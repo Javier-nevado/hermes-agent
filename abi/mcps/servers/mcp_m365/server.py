@@ -152,7 +152,7 @@ class M365MCPServer(ABIMCPServer):
             self._save_creds(creds)
 
     async def _validate_credentials(self, creds: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Validate by trying to acquire a token silently."""
+        """Validate by trying to acquire a token silently, or complete pending device code flow."""
         client_id = creds.get("client_id", "")
         tenant_id = creds.get("tenant_id", "")
         if not client_id or not tenant_id:
@@ -161,9 +161,32 @@ class M365MCPServer(ABIMCPServer):
         try:
             import msal
             app = self._get_msal_app(client_id, tenant_id)
+
+            # First: try to complete a pending device code flow
+            flow = creds.get("pending_flow")
+            if flow:
+                result = app.acquire_token_by_device_flow(flow)
+                if result and "access_token" in result:
+                    # Device code completed — store the token
+                    creds.pop("pending_flow", None)
+                    creds["msal_cache"] = app.token_cache.serialize()
+                    self._save_creds(creds)
+                    return None  # Valid!
+                error = result.get("error", "")
+                desc = result.get("error_description", "")
+                if "authorization_pending" in error or "authorization_pending" in desc:
+                    return {"valid": False, "message": "Authentication still pending. Complete the device code in your browser, then check status again."}
+                if "expired_token" in error:
+                    creds.pop("pending_flow", None)
+                    self._save_creds(creds)
+                    return {"valid": False, "message": "Device code expired. Call m365_login to start a new flow."}
+                # Other error
+                return {"valid": False, "message": f"Device code flow error: {desc}"}
+
+            # No pending flow — try silent token acquisition
             accounts = app.get_accounts()
             if not accounts:
-                return {"valid": False, "message": "No authenticated accounts. Call m365_login."}
+                return {"valid": False, "message": "Not authenticated. Call m365_login to start device code flow."}
 
             result = app.acquire_token_silent(scopes=DEFAULT_SCOPES, account=accounts[0])
             if result and "access_token" in result:
