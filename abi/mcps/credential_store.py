@@ -1,6 +1,6 @@
 """Credential store — per-agent encrypted credential storage.
 
-Each agent stores credentials in /home/{agent_user}/.abi/credentials/
+Each agent stores credentials in /home/{agent_user}/workspace/agent/credentials/
 as JSON files. For the MVP, files are stored with mode 600 (owner-only).
 Full sops+age encryption will be added in Phase 7 (Hardening).
 
@@ -24,7 +24,7 @@ def _credentials_dir() -> Path:
     else:
         agent_home = str(Path.home())
 
-    cred_dir = Path(agent_home) / ".abi" / "credentials"
+    cred_dir = Path(agent_home) / "workspace/agent/credentials"
     cred_dir.mkdir(parents=True, exist_ok=True)
     return cred_dir
 
