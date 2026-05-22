@@ -391,8 +391,8 @@ class M365MCPServer(ABIMCPServer):
         end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
         qparams = urllib.parse.urlencode({
-            "$filter": f"start/dateTime ge '{now}' and end/dateTime le '{end}'",
-            "$orderby": "start/dateTime",
+            "startDateTime": now,
+            "endDateTime": end,
             "$select": "subject,start,end,organizer,location",
         })
         req = urllib.request.Request(
