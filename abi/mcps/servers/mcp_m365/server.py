@@ -23,11 +23,8 @@ from mcp import types
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Azure AD app registration (multi-tenant, common endpoint)
-# These are public client IDs — safe to embed in MCP server code
-CLIENT_ID = "a4a3b3b2-1c1d-4e2f-8a9b-0c1d2e3f4a5b"
-AUTHORITY = "https://login.microsoftonline.com/common"
-SCOPES = [
+# Default scopes — used unless overridden at login
+DEFAULT_SCOPES = [
     "https://graph.microsoft.com/Mail.Read",
     "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/Calendars.Read",
@@ -44,12 +41,16 @@ class M365MCPServer(ABIMCPServer):
         return {
             "type": "object",
             "properties": {
+                "client_id": {
+                    "type": "string",
+                    "description": "Azure AD application (client) ID for this tenant.",
+                },
                 "tenant_id": {
                     "type": "string",
                     "description": "M365 tenant ID or domain (e.g., contoso.onmicrosoft.com).",
                 },
             },
-            "required": ["tenant_id"],
+            "required": ["client_id", "tenant_id"],
         }
 
     def _extra_tools(self) -> List[types.Tool]:
@@ -156,10 +157,10 @@ class M365MCPServer(ABIMCPServer):
             import urllib.request
             import urllib.error
             data = json.dumps({
-                "client_id": CLIENT_ID,
+                "client_id": creds.get("client_id", ""),
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
-                "scope": " ".join(SCOPES),
+                "scope": " ".join(creds.get("scopes", DEFAULT_SCOPES)),
             }).encode()
 
             req = urllib.request.Request(
@@ -186,7 +187,10 @@ class M365MCPServer(ABIMCPServer):
             return False
 
     async def _handle_login(self, args: Dict[str, Any]) -> str:
+        client_id = args.get("client_id", "").strip()
         tenant_id = args.get("tenant_id", "").strip()
+        if not client_id:
+            return json.dumps({"error": "client_id is required. Provide the Azure AD application (client) ID."})
         if not tenant_id:
             return json.dumps({"error": "tenant_id is required."})
 
@@ -194,8 +198,8 @@ class M365MCPServer(ABIMCPServer):
             import urllib.request
             # Initiate device code flow
             data = json.dumps({
-                "client_id": CLIENT_ID,
-                "scope": " ".join(SCOPES),
+                "client_id": client_id,
+                "scope": " ".join(DEFAULT_SCOPES),
             }).encode()
 
             req = urllib.request.Request(
@@ -221,7 +225,7 @@ class M365MCPServer(ABIMCPServer):
                 time.sleep(interval)
                 try:
                     token_data = json.dumps({
-                        "client_id": CLIENT_ID,
+                        "client_id": client_id,
                         "grant_type": "urn:ietf:params:oauth:grants:device_code",
                         "device_code": device_code,
                     }).encode()
@@ -235,11 +239,13 @@ class M365MCPServer(ABIMCPServer):
                     with urllib.request.urlopen(token_req, timeout=15) as token_resp:
                         token_result = json.loads(token_resp.read())
 
-                        # Store tokens
+                        # Store tokens + app config for refresh
                         self._save_creds({
                             "access_token": token_result["access_token"],
                             "refresh_token": token_result.get("refresh_token", ""),
+                            "client_id": client_id,
                             "tenant_id": tenant_id,
+                            "scopes": DEFAULT_SCOPES,
                             "expires_at": time.time() + token_result.get("expires_in", 3600),
                         })
                         return json.dumps({
@@ -272,14 +278,17 @@ class M365MCPServer(ABIMCPServer):
 
     async def _handle_login_no_wait(self, args: Dict[str, Any]) -> str:
         """Alternative: return device code info for owner to complete, don't wait."""
+        client_id = args.get("client_id", "").strip()
         tenant_id = args.get("tenant_id", "").strip()
+        if not client_id:
+            return json.dumps({"error": "client_id is required."})
         if not tenant_id:
             return json.dumps({"error": "tenant_id is required."})
 
         import urllib.request
         data = json.dumps({
-            "client_id": CLIENT_ID,
-            "scope": " ".join(SCOPES),
+            "client_id": client_id,
+            "scope": " ".join(DEFAULT_SCOPES),
         }).encode()
 
         req = urllib.request.Request(
