@@ -393,23 +393,32 @@ class M365MCPServer(ABIMCPServer):
         qparams = urllib.parse.urlencode({
             "startDateTime": now,
             "endDateTime": end,
-            "$select": "subject,start,end,organizer,location",
+            "$select": "subject,start,end,organizer,location,responseStatus,isAllDay,recurrence",
         })
         req = urllib.request.Request(
             f"{GRAPH_BASE}/me/calendarView?{qparams}",
-            headers={"Authorization": f"Bearer {token}", "accept": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "accept": "application/json",
+                "Prefer": 'outlook.timezone="Europe/Malta"',
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
                 events = []
                 for evt in data.get("value", []):
+                    start_obj = evt.get("start", {})
+                    end_obj = evt.get("end", {})
                     events.append({
                         "subject": evt.get("subject", ""),
-                        "start": evt.get("start", {}).get("dateTime", ""),
-                        "end": evt.get("end", {}).get("dateTime", ""),
+                        "start": start_obj.get("dateTime", ""),
+                        "start_timezone": start_obj.get("timeZone", ""),
+                        "end": end_obj.get("dateTime", ""),
+                        "end_timezone": end_obj.get("timeZone", ""),
                         "organizer": evt.get("organizer", {}).get("emailAddress", {}).get("address", ""),
                         "location": evt.get("location", {}).get("displayName", ""),
+                        "response": evt.get("responseStatus", {}).get("response", ""),
                     })
                 return json.dumps({"events": events, "count": len(events)})
         except urllib.error.HTTPError as e:
