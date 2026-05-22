@@ -214,20 +214,20 @@ class ABIMemoryProvider(MemoryProvider):
                     )
                 else:
                     # Fallback: full-text search using PostgreSQL plainto_tsquery
-                    cur.execute(
-                        f"""
-                        SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata,
-                               ts_rank_cd(to_tsvector('english', content),
-                                          plainto_tsquery('english', %s)) AS rank
-                        FROM abi_memories
-                        WHERE {where_clause}
-                        AND to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-                        ORDER BY rank DESC, created_at DESC
-                        LIMIT %s
-                        """,
-                        params + [query, query, limit],
+                    # NOTE: Cannot use f-string because {where_clause} contains %s
+                    # placeholders needed by psycopg2, and f-string consumes single quotes.
+                    _sql = (
+                        "SELECT id, content, dlp_level, agent_name, user_id, "
+                        "source_type, created_at, metadata, "
+                        "ts_rank_cd(to_tsvector('english', content), "
+                        "plainto_tsquery('english', %s)) AS rank "
+                        "FROM abi_memories "
+                        "WHERE " + where_clause + " "
+                        "AND to_tsvector('english', content) @@ plainto_tsquery('english', %s) "
+                        "ORDER BY rank DESC, created_at DESC "
+                        "LIMIT %s"
                     )
+                    cur.execute(_sql, [query] + params + [query, limit])
 
                 results = cur.fetchall()
 
