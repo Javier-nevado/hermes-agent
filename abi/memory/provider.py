@@ -213,18 +213,20 @@ class ABIMemoryProvider(MemoryProvider):
                         [str(embedding), str(embedding)] + params + [limit],
                     )
                 else:
-                    # Fallback: text search
+                    # Fallback: full-text search using PostgreSQL plainto_tsquery
                     cur.execute(
                         f"""
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata
+                               source_type, created_at, metadata,
+                               ts_rank_cd(to_tsvector('english', content),
+                                          plainto_tsquery('english', %s)) AS rank
                         FROM abi_memories
                         WHERE {where_clause}
-                        AND content ILIKE %s
-                        ORDER BY created_at DESC
+                        AND to_tsvector('english', content) @@ plainto_tsquery('english', %s)
+                        ORDER BY rank DESC, created_at DESC
                         LIMIT %s
                         """,
-                        params + [f"%{query}%", limit],
+                        params + [query, query, limit],
                     )
 
                 results = cur.fetchall()
