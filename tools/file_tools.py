@@ -119,21 +119,34 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
-    if not p.is_absolute():
-        # ABI-PATCH: route relative paths through per-user sandbox
-        try:
-            from gateway.session_context import get_session_env
-            _abi_user = get_session_env("HERMES_SESSION_USER_ID", "")
-            if _abi_user:
-                from abi.files.sandbox import resolve_path
-                _hermes_home = os.environ.get("HERMES_HOME", "")
-                if _hermes_home:
-                    _agent_home = str(Path(_hermes_home).parent)
+    # ABI-PATCH: route ALL paths through per-user sandbox when session user is set
+    try:
+        from gateway.session_context import get_session_env
+        _abi_user = get_session_env("HERMES_SESSION_USER_ID", "")
+        if _abi_user:
+            from abi.files.sandbox import resolve_path
+            _hermes_home = os.environ.get("HERMES_HOME", "")
+            if _hermes_home:
+                _agent_home = str(Path(_hermes_home).parent)
+                # For absolute paths inside agent home, strip the prefix and sandbox
+                if p.is_absolute():
+                    _resolved = p.resolve()
+                    _agent_resolved = str(Path(_agent_home).resolve())
+                    _rel = os.path.relpath(str(_resolved), _agent_resolved)
+                    if not _rel.startswith(".."):
+                        # Path is inside agent home, sandbox it
+                        _sandboxed = resolve_path(_rel, _abi_user, _agent_home)
+                        return Path(_sandboxed)
+                    # Path is outside agent home (e.g. /tmp), allow as-is
+                    return _resolved
+                else:
                     _sandboxed = resolve_path(filepath, _abi_user, _agent_home)
+                    Path(_sandboxed).parent.mkdir(parents=True, exist_ok=True)
                     return Path(_sandboxed)
-        except Exception:
-            pass  # Fall through to default resolution
-        # END ABI-PATCH
+    except Exception:
+        pass  # Fall through to default resolution
+    # END ABI-PATCH
+    if not p.is_absolute():
         base = _get_live_tracking_cwd(task_id) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
         )
