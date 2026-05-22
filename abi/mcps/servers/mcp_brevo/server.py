@@ -150,7 +150,7 @@ class BrevoMCPServer(ABIMCPServer):
             "sender": sender,
             "to": [{"email": args["to"], "name": args.get("to_name", "")}],
             "subject": args["subject"],
-            "htmlContent": args["html_body"],
+            "htmlContent": args.get("html_body") or args.get("content") or args.get("body", "<p></p>"),
         }
 
         # If no from_email specified, use the account's default sender
@@ -179,6 +179,9 @@ class BrevoMCPServer(ABIMCPServer):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 result = json.loads(resp.read())
                 return json.dumps({"status": "sent", "message_id": result.get("messageId", "")})
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            return json.dumps({"error": f"HTTP {e.code}: {body}"})
         except Exception as e:
             return json.dumps({"error": f"Failed to send email: {e}"})
 
