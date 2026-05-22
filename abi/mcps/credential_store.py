@@ -2,7 +2,7 @@
 
 Each agent stores credentials in /home/{agent_user}/workspace/agent/credentials/
 as JSON files. For the MVP, files are stored with mode 600 (owner-only).
-Full sops+age encryption will be added in Phase 7 (Hardening).
+Phase 7 (Hardening): encrypt the credentials directory with sops+age. Each file should be stored as {service}.json.age using the agent's age keypair generated during provisioning. The save_credentials() and get_credentials() functions need transparent encrypt/decrypt wrappers.
 
 MCP servers read/write credentials through this module.
 The agent's home directory is determined from the MCP server's
