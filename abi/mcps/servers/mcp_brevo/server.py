@@ -142,11 +142,12 @@ class BrevoMCPServer(ABIMCPServer):
             return self._no_creds_error()
 
         import urllib.request
+        sender = {"email": args.get("from_email", "")}
+        from_name = args.get("from_name")
+        if from_name:
+            sender["name"] = from_name
         payload = {
-            "sender": {
-                "email": args.get("from_email", ""),
-                "name": args.get("from_name", ""),
-            },
+            "sender": sender,
             "to": [{"email": args["to"], "name": args.get("to_name", "")}],
             "subject": args["subject"],
             "htmlContent": args["html_body"],
