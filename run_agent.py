@@ -2067,6 +2067,27 @@ class AIAgent:
                             _profile = get_active_profile_name()
                             _init_kwargs["agent_identity"] = _profile
                             _init_kwargs["agent_workspace"] = "hermes"
+                            # ABI-PATCH: derive real agent name from HERMES_HOME and lookup clearance
+                            import os as _os
+                            _hh = _os.environ.get("HERMES_HOME", "")
+                            if _hh:
+                                from pathlib import Path as _P
+                                _abi_agent = _P(_hh).parent.name  # /home/ailean/.hermes -> ailean
+                                _init_kwargs["agent_identity"] = _abi_agent
+                                try:
+                                    import psycopg2 as _pg
+                                    _db_url = _os.environ.get("ABI_DATABASE_URL",
+                                        "postgresql://abi_agent:abi_local_dev_2026@localhost:5432/abi_memory")
+                                    _pc = _pg.connect(_db_url)
+                                    _cr = _pc.cursor()
+                                    _cr.execute("SELECT clearance FROM abi_agents WHERE username = %s", (_abi_agent,))
+                                    _row = _cr.fetchone()
+                                    _pc.close()
+                                    if _row:
+                                        _init_kwargs["clearance"] = _row[0]
+                                except Exception:
+                                    pass
+                            # END ABI-PATCH
                         except Exception:
                             pass
                         self._memory_manager.initialize_all(**_init_kwargs)
