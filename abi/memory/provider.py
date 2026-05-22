@@ -164,6 +164,11 @@ class ABIMemoryProvider(MemoryProvider):
             "[System note: ABI memory provider active. You can use abi_recall to search "
             "past memories and abi_remember to store new facts. DLP levels control "
             f"cross-agent visibility. Your clearance: {self._clearance}.]\n"
+            "\n<file-namespaces>\n"
+            "[System note: File sandbox active. Use RELATIVE paths (never absolute). "
+            "Prefixes: no prefix = private to user, agent/ = agent files, "
+            "shared/ = shared between users, public/ = visible to all agents.]\n"
+            "</file-namespaces>\n"
             "</memory-context>\n"
         )
 
