@@ -160,12 +160,16 @@ class M365MCPServer(ABIMCPServer):
 
         try:
             import msal
+            import asyncio
+            loop = asyncio.get_event_loop()
             app = self._get_msal_app(client_id, tenant_id)
 
             # First: try to complete a pending device code flow
             flow = creds.get("pending_flow")
             if flow:
-                result = app.acquire_token_by_device_flow(flow)
+                result = await loop.run_in_executor(
+                    None, lambda: app.acquire_token_by_device_flow(flow)
+                )
                 if result and "access_token" in result:
                     # Device code completed — store the token
                     creds.pop("pending_flow", None)
@@ -206,10 +210,14 @@ class M365MCPServer(ABIMCPServer):
 
         try:
             import msal
+            import asyncio
+
             app = self._get_msal_app(client_id, tenant_id)
 
-            # Initiate device code flow
-            flow = app.initiate_device_flow(scopes=DEFAULT_SCOPES)
+            # Run MSAL in thread executor to avoid blocking the async event loop
+            loop = asyncio.get_event_loop()
+            flow = await loop.run_in_executor(None, lambda: app.initiate_device_flow(scopes=DEFAULT_SCOPES))
+
             if "error" in flow:
                 desc = flow.get("error_description", flow.get("error", "Unknown error"))
                 return json.dumps({"error": f"Device code flow failed: {desc}"})
@@ -244,7 +252,7 @@ class M365MCPServer(ABIMCPServer):
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     def _get_token(self) -> Optional[str]:
-        """Get a valid access token using MSAL (auto-refresh)."""
+        """Get a valid access token using MSAL (auto-refresh). Called from async handlers."""
         creds = self._require_creds()
         if not creds:
             return None
@@ -262,14 +270,12 @@ class M365MCPServer(ABIMCPServer):
             flow = creds.get("pending_flow")
             if flow:
                 result = app.acquire_token_by_device_flow(flow)
-                if "access_token" in result:
+                if result and "access_token" in result:
                     creds.pop("pending_flow", None)
                     creds["msal_cache"] = app.token_cache.serialize()
                     self._save_creds(creds)
                     return result["access_token"]
-                error = result.get("error_description", result.get("error", "Unknown"))
-                if "authorization_pending" not in str(error):
-                    return None  # Real error, not just waiting
+                return None
             return None
 
         result = app.acquire_token_silent(scopes=DEFAULT_SCOPES, account=accounts[0])
