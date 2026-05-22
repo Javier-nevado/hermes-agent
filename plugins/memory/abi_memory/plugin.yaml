@@ -1,0 +1,6 @@
+name: abi_memory
+version: 0.1.0
+description: "ABI Memory — PostgreSQL+pgvector memory with DLP enforcement and PII detection."
+pip_dependencies:
+  - psycopg2-binary
+  - sentence-transformers
