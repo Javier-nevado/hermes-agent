@@ -823,10 +823,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
         except Exception:
             _resolved = None
 
+        # ABI-PATCH: use resolved path for actual file operations
+        _abi_write_path = _resolved or path
+
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            result = file_ops.write_file(_abi_write_path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
@@ -842,7 +845,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            result = file_ops.write_file(_abi_write_path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
             if effective_warning:
