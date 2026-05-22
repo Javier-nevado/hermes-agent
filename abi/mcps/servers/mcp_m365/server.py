@@ -291,14 +291,17 @@ class M365MCPServer(ABIMCPServer):
 
         import urllib.request
         import urllib.error
+        import urllib.parse
         folder = args.get("folder", "Inbox")
         limit = min(args.get("limit", 10), 50)
-        params = f"={limit}&=receivedDateTime desc&=subject,from,receivedDateTime,isRead,bodyPreview"
-        if args.get("unread_only"):
-            params += "&=isRead eq false"
-
-        req = urllib.request.Request(
-            f"{GRAPH_BASE}/me/mailFolders/{folder}/messages?{params}",
+        qparams = urllib.parse.urlencode({
+            "$top": str(limit),
+            "$orderby": "receivedDateTime desc",
+            "$select": "subject,from,receivedDateTime,isRead,bodyPreview",
+            **({"$filter": "isRead eq false"} if args.get("unread_only") else {}),
+        })
+        url = f"{GRAPH_BASE}/me/mailFolders/{urllib.parse.quote(folder, safe='')}/messages?{qparams}"
+        req = urllib.request.Request(url,
             headers={"Authorization": f"Bearer {token}", "accept": "application/json"},
         )
         try:
@@ -380,15 +383,20 @@ class M365MCPServer(ABIMCPServer):
 
         import urllib.request
         import urllib.error
+        import urllib.parse
         from datetime import datetime, timezone, timedelta
 
         days = max(1, min(args.get("days", 7), 365))
         now = datetime.now(timezone.utc).isoformat()
         end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
-        params = f"=start/dateTime ge '{now}' and end/dateTime le '{end}'&=start/dateTime&=subject,start,end,organizer,location"
+        qparams = urllib.parse.urlencode({
+            "$filter": f"start/dateTime ge '{now}' and end/dateTime le '{end}'",
+            "$orderby": "start/dateTime",
+            "$select": "subject,start,end,organizer,location",
+        })
         req = urllib.request.Request(
-            f"{GRAPH_BASE}/me/calendarView?{params}",
+            f"{GRAPH_BASE}/me/calendarView?{qparams}",
             headers={"Authorization": f"Bearer {token}", "accept": "application/json"},
         )
         try:
