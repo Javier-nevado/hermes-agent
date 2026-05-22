@@ -108,13 +108,21 @@ class M365MCPServer(ABIMCPServer):
             ),
             types.Tool(
                 name="calendar",
-                description="Get upcoming calendar events.",
+                description="Get calendar events for a date range.",
                 inputSchema={
                     "type": "object",
                     "properties": {
+                        "start_date": {
+                            "type": "string",
+                            "description": "Start date in YYYY-MM-DD format (default: today).",
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "End date in YYYY-MM-DD format (default: start_date + 7 days).",
+                        },
                         "days": {
                             "type": "integer",
-                            "description": "Number of days to look ahead (default: 7).",
+                            "description": "Number of days to look ahead from start_date (default: 7). Ignored if end_date is set.",
                             "default": 7,
                         },
                     },
@@ -386,9 +394,31 @@ class M365MCPServer(ABIMCPServer):
         import urllib.parse
         from datetime import datetime, timezone, timedelta
 
+        # Parse date range — start_date defaults to today
+        start_date_str = args.get("start_date", "").strip()
+        end_date_str = args.get("end_date", "").strip()
         days = max(1, min(args.get("days", 7), 365))
-        now = datetime.now(timezone.utc).isoformat()
-        end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+        if start_date_str:
+            try:
+                base = datetime.strptime(start_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                return json.dumps({"error": f"Invalid start_date '{start_date_str}'. Use YYYY-MM-DD format."})
+        else:
+            base = datetime.now(timezone.utc)
+
+        if end_date_str:
+            try:
+                end_dt = datetime.strptime(end_date_str, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc, hour=23, minute=59, second=59
+                )
+            except ValueError:
+                return json.dumps({"error": f"Invalid end_date '{end_date_str}'. Use YYYY-MM-DD format."})
+        else:
+            end_dt = base + timedelta(days=days)
+
+        now = base.isoformat()
+        end = end_dt.isoformat()
 
         qparams = urllib.parse.urlencode({
             "startDateTime": now,
