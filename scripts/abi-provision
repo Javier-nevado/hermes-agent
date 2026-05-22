@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""ABI Agent Provisioning CLI.
+
+Usage:
+    sudo python3 scripts/abi-provision \\
+        --name atlas \\
+        --display-name "Atlas" \\
+        --role Ops \\
+        --clearance admin \\
+        --mcps proxmox,m365 \\
+        --telegram-token 123456:ABC
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from abi.provision.agent import main
+
+if __name__ == "__main__":
+    main()
