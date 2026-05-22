@@ -156,7 +156,8 @@ class M365MCPServer(ABIMCPServer):
         try:
             import urllib.request
             import urllib.error
-            data = json.dumps({
+            import urllib.parse as _up
+            data = _up.urlencode({
                 "client_id": creds.get("client_id", ""),
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
@@ -196,8 +197,9 @@ class M365MCPServer(ABIMCPServer):
 
         try:
             import urllib.request
-            # Initiate device code flow
-            data = json.dumps({
+            # Initiate device code flow (must be form-encoded, not JSON)
+            import urllib.parse
+            data = urllib.parse.urlencode({
                 "client_id": client_id,
                 "scope": " ".join(DEFAULT_SCOPES),
             }).encode()
@@ -224,7 +226,8 @@ class M365MCPServer(ABIMCPServer):
             while time.time() - start < expires_in:
                 time.sleep(interval)
                 try:
-                    token_data = json.dumps({
+                    import urllib.parse as _up
+                    token_data = _up.urlencode({
                         "client_id": client_id,
                         "grant_type": "urn:ietf:params:oauth:grants:device_code",
                         "device_code": device_code,
@@ -286,7 +289,8 @@ class M365MCPServer(ABIMCPServer):
             return json.dumps({"error": "tenant_id is required."})
 
         import urllib.request
-        data = json.dumps({
+        import urllib.parse
+        data = urllib.parse.urlencode({
             "client_id": client_id,
             "scope": " ".join(DEFAULT_SCOPES),
         }).encode()
