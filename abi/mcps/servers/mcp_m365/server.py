@@ -154,6 +154,7 @@ class M365MCPServer(ABIMCPServer):
 
         try:
             import urllib.request
+            import urllib.error
             data = json.dumps({
                 "client_id": CLIENT_ID,
                 "grant_type": "refresh_token",
@@ -162,7 +163,7 @@ class M365MCPServer(ABIMCPServer):
             }).encode()
 
             req = urllib.request.Request(
-                f"https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                f"https://login.microsoftonline.com/{creds.get('tenant_id', 'common')}/oauth2/v2.0/token",
                 data=data,
                 headers={"content-type": "application/x-www-form-urlencoded"},
                 method="POST",
@@ -172,8 +173,15 @@ class M365MCPServer(ABIMCPServer):
                 creds["access_token"] = result["access_token"]
                 if "refresh_token" in result:
                     creds["refresh_token"] = result["refresh_token"]
+                creds["expires_at"] = __import__("time").time() + result.get("expires_in", 3600)
                 self._save_creds(creds)
                 return True
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if "AADSTS70008" in body or "AADSTS700082" in body:
+                # Refresh token expired — need full re-auth
+                return False
+            return False
         except Exception:
             return False
 
@@ -252,6 +260,13 @@ class M365MCPServer(ABIMCPServer):
 
             return json.dumps({"error": "Device code flow timed out. Please try again."})
 
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 400 and "AADSTS500011" in body:
+                return json.dumps({"error": f"Tenant '{tenant_id}' not found. Use the exact tenant ID (e.g., contoso.onmicrosoft.com) or GUID."})
+            if e.code == 400:
+                return json.dumps({"error": f"Bad request starting device code flow: {body}"})
+            return json.dumps({"error": f"HTTP {e.code} during login: {body}"})
         except Exception as e:
             return json.dumps({"error": f"Login failed: {e}"})
 
@@ -324,6 +339,7 @@ class M365MCPServer(ABIMCPServer):
             return self._no_creds_error()
 
         import urllib.request
+        import urllib.error
         folder = args.get("folder", "Inbox")
         limit = min(args.get("limit", 10), 50)
         params = f"$top={limit}&$orderby=receivedDateTime desc&$select=subject,from,receivedDateTime,isRead,bodyPreview"
@@ -347,10 +363,14 @@ class M365MCPServer(ABIMCPServer):
                         "preview": msg.get("bodyPreview", "")[:200],
                     })
                 return json.dumps({"emails": emails, "count": len(emails)})
-        except Exception as e:
-            err_str = str(e)
-            if "401" in err_str:
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 401:
                 return json.dumps({"error": "Token expired. Call m365_login to re-authenticate."})
+            if e.code == 404:
+                return json.dumps({"error": f"Mail folder '{folder}' not found. Use folder name like Inbox, SentItems, Drafts, DeletedItems, or JunkEmail."})
+            return json.dumps({"error": f"HTTP {e.code} reading mail: {body}"})
+        except Exception as e:
             return json.dumps({"error": f"Failed to read mail: {e}"})
 
     async def _send_mail(self, args: Dict[str, Any]) -> str:
@@ -358,12 +378,22 @@ class M365MCPServer(ABIMCPServer):
         if not token:
             return self._no_creds_error()
 
+        # Validate required fields
+        missing = [f for f in ["to", "subject", "body"] if not args.get(f)]
+        if missing:
+            return json.dumps({"error": f"Missing required fields: {', '.join(missing)}. Provide to (email address), subject, and body (HTML content)."})
+
         import urllib.request
+        import urllib.error
+        to_addr = args["to"].strip()
+        if "@" not in to_addr:
+            return json.dumps({"error": f"Invalid recipient email: '{to_addr}'. Must be a valid email address."})
+
         payload = {
             "message": {
                 "subject": args["subject"],
                 "body": {"contentType": "HTML", "content": args["body"]},
-                "toRecipients": [{"emailAddress": {"address": args["to"]}}],
+                "toRecipients": [{"emailAddress": {"address": to_addr}}],
             },
         }
         if args.get("cc"):
@@ -383,10 +413,14 @@ class M365MCPServer(ABIMCPServer):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.dumps({"status": "sent"})
-        except Exception as e:
-            err_str = str(e)
-            if "401" in err_str:
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 401:
                 return json.dumps({"error": "Token expired. Call m365_login to re-authenticate."})
+            if e.code == 403:
+                return json.dumps({"error": f"Permission denied. The app needs Mail.Send permission. Details: {body}"})
+            return json.dumps({"error": f"HTTP {e.code} sending mail: {body}"})
+        except Exception as e:
             return json.dumps({"error": f"Failed to send mail: {e}"})
 
     async def _calendar(self, args: Dict[str, Any]) -> str:
@@ -395,10 +429,12 @@ class M365MCPServer(ABIMCPServer):
             return self._no_creds_error()
 
         import urllib.request
+        import urllib.error
         from datetime import datetime, timezone, timedelta
 
+        days = max(1, min(args.get("days", 7), 365))
         now = datetime.now(timezone.utc).isoformat()
-        end = (datetime.now(timezone.utc) + timedelta(days=args.get("days", 7))).isoformat()
+        end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
         params = f"$filter=start/dateTime ge '{now}' and end/dateTime le '{end}'&$orderby=start/dateTime&$select=subject,start,end,organizer,location"
         req = urllib.request.Request(
@@ -418,10 +454,14 @@ class M365MCPServer(ABIMCPServer):
                         "location": evt.get("location", {}).get("displayName", ""),
                     })
                 return json.dumps({"events": events, "count": len(events)})
-        except Exception as e:
-            err_str = str(e)
-            if "401" in err_str:
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 401:
                 return json.dumps({"error": "Token expired. Call m365_login to re-authenticate."})
+            if e.code == 403:
+                return json.dumps({"error": f"Permission denied. The app needs Calendars.Read permission. Details: {body}"})
+            return json.dumps({"error": f"HTTP {e.code} fetching calendar: {body}"})
+        except Exception as e:
             return json.dumps({"error": f"Failed to fetch calendar: {e}"})
 
 

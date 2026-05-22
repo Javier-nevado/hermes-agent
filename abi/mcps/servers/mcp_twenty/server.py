@@ -107,8 +107,9 @@ class TwentyMCPServer(ABIMCPServer):
         ]
 
     async def _validate_credentials(self, creds: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        import urllib.request
+        import urllib.error
         try:
-            import urllib.request
             base_url = creds.get("base_url", "").rstrip("/")
             req = urllib.request.Request(
                 f"{base_url}/rest/companies?limit=1",
@@ -119,9 +120,14 @@ class TwentyMCPServer(ABIMCPServer):
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 401:
+                return {"valid": False, "message": "API key is invalid or revoked. Get a new key from Twenty CRM Settings > API."}
+            if e.code == 403:
+                return {"valid": False, "message": "API key does not have permission to access companies. Check key permissions."}
+            return {"valid": False, "message": f"HTTP {e.code}: {body}"}
         except Exception as e:
-            if "401" in str(e) or "403" in str(e):
-                return {"valid": False, "message": "API key is invalid."}
             return None
 
     async def _handle_login(self, args: Dict[str, Any]) -> str:
@@ -147,9 +153,10 @@ class TwentyMCPServer(ABIMCPServer):
     def _api_request(self, method: str, path: str, data: Optional[Dict] = None) -> Dict:
         """Make an authenticated request to Twenty CRM."""
         import urllib.request
+        import urllib.error
         creds = self._require_creds()
         if not creds:
-            raise ValueError("Not authenticated")
+            raise ValueError("Not authenticated. Call twenty_login first.")
 
         base_url = creds["base_url"].rstrip("/")
         url = f"{base_url}/rest/{path.lstrip('/')}"
@@ -160,10 +167,14 @@ class TwentyMCPServer(ABIMCPServer):
         }
         body = json.dumps(data).encode() if data else None
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            if resp.status == 204:
-                return {}
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 204:
+                    return {}
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            raise RuntimeError(f"HTTP {e.code} on {method} {path}: {error_body}") from e
 
     async def _list_companies(self, args: Dict[str, Any]) -> str:
         try:
@@ -180,10 +191,14 @@ class TwentyMCPServer(ABIMCPServer):
                     "domain": c.get("domainName", ""),
                 })
             return json.dumps({"companies": companies, "count": len(companies)})
-        except Exception as e:
+        except RuntimeError as e:
             return json.dumps({"error": str(e)})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to list companies: {e}"})
 
     async def _create_company(self, args: Dict[str, Any]) -> str:
+        if not args.get("name"):
+            return json.dumps({"error": "Company name is required. Provide the 'name' parameter."})
         try:
             payload = {"name": args["name"]}
             if args.get("domain"):
@@ -192,10 +207,18 @@ class TwentyMCPServer(ABIMCPServer):
                 payload["industry"] = args["industry"]
             data = self._api_request("POST", "companies", payload)
             return json.dumps({"status": "created", "company": data.get("data", data)})
+        except RuntimeError as e:
+            err = str(e)
+            if "already exists" in err.lower() or "duplicate" in err.lower():
+                return json.dumps({"error": f"Company '{args['name']}' already exists. Use list_companies to find existing companies."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Failed to create company: {e}"})
 
     async def _create_person(self, args: Dict[str, Any]) -> str:
+        missing = [f for f in ["first_name", "last_name"] if not args.get(f)]
+        if missing:
+            return json.dumps({"error": f"Missing required fields: {', '.join(missing)}. Provide first_name and last_name."})
         try:
             payload = {
                 "firstName": args["first_name"],
@@ -207,15 +230,25 @@ class TwentyMCPServer(ABIMCPServer):
             person_id = data.get("data", data).get("id", "")
             # Link to company if specified
             if args.get("company_id") and person_id:
-                self._api_request("POST", "personCompanies", {
-                    "personId": person_id,
-                    "companyId": args["company_id"],
-                })
+                try:
+                    self._api_request("POST", "personCompanies", {
+                        "personId": person_id,
+                        "companyId": args["company_id"],
+                    })
+                except RuntimeError as link_err:
+                    return json.dumps({"status": "created", "person": data.get("data", data), "warning": f"Person created but company link failed: {link_err}"})
             return json.dumps({"status": "created", "person": data.get("data", data)})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": f"Company ID '{args.get('company_id', '')}' not found. Use list_companies to find valid IDs."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Failed to create person: {e}"})
 
     async def _create_opportunity(self, args: Dict[str, Any]) -> str:
+        if not args.get("name"):
+            return json.dumps({"error": "Opportunity name is required. Provide the 'name' parameter."})
         try:
             payload = {"name": args["name"]}
             if args.get("company_id"):
@@ -226,8 +259,13 @@ class TwentyMCPServer(ABIMCPServer):
                 payload["stage"] = args["stage"]
             data = self._api_request("POST", "opportunities", payload)
             return json.dumps({"status": "created", "opportunity": data.get("data", data)})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": f"Company ID '{args.get('company_id', '')}' not found. Use list_companies to find valid IDs."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Failed to create opportunity: {e}"})
 
 
 if __name__ == "__main__":

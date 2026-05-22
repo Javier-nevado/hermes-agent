@@ -124,8 +124,9 @@ class ProxmoxMCPServer(ABIMCPServer):
         return ctx
 
     async def _validate_credentials(self, creds: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        import urllib.request
+        import urllib.error
         try:
-            import urllib.request
             url = creds.get("api_url", "").rstrip("/")
             verify = creds.get("verify_ssl", False)
             ctx = self._get_ssl_context(verify)
@@ -138,9 +139,18 @@ class ProxmoxMCPServer(ABIMCPServer):
             )
             with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 return None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 401:
+                return {"valid": False, "message": "API token is invalid or expired. Generate a new token in Proxmox Datacenter > Permissions > API Tokens."}
+            if e.code == 403:
+                return {"valid": False, "message": "API token does not have sufficient permissions. Check token privileges on the Proxmox cluster."}
+            return {"valid": False, "message": f"HTTP {e.code}: {body}"}
         except Exception as e:
-            if "401" in str(e) or "403" in str(e):
-                return {"valid": False, "message": "API token is invalid."}
+            if "CERTIFICATE" in str(e).upper() or "SSL" in str(e).upper():
+                return {"valid": False, "message": f"SSL certificate error. Set verify_ssl=false for self-signed certs. Details: {e}"}
+            if "Connection refused" in str(e) or "timed out" in str(e):
+                return {"valid": False, "message": f"Cannot reach Proxmox at {creds.get('api_url', '')}. Check URL and network connectivity."}
             return None
 
     async def _handle_login(self, args: Dict[str, Any]) -> str:
@@ -162,7 +172,7 @@ class ProxmoxMCPServer(ABIMCPServer):
 
         validation = await self._validate_credentials(creds)
         if validation and not validation.get("valid"):
-            return json.dumps({"error": validation.get("message", "Token validation failed.")})
+            return json.dumps({"error": validation.get("message", "Token validation failed. Check api_url, token_id, and token_secret.")})
 
         self._save_creds(creds)
         return json.dumps({"status": "connected", "message": f"Proxmox connected at {api_url}."})
@@ -178,9 +188,10 @@ class ProxmoxMCPServer(ABIMCPServer):
 
     def _api_request(self, path: str, method: str = "GET", data: Optional[Dict] = None) -> Dict:
         import urllib.request
+        import urllib.error
         creds = self._require_creds()
         if not creds:
-            raise ValueError("Not authenticated")
+            raise ValueError("Not authenticated. Call proxmox_login first.")
 
         url = f"{creds['api_url']}/api2/json/{path.lstrip('/')}"
         ctx = self._get_ssl_context(creds.get("verify_ssl", False))
@@ -194,11 +205,16 @@ class ProxmoxMCPServer(ABIMCPServer):
             headers["content-type"] = "application/json"
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            if resp.status == 204 or resp.status == 200 and not resp.read():
-                return {}
-            resp_data = json.loads(resp.read())
-            return resp_data.get("data", resp_data)
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                raw = resp.read()
+                if not raw:
+                    return {}
+                resp_data = json.loads(raw)
+                return resp_data.get("data", resp_data)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            raise RuntimeError(f"HTTP {e.code} on {method} {path}: {error_body}") from e
 
     async def _list_vms(self, args: Dict[str, Any]) -> str:
         try:
@@ -230,20 +246,38 @@ class ProxmoxMCPServer(ABIMCPServer):
                         "type": vm.get("type", ""),
                     })
             return json.dumps({"vms": vms, "count": len(vms)})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err and "nodes/" in err:
+                return json.dumps({"error": f"Node '{node}' not found. List cluster resources without the node filter first to see available nodes."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Failed to list VMs: {e}"})
 
     async def _vm_status(self, args: Dict[str, Any]) -> str:
+        if not args.get("node"):
+            return json.dumps({"error": "Node name is required. Provide the 'node' parameter (e.g., 'atlas', 'apollo')."})
+        if not args.get("vmid"):
+            return json.dumps({"error": "VM ID is required. Provide the 'vmid' parameter (numeric)."})
         try:
             node = args["node"]
             vmid = args["vmid"]
             vm_type = args.get("type", "qemu")
             data = self._api_request(f"nodes/{node}/{vm_type}/{vmid}/status/current")
             return json.dumps({"status": data})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": f"VM {vmid} not found on node '{node}'. Use list_vms to find valid VM IDs."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Failed to get VM status: {e}"})
 
     async def _snapshot(self, args: Dict[str, Any]) -> str:
+        if not args.get("node"):
+            return json.dumps({"error": "Node name is required. Provide the 'node' parameter."})
+        if not args.get("vmid"):
+            return json.dumps({"error": "VM ID is required. Provide the 'vmid' parameter."})
         try:
             node = args["node"]
             vmid = args["vmid"]
@@ -256,16 +290,23 @@ class ProxmoxMCPServer(ABIMCPServer):
             elif action == "create":
                 snapname = args.get("snapname")
                 if not snapname:
-                    return json.dumps({"error": "snapname is required for create action."})
+                    return json.dumps({"error": "Snapshot name (snapname) is required for create action. Choose a descriptive name (alphanumeric, dashes ok)."})
                 payload = {"snapname": snapname}
                 if args.get("description"):
                     payload["description"] = args["description"]
                 self._api_request(f"nodes/{node}/qemu/{vmid}/snapshot", method="POST", data=payload)
                 return json.dumps({"status": "created", "snapshot": snapname})
             else:
-                return json.dumps({"error": f"Unknown action: {action}"})
+                return json.dumps({"error": f"Unknown snapshot action: '{action}'. Use 'list' or 'create'."})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": f"VM {vmid} not found on node '{node}'. Use list_vms to find valid VM IDs."})
+            if "409" in err or "already exists" in err:
+                return json.dumps({"error": f"Snapshot '{args.get('snapname', '')}' already exists. Use a different name or list existing snapshots first."})
+            return json.dumps({"error": err})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": f"Snapshot operation failed: {e}"})
 
 
 if __name__ == "__main__":
