@@ -120,6 +120,20 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
+        # ABI-PATCH: route relative paths through per-user sandbox
+        try:
+            from gateway.session_context import get_session_env
+            _abi_user = get_session_env("HERMES_SESSION_USER_ID", "")
+            if _abi_user:
+                from abi.files.sandbox import resolve_path
+                _hermes_home = os.environ.get("HERMES_HOME", "")
+                if _hermes_home:
+                    _agent_home = str(Path(_hermes_home).parent)
+                    _sandboxed = resolve_path(filepath, _abi_user, _agent_home)
+                    return Path(_sandboxed)
+        except Exception:
+            pass  # Fall through to default resolution
+        # END ABI-PATCH
         base = _get_live_tracking_cwd(task_id) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
         )
