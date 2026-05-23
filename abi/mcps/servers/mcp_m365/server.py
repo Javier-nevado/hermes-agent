@@ -13,6 +13,7 @@ Tools:
     m365_chats     — List 1:1 and group chats, send messages
     m365_drive     — List, upload, download OneDrive files
     m365_sharepoint — List SharePoint sites, drives, browse libraries
+    m365_onenote   — List notebooks, sections, read/create pages
     m365_contacts  — List and search contacts
 
 Auth: MSAL device code flow. Agent gives owner URL+code, owner authenticates in browser.
@@ -47,6 +48,7 @@ DEFAULT_SCOPES = [
     "https://graph.microsoft.com/Team.ReadBasic.All",
     "https://graph.microsoft.com/Channel.ReadBasic.All",
     "https://graph.microsoft.com/Sites.Read.All",
+    "https://graph.microsoft.com/Notes.Read",
 ]
 
 
@@ -464,6 +466,81 @@ class M365MCPServer(ABIMCPServer):
                     "required": ["drive_id"],
                 },
             ),
+            # --- OneNote ---
+            types.Tool(
+                name="list_notebooks",
+                description="List OneNote notebooks.",
+                inputSchema={"type": "object", "properties": {}, "required": []},
+            ),
+            types.Tool(
+                name="list_sections",
+                description="List sections in a OneNote notebook.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "notebook_id": {
+                            "type": "string",
+                            "description": "Notebook ID (optional, defaults to first notebook).",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="list_pages",
+                description="List pages in a OneNote section or across all sections.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "section_id": {
+                            "type": "string",
+                            "description": "Section ID (optional, lists recent pages from all sections if omitted).",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max pages (default: 25).",
+                            "default": 25,
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="get_page",
+                description="Read the content of a OneNote page.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "page_id": {
+                            "type": "string",
+                            "description": "Page ID to read.",
+                        },
+                    },
+                    "required": ["page_id"],
+                },
+            ),
+            types.Tool(
+                name="create_page",
+                description="Create a new OneNote page with HTML content.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "section_id": {
+                            "type": "string",
+                            "description": "Section ID (optional, creates in default section).",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Page title.",
+                        },
+                        "body_html": {
+                            "type": "string",
+                            "description": "Page body as HTML.",
+                        },
+                    },
+                    "required": ["title"],
+                },
+            ),
             # --- Contacts ---
             types.Tool(
                 name="list_contacts",
@@ -629,6 +706,12 @@ class M365MCPServer(ABIMCPServer):
             "list_sites": self._list_sites,
             "list_shared_drives": self._list_shared_drives,
             "browse_shared_drive": self._browse_shared_drive,
+            # OneNote
+            "list_notebooks": self._list_notebooks,
+            "list_sections": self._list_sections,
+            "list_pages": self._list_pages,
+            "get_page": self._get_page,
+            "create_page": self._create_page,
             # Contacts
             "list_contacts": self._list_contacts,
         }
@@ -1356,6 +1439,126 @@ class M365MCPServer(ABIMCPServer):
             return json.dumps({"items": items, "count": len(items)})
         except RuntimeError as e:
             return json.dumps({"error": f"Failed to browse shared drive: {e}"})
+
+    # =========================================================================
+    # OneNote
+    # =========================================================================
+
+    async def _list_notebooks(self, args: Dict[str, Any]) -> str:
+        try:
+            data = self._graph_get("/me/onenote/notebooks")
+            notebooks = []
+            for nb in data.get("value", []):
+                notebooks.append({
+                    "id": nb.get("id", ""),
+                    "name": nb.get("displayName", ""),
+                    "created": nb.get("createdDateTime", ""),
+                    "last_modified": nb.get("lastModifiedDateTime", ""),
+                    "url": nb.get("links", {}).get("oneNoteWebUrl", {}).get("href", ""),
+                })
+            return json.dumps({"notebooks": notebooks, "count": len(notebooks)})
+        except RuntimeError as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": "OneNote not available. The tenant may not have OneNote provisioned or Notes.Read permission not granted."})
+            return json.dumps({"error": f"Failed to list notebooks: {e}"})
+
+    async def _list_sections(self, args: Dict[str, Any]) -> str:
+        notebook_id = args.get("notebook_id", "").strip()
+        try:
+            if notebook_id:
+                data = self._graph_get(f"/me/onenote/notebooks/{notebook_id}/sections")
+            else:
+                # Default to first notebook
+                nb_data = self._graph_get("/me/onenote/notebooks")
+                notebooks = nb_data.get("value", [])
+                if not notebooks:
+                    return json.dumps({"sections": [], "count": 0, "hint": "No notebooks found."})
+                data = self._graph_get(f"/me/onenote/notebooks/{notebooks[0]['id']}/sections")
+            sections = []
+            for s in data.get("value", []):
+                sections.append({
+                    "id": s.get("id", ""),
+                    "name": s.get("displayName", ""),
+                    "pages_url": s.get("pagesUrl", ""),
+                })
+            return json.dumps({"sections": sections, "count": len(sections)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list sections: {e}"})
+
+    async def _list_pages(self, args: Dict[str, Any]) -> str:
+        section_id = args.get("section_id", "").strip()
+        limit = min(args.get("limit", 25), 100)
+        try:
+            if section_id:
+                data = self._graph_get(f"/me/onenote/sections/{section_id}/pages", {"$top": str(limit), "$orderby": "lastModifiedDateTime desc"})
+            else:
+                data = self._graph_get("/me/onenote/pages", {"$top": str(limit), "$orderby": "lastModifiedDateTime desc"})
+            pages = []
+            for p in data.get("value", []):
+                pages.append({
+                    "id": p.get("id", ""),
+                    "title": p.get("title", "(untitled)"),
+                    "created": p.get("createdDateTime", ""),
+                    "last_modified": p.get("lastModifiedDateTime", ""),
+                    "self_url": p.get("links", {}).get("oneNoteClientUrl", {}).get("href", ""),
+                })
+            return json.dumps({"pages": pages, "count": len(pages)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list pages: {e}"})
+
+    async def _get_page(self, args: Dict[str, Any]) -> str:
+        page_id = args.get("page_id", "").strip()
+        if not page_id:
+            return json.dumps({"error": "page_id is required."})
+        try:
+            import urllib.request, urllib.error
+            token = self._get_token()
+            if not token:
+                return self._no_creds_error()
+            # OneNote page content is HTML, retrieved from the content endpoint
+            req = urllib.request.Request(
+                f"{GRAPH_BASE}/me/onenote/pages/{page_id}/content",
+                headers={"Authorization": f"Bearer {token}", "accept": "text/html"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                html_content = resp.read().decode("utf-8", errors="replace")
+            return json.dumps({"page_id": page_id, "content": html_content, "content_length": len(html_content)})
+        except Exception as e:
+            err = str(e)
+            if "404" in err:
+                return json.dumps({"error": f"Page {page_id} not found."})
+            return json.dumps({"error": f"Failed to get page: {e}"})
+
+    async def _create_page(self, args: Dict[str, Any]) -> str:
+        title = args.get("title", "").strip()
+        if not title:
+            return json.dumps({"error": "title is required."})
+        body_html = args.get("body_html", "").strip()
+        section_id = args.get("section_id", "").strip()
+        try:
+            import urllib.request, urllib.error
+            token = self._get_token()
+            if not token:
+                return self._no_creds_error()
+            # Build the page HTML
+            page_html = f"<!DOCTYPE html><html><head><title>{title}</title></head><body>{body_html or '<p></p>'}</body></html>"
+            endpoint = f"/me/onenote/sections/{section_id}/pages" if section_id else "/me/onenote/pages"
+            data = page_html.encode("utf-8")
+            req = urllib.request.Request(
+                f"{GRAPH_BASE}{endpoint}", data=data,
+                headers={"Authorization": f"Bearer {token}", "content-type": "text/html"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                result = json.loads(resp.read())
+            return json.dumps({
+                "status": "created",
+                "page_id": result.get("id", ""),
+                "title": result.get("title", title),
+            })
+        except Exception as e:
+            return json.dumps({"error": f"Failed to create page: {e}"})
 
     # =========================================================================
     # Contacts
