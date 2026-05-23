@@ -545,6 +545,38 @@ class M365MCPServer(ABIMCPServer):
                     "required": ["title"],
                 },
             ),
+            types.Tool(
+                name="create_notebook",
+                description="Create a new OneNote notebook.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Notebook name.",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+            types.Tool(
+                name="create_section",
+                description="Create a new section in a OneNote notebook.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "notebook_id": {
+                            "type": "string",
+                            "description": "Notebook ID to create the section in.",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Section name.",
+                        },
+                    },
+                    "required": ["notebook_id", "name"],
+                },
+            ),
             # --- Excel ---
             types.Tool(
                 name="list_worksheets",
@@ -826,6 +858,8 @@ class M365MCPServer(ABIMCPServer):
             "list_pages": self._list_pages,
             "get_page": self._get_page,
             "create_page": self._create_page,
+            "create_notebook": self._create_notebook,
+            "create_section": self._create_section,
             # Excel
             "list_worksheets": self._list_worksheets,
             "get_worksheet_data": self._get_worksheet_data,
@@ -1710,6 +1744,37 @@ class M365MCPServer(ABIMCPServer):
                     "hint": "Pages can only be created in API-compatible sections. The create_page tool will auto-pick the first compatible section if no section_id is provided.",
                 })
             return json.dumps({"error": f"Failed to create page: {e}"})
+
+    async def _create_notebook(self, args: Dict[str, Any]) -> str:
+        name = args.get("name", "").strip()
+        if not name:
+            return json.dumps({"error": "name is required."})
+        try:
+            result = self._graph_post("/me/onenote/notebooks", {"displayName": name})
+            return json.dumps({
+                "status": "created",
+                "notebook_id": result.get("id", ""),
+                "name": result.get("displayName", name),
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to create notebook: {e}"})
+
+    async def _create_section(self, args: Dict[str, Any]) -> str:
+        notebook_id = args.get("notebook_id", "").strip()
+        name = args.get("name", "").strip()
+        if not notebook_id:
+            return json.dumps({"error": "notebook_id is required. Use list_notebooks to find IDs."})
+        if not name:
+            return json.dumps({"error": "name is required."})
+        try:
+            result = self._graph_post(f"/me/onenote/notebooks/{notebook_id}/sections", {"displayName": name})
+            return json.dumps({
+                "status": "created",
+                "section_id": result.get("id", ""),
+                "name": result.get("displayName", name),
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to create section: {e}"})
 
     # =========================================================================
     # Excel
