@@ -1951,7 +1951,7 @@ class M365MCPServer(ABIMCPServer):
             import urllib.parse
             params = {
                 "$top": str(limit),
-                "$select": "displayName,emailAddresses,companyName,jobTitle,phones",
+                "$select": "displayName,emailAddresses,companyName,jobTitle,mobilePhone,businessPhones,homePhones",
                 "$orderby": "displayName",
             }
             if search:
@@ -1963,13 +1963,17 @@ class M365MCPServer(ABIMCPServer):
             contacts = []
             for c in data.get("value", []):
                 emails = [e.get("address", "") for e in c.get("emailAddresses", []) if e.get("address")]
-                phones = [p.get("number", "") for p in c.get("phones", []) if p.get("number")]
+                phone_list = []
+                if c.get("mobilePhone"):
+                    phone_list.append(c["mobilePhone"])
+                phone_list.extend(c.get("businessPhones", []))
+                phone_list.extend(c.get("homePhones", []))
                 contacts.append({
                     "name": c.get("displayName", ""),
                     "emails": emails,
                     "company": c.get("companyName", ""),
                     "job_title": c.get("jobTitle", ""),
-                    "phones": phones,
+                    "phones": phone_list,
                 })
             return json.dumps({"contacts": contacts, "count": len(contacts)})
         except RuntimeError as e:
