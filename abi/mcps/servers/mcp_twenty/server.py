@@ -116,6 +116,7 @@ class TwentyMCPServer(ABIMCPServer):
                 headers={
                     "Authorization": f"Bearer {creds.get('api_key', '')}",
                     "accept": "application/json",
+                    "User-Agent": "Opteia-ABI-MCP/1.0",
                 },
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -164,6 +165,7 @@ class TwentyMCPServer(ABIMCPServer):
             "Authorization": f"Bearer {creds['api_key']}",
             "accept": "application/json",
             "content-type": "application/json",
+            "User-Agent": "Opteia-ABI-MCP/1.0",
         }
         body = json.dumps(data).encode() if data else None
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
