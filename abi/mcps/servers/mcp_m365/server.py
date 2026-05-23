@@ -12,6 +12,7 @@ Tools:
     m365_teams_messages — List/send channel messages
     m365_chats     — List 1:1 and group chats, send messages
     m365_drive     — List, upload, download OneDrive files
+    m365_sharepoint — List SharePoint sites, drives, browse libraries
     m365_contacts  — List and search contacts
 
 Auth: MSAL device code flow. Agent gives owner URL+code, owner authenticates in browser.
@@ -45,6 +46,7 @@ DEFAULT_SCOPES = [
     "https://graph.microsoft.com/ChannelMessage.Send",
     "https://graph.microsoft.com/Team.ReadBasic.All",
     "https://graph.microsoft.com/Channel.ReadBasic.All",
+    "https://graph.microsoft.com/Sites.Read.All",
 ]
 
 
@@ -410,6 +412,58 @@ class M365MCPServer(ABIMCPServer):
                     "required": ["query"],
                 },
             ),
+            # --- SharePoint ---
+            types.Tool(
+                name="list_sites",
+                description="List SharePoint sites the user has access to.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "search": {
+                            "type": "string",
+                            "description": "Search query to filter sites (optional, defaults to all).",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="list_shared_drives",
+                description="List all drives accessible to the user, including SharePoint document libraries.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "site_id": {
+                            "type": "string",
+                            "description": "SharePoint site ID to list its drives (optional, defaults to all drives).",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="browse_shared_drive",
+                description="Browse files and folders in a SharePoint document library or shared drive.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "drive_id": {
+                            "type": "string",
+                            "description": "Drive ID of the SharePoint library.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Folder path within the drive (optional, defaults to root).",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max items (default: 50).",
+                            "default": 50,
+                        },
+                    },
+                    "required": ["drive_id"],
+                },
+            ),
             # --- Contacts ---
             types.Tool(
                 name="list_contacts",
@@ -571,6 +625,10 @@ class M365MCPServer(ABIMCPServer):
             "upload_file": self._upload_file,
             "create_folder": self._create_folder,
             "search_drive": self._search_drive,
+            # SharePoint
+            "list_sites": self._list_sites,
+            "list_shared_drives": self._list_shared_drives,
+            "browse_shared_drive": self._browse_shared_drive,
             # Contacts
             "list_contacts": self._list_contacts,
         }
@@ -1220,6 +1278,84 @@ class M365MCPServer(ABIMCPServer):
             return json.dumps({"items": items, "count": len(items)})
         except RuntimeError as e:
             return json.dumps({"error": f"Failed to search drive: {e}"})
+
+    # =========================================================================
+    # SharePoint
+    # =========================================================================
+
+    async def _list_sites(self, args: Dict[str, Any]) -> str:
+        search = args.get("search", "").strip()
+        try:
+            import urllib.parse
+            if search:
+                data = self._graph_get("/sites", {"search": urllib.parse.quote(search, safe='')})
+            else:
+                data = self._graph_get("/sites", {"search": "*"})
+            sites = []
+            for s in data.get("value", []):
+                sites.append({
+                    "id": s.get("id", ""),
+                    "name": s.get("displayName", ""),
+                    "url": s.get("webUrl", ""),
+                    "description": s.get("description", "")[:200],
+                })
+            return json.dumps({"sites": sites, "count": len(sites)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list SharePoint sites: {e}"})
+
+    async def _list_shared_drives(self, args: Dict[str, Any]) -> str:
+        site_id = args.get("site_id", "").strip()
+        try:
+            import urllib.parse
+            if site_id:
+                # List drives for a specific SharePoint site
+                data = self._graph_get(f"/sites/{site_id}/drives")
+            else:
+                # List all drives accessible to the user (OneDrive + SharePoint libraries)
+                data = self._graph_get("/me/drives")
+            drives = []
+            for d in data.get("value", []):
+                drives.append({
+                    "id": d.get("id", ""),
+                    "name": d.get("name", ""),
+                    "type": d.get("driveType", ""),  # personal, business, documentLibrary
+                    "url": d.get("webUrl", ""),
+                    "owner": d.get("owner", {}).get("user", {}).get("displayName", ""),
+                })
+            return json.dumps({"drives": drives, "count": len(drives)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list drives: {e}"})
+
+    async def _browse_shared_drive(self, args: Dict[str, Any]) -> str:
+        drive_id = args.get("drive_id", "").strip()
+        if not drive_id:
+            return json.dumps({"error": "drive_id is required. Use list_shared_drives to find drive IDs."})
+        path = args.get("path", "").strip()
+        limit = min(args.get("limit", 50), 200)
+        try:
+            import urllib.parse
+            if path:
+                endpoint = f"/drives/{drive_id}/root:/{urllib.parse.quote(path, safe='')}:/children"
+            else:
+                endpoint = f"/drives/{drive_id}/root/children"
+            data = self._graph_get(endpoint, {"$top": str(limit), "$select": "name,size,lastModifiedDateTime,folder,file"})
+            items = []
+            for item in data.get("value", []):
+                entry = {
+                    "name": item.get("name", ""),
+                    "size": item.get("size", 0),
+                    "last_modified": item.get("lastModifiedDateTime", ""),
+                }
+                if item.get("folder"):
+                    entry["type"] = "folder"
+                    entry["child_count"] = item["folder"].get("childCount", 0)
+                elif item.get("file"):
+                    entry["type"] = "file"
+                    entry["mime_type"] = item["file"].get("mimeType", "")
+                items.append(entry)
+            return json.dumps({"items": items, "count": len(items)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to browse shared drive: {e}"})
 
     # =========================================================================
     # Contacts
