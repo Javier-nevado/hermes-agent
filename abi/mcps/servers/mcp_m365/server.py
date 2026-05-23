@@ -14,6 +14,8 @@ Tools:
     m365_drive     — List, upload, download OneDrive files
     m365_sharepoint — List SharePoint sites, drives, browse libraries
     m365_onenote   — List notebooks, sections, read/create pages
+    m365_excel     — List worksheets, read/update cell ranges
+    m365_planner   — List plans, tasks, create/update tasks
     m365_contacts  — List and search contacts
 
 Auth: MSAL device code flow. Agent gives owner URL+code, owner authenticates in browser.
@@ -49,6 +51,8 @@ DEFAULT_SCOPES = [
     "https://graph.microsoft.com/Channel.ReadBasic.All",
     "https://graph.microsoft.com/Sites.Read.All",
     "https://graph.microsoft.com/Notes.Read",
+    "https://graph.microsoft.com/Notes.ReadWrite",
+    "https://graph.microsoft.com/Group.Read.All",
 ]
 
 
@@ -541,6 +545,116 @@ class M365MCPServer(ABIMCPServer):
                     "required": ["title"],
                 },
             ),
+            # --- Excel ---
+            types.Tool(
+                name="list_worksheets",
+                description="List worksheets in an Excel workbook (by Drive item ID or path).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_id": {
+                            "type": "string",
+                            "description": "Drive item ID of the Excel file.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the Excel file in OneDrive (alternative to file_id).",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="get_worksheet_data",
+                description="Read data from an Excel worksheet (entire used range or specific range).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_id": {"type": "string", "description": "Drive item ID of the Excel file."},
+                        "path": {"type": "string", "description": "Path to the Excel file in OneDrive (alternative to file_id)."},
+                        "worksheet": {"type": "string", "description": "Worksheet name (default: first worksheet)."},
+                        "range": {"type": "string", "description": "Cell range (e.g., 'A1:D10'). Omit for entire used range."},
+                    },
+                    "required": [],
+                },
+            ),
+            types.Tool(
+                name="update_worksheet_range",
+                description="Write data to a range in an Excel worksheet.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_id": {"type": "string", "description": "Drive item ID of the Excel file."},
+                        "path": {"type": "string", "description": "Path to the Excel file in OneDrive (alternative to file_id)."},
+                        "worksheet": {"type": "string", "description": "Worksheet name (default: first worksheet)."},
+                        "range": {"type": "string", "description": "Target cell range (e.g., 'A1:C3')."},
+                        "values": {
+                            "type": "array",
+                            "description": "2D array of values (rows of columns). E.g., [[1,2,3],[4,5,6]].",
+                            "items": {"type": "array", "items": {}},
+                        },
+                    },
+                    "required": ["range", "values"],
+                },
+            ),
+            # --- Planner ---
+            types.Tool(
+                name="list_plans",
+                description="List Microsoft Planner plans the user has access to.",
+                inputSchema={"type": "object", "properties": {}, "required": []},
+            ),
+            types.Tool(
+                name="list_plan_tasks",
+                description="List tasks in a Planner plan.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "plan_id": {"type": "string", "description": "Planner plan ID."},
+                    },
+                    "required": ["plan_id"],
+                },
+            ),
+            types.Tool(
+                name="create_planner_task",
+                description="Create a new task in a Planner plan.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "plan_id": {"type": "string", "description": "Planner plan ID."},
+                        "title": {"type": "string", "description": "Task title."},
+                        "bucket_id": {"type": "string", "description": "Bucket ID (optional)."},
+                        "due_date": {"type": "string", "description": "Due date YYYY-MM-DD (optional)."},
+                        "priority": {"type": "integer", "description": "Priority 1 (urgent) to 10 (low). Default: 5."},
+                    },
+                    "required": ["plan_id", "title"],
+                },
+            ),
+            types.Tool(
+                name="update_planner_task",
+                description="Update a Planner task (status, title, due date, etc.).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "Planner task ID."},
+                        "title": {"type": "string", "description": "New title."},
+                        "percent_complete": {"type": "integer", "description": "Completion percentage (0-100). 100 = completed."},
+                        "due_date": {"type": "string", "description": "Due date YYYY-MM-DD."},
+                        "priority": {"type": "integer", "description": "Priority 1-10."},
+                    },
+                    "required": ["task_id"],
+                },
+            ),
+            types.Tool(
+                name="list_plan_buckets",
+                description="List buckets (columns/swimlanes) in a Planner plan.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "plan_id": {"type": "string", "description": "Planner plan ID."},
+                    },
+                    "required": ["plan_id"],
+                },
+            ),
             # --- Contacts ---
             types.Tool(
                 name="list_contacts",
@@ -712,6 +826,16 @@ class M365MCPServer(ABIMCPServer):
             "list_pages": self._list_pages,
             "get_page": self._get_page,
             "create_page": self._create_page,
+            # Excel
+            "list_worksheets": self._list_worksheets,
+            "get_worksheet_data": self._get_worksheet_data,
+            "update_worksheet_range": self._update_worksheet_range,
+            # Planner
+            "list_plans": self._list_plans,
+            "list_plan_tasks": self._list_plan_tasks,
+            "create_planner_task": self._create_planner_task,
+            "update_planner_task": self._update_planner_task,
+            "list_plan_buckets": self._list_plan_buckets,
             # Contacts
             "list_contacts": self._list_contacts,
         }
@@ -1559,6 +1683,262 @@ class M365MCPServer(ABIMCPServer):
             })
         except Exception as e:
             return json.dumps({"error": f"Failed to create page: {e}"})
+
+    # =========================================================================
+    # Excel
+    # =========================================================================
+
+    def _resolve_drive_item(self, file_id: str, path: str) -> str:
+        """Resolve file_id or path to a drive item ID. Returns item ID or raises."""
+        import urllib.parse
+        if file_id:
+            return file_id
+        if not path:
+            raise RuntimeError("Provide either file_id or path.")
+        # Resolve path to item ID
+        data = self._graph_get(f"/me/drive/root:/{urllib.parse.quote(path, safe='')}")
+        item_id = data.get("id", "")
+        if not item_id:
+            raise RuntimeError(f"File not found at path: {path}")
+        return item_id
+
+    async def _list_worksheets(self, args: Dict[str, Any]) -> str:
+        file_id = args.get("file_id", "").strip()
+        path = args.get("path", "").strip()
+        if not file_id and not path:
+            return json.dumps({"error": "Provide either file_id or path to an Excel file."})
+        try:
+            item_id = self._resolve_drive_item(file_id, path)
+            data = self._graph_get(f"/me/drive/items/{item_id}/workbook/worksheets")
+            sheets = []
+            for ws in data.get("value", []):
+                sheets.append({
+                    "id": ws.get("id", ""),
+                    "name": ws.get("name", ""),
+                    "position": ws.get("position", 0),
+                    "visibility": ws.get("visibility", ""),
+                })
+            return json.dumps({"worksheets": sheets, "count": len(sheets)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list worksheets: {e}"})
+
+    async def _get_worksheet_data(self, args: Dict[str, Any]) -> str:
+        file_id = args.get("file_id", "").strip()
+        path = args.get("path", "").strip()
+        worksheet = args.get("worksheet", "").strip()
+        cell_range = args.get("range", "").strip()
+        if not file_id and not path:
+            return json.dumps({"error": "Provide either file_id or path to an Excel file."})
+        try:
+            import urllib.parse
+            item_id = self._resolve_drive_item(file_id, path)
+            # Default to first worksheet if not specified
+            if not worksheet:
+                ws_data = self._graph_get(f"/me/drive/items/{item_id}/workbook/worksheets")
+                sheets = ws_data.get("value", [])
+                if not sheets:
+                    return json.dumps({"error": "No worksheets found in the workbook."})
+                worksheet = sheets[0]["name"]
+
+            ws_encoded = urllib.parse.quote(worksheet, safe='')
+            if cell_range:
+                endpoint = f"/me/drive/items/{item_id}/workbook/worksheets/{ws_encoded}/range(address='{urllib.parse.quote(cell_range, safe='')}')"
+            else:
+                endpoint = f"/me/drive/items/{item_id}/workbook/worksheets/{ws_encoded}/usedRange"
+
+            data = self._graph_get(endpoint)
+            values = data.get("values", [])
+            text = data.get("text", values)
+            return json.dumps({
+                "worksheet": worksheet,
+                "range": cell_range or "usedRange",
+                "rows": len(values),
+                "columns": len(values[0]) if values else 0,
+                "values": values,
+                "text": text,
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to read worksheet data: {e}"})
+
+    async def _update_worksheet_range(self, args: Dict[str, Any]) -> str:
+        file_id = args.get("file_id", "").strip()
+        path = args.get("path", "").strip()
+        worksheet = args.get("worksheet", "").strip()
+        cell_range = args.get("range", "").strip()
+        values = args.get("values", [])
+        if not cell_range:
+            return json.dumps({"error": "range is required (e.g., 'A1:C3')."})
+        if not values:
+            return json.dumps({"error": "values is required (2D array, e.g., [[1,2,3],[4,5,6]])."})
+        if not file_id and not path:
+            return json.dumps({"error": "Provide either file_id or path to an Excel file."})
+        try:
+            import urllib.parse
+            item_id = self._resolve_drive_item(file_id, path)
+            if not worksheet:
+                ws_data = self._graph_get(f"/me/drive/items/{item_id}/workbook/worksheets")
+                sheets = ws_data.get("value", [])
+                if not sheets:
+                    return json.dumps({"error": "No worksheets found in the workbook."})
+                worksheet = sheets[0]["name"]
+
+            ws_encoded = urllib.parse.quote(worksheet, safe='')
+            endpoint = f"/me/drive/items/{item_id}/workbook/worksheets/{ws_encoded}/range(address='{urllib.parse.quote(cell_range, safe='')}')"
+            result = self._graph_patch(endpoint, {"values": values})
+            return json.dumps({
+                "status": "updated",
+                "worksheet": worksheet,
+                "range": cell_range,
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to update worksheet: {e}"})
+
+    # =========================================================================
+    # Planner
+    # =========================================================================
+
+    async def _list_plans(self, args: Dict[str, Any]) -> str:
+        try:
+            # Get plans from groups the user belongs to
+            user_data = self._graph_get("/me")
+            user_id = user_data.get("id", "")
+            # List plans the user has access to via /me/planner/plans (not available)
+            # Planner plans are accessed via groups
+            groups_data = self._graph_get("/me/memberOf", {"$select": "id,displayName,groupTypes"})
+            groups = [g for g in groups_data.get("value", []) if "Unified" in g.get("groupTypes", [])]
+            all_plans = []
+            for group in groups[:20]:  # Limit to avoid too many API calls
+                try:
+                    plans_data = self._graph_get(f"/groups/{group['id']}/planner/plans")
+                    for p in plans_data.get("value", []):
+                        all_plans.append({
+                            "id": p.get("id", ""),
+                            "title": p.get("title", ""),
+                            "owner_group_id": group["id"],
+                            "owner_group_name": group.get("displayName", ""),
+                            "created": p.get("createdDateTime", ""),
+                        })
+                except RuntimeError:
+                    continue  # Group may not have Planner
+            return json.dumps({"plans": all_plans, "count": len(all_plans)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list Planner plans: {e}"})
+
+    async def _list_plan_tasks(self, args: Dict[str, Any]) -> str:
+        plan_id = args.get("plan_id", "").strip()
+        if not plan_id:
+            return json.dumps({"error": "plan_id is required. Use list_plans to find plan IDs."})
+        try:
+            data = self._graph_get(f"/planner/plans/{plan_id}/tasks")
+            tasks = []
+            for t in data.get("value", []):
+                tasks.append({
+                    "id": t.get("id", ""),
+                    "title": t.get("title", ""),
+                    "status": t.get("status", ""),
+                    "percent_complete": t.get("percentComplete", 0),
+                    "priority": t.get("priority", 5),
+                    "bucket_id": t.get("bucketId", ""),
+                    "due_date": t.get("dueDateTime", ""),
+                    "created": t.get("createdDateTime", ""),
+                    "etag": t.get("@odata.etag", ""),
+                })
+            return json.dumps({"tasks": tasks, "count": len(tasks)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list plan tasks: {e}"})
+
+    async def _create_planner_task(self, args: Dict[str, Any]) -> str:
+        plan_id = args.get("plan_id", "").strip()
+        title = args.get("title", "").strip()
+        if not plan_id or not title:
+            return json.dumps({"error": "plan_id and title are required."})
+        try:
+            payload = {"planId": plan_id, "title": title}
+            if args.get("bucket_id"):
+                payload["bucketId"] = args["bucket_id"]
+            if args.get("due_date"):
+                from datetime import datetime
+                try:
+                    dt = datetime.strptime(args["due_date"], "%Y-%m-%d")
+                    payload["dueDateTime"] = {"dateTime": dt.isoformat(), "timeZone": "UTC"}
+                except ValueError:
+                    return json.dumps({"error": f"Invalid due_date '{args['due_date']}'. Use YYYY-MM-DD."})
+            if args.get("priority") is not None:
+                payload["priority"] = args["priority"]
+            result = self._graph_post("/planner/tasks", payload)
+            return json.dumps({
+                "status": "created",
+                "task_id": result.get("id", ""),
+                "title": result.get("title", title),
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to create Planner task: {e}"})
+
+    async def _update_planner_task(self, args: Dict[str, Any]) -> str:
+        task_id = args.get("task_id", "").strip()
+        if not task_id:
+            return json.dumps({"error": "task_id is required."})
+        try:
+            import urllib.request, urllib.error
+            token = self._get_token()
+            if not token:
+                return self._no_creds_error()
+
+            # First get the task to retrieve its etag (required for updates)
+            task_data = self._graph_get(f"/planner/tasks/{task_id}")
+            etag = task_data.get("@odata.etag", "")
+            if not etag:
+                return json.dumps({"error": f"Could not get etag for task {task_id}."})
+
+            payload = {}
+            if args.get("title"):
+                payload["title"] = args["title"]
+            if args.get("percent_complete") is not None:
+                payload["percentComplete"] = args["percent_complete"]
+            if args.get("due_date"):
+                from datetime import datetime
+                try:
+                    dt = datetime.strptime(args["due_date"], "%Y-%m-%d")
+                    payload["dueDateTime"] = {"dateTime": dt.isoformat(), "timeZone": "UTC"}
+                except ValueError:
+                    return json.dumps({"error": f"Invalid due_date '{args['due_date']}'. Use YYYY-MM-DD."})
+            if args.get("priority") is not None:
+                payload["priority"] = args["priority"]
+
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(
+                f"{GRAPH_BASE}/planner/tasks/{task_id}", data=data,
+                headers={"Authorization": f"Bearer {token}", "content-type": "application/json", "If-Match": etag},
+                method="PATCH",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read()
+                result = json.loads(raw) if raw else {}
+            return json.dumps({"status": "updated", "task_id": task_id})
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 412:
+                return json.dumps({"error": "Precondition failed — task was modified by another user. Fetch the latest task and retry."})
+            return json.dumps({"error": f"HTTP {e.code} updating task: {body}"})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to update Planner task: {e}"})
+
+    async def _list_plan_buckets(self, args: Dict[str, Any]) -> str:
+        plan_id = args.get("plan_id", "").strip()
+        if not plan_id:
+            return json.dumps({"error": "plan_id is required. Use list_plans to find plan IDs."})
+        try:
+            data = self._graph_get(f"/planner/plans/{plan_id}/buckets")
+            buckets = []
+            for b in data.get("value", []):
+                buckets.append({
+                    "id": b.get("id", ""),
+                    "name": b.get("name", ""),
+                    "order": b.get("orderHint", ""),
+                })
+            return json.dumps({"buckets": buckets, "count": len(buckets)})
+        except RuntimeError as e:
+            return json.dumps({"error": f"Failed to list plan buckets: {e}"})
 
     # =========================================================================
     # Contacts
