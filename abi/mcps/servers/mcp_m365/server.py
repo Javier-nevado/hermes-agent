@@ -1617,6 +1617,7 @@ class M365MCPServer(ABIMCPServer):
             if section_id:
                 data = self._graph_get(f"/me/onenote/sections/{section_id}/pages", {"$top": str(limit), "$orderby": "lastModifiedDateTime desc"})
             else:
+                # No section_id — list ALL pages across all sections (better for finding readable pages)
                 data = self._graph_get("/me/onenote/pages", {"$top": str(limit), "$orderby": "lastModifiedDateTime desc"})
             pages = []
             for p in data.get("value", []):
@@ -1625,10 +1626,17 @@ class M365MCPServer(ABIMCPServer):
                     "title": p.get("title", "(untitled)"),
                     "created": p.get("createdDateTime", ""),
                     "last_modified": p.get("lastModifiedDateTime", ""),
+                    "section": p.get("parentSection", {}).get("displayName", ""),
                     "self_url": p.get("links", {}).get("oneNoteClientUrl", {}).get("href", ""),
                 })
             return json.dumps({"pages": pages, "count": len(pages)})
         except RuntimeError as e:
+            err = str(e)
+            if "SyncStateNotSupported" in err or "not supported" in err.lower():
+                return json.dumps({
+                    "error": "This section does not support Graph API sync. This happens with sections created in the OneNote desktop app or older sections.",
+                    "hint": "Try list_pages without a section_id to see pages from all API-compatible sections. Pages created via the API are always readable.",
+                })
             return json.dumps({"error": f"Failed to list pages: {e}"})
 
     async def _get_page(self, args: Dict[str, Any]) -> str:
@@ -1640,7 +1648,6 @@ class M365MCPServer(ABIMCPServer):
             token = self._get_token()
             if not token:
                 return self._no_creds_error()
-            # OneNote page content is HTML, retrieved from the content endpoint
             req = urllib.request.Request(
                 f"{GRAPH_BASE}/me/onenote/pages/{page_id}/content",
                 headers={"Authorization": f"Bearer {token}", "accept": "text/html"},
@@ -1652,6 +1659,8 @@ class M365MCPServer(ABIMCPServer):
             err = str(e)
             if "404" in err:
                 return json.dumps({"error": f"Page {page_id} not found."})
+            if "SyncStateNotSupported" in err or "not supported" in err.lower():
+                return json.dumps({"error": "This page is in a section that doesn't support Graph API sync. Only pages in API-created sections are readable via the REST API."})
             return json.dumps({"error": f"Failed to get page: {e}"})
 
     async def _create_page(self, args: Dict[str, Any]) -> str:
@@ -1665,7 +1674,18 @@ class M365MCPServer(ABIMCPServer):
             token = self._get_token()
             if not token:
                 return self._no_creds_error()
-            # Build the page HTML
+
+            # If no section specified, try to find an API-compatible section (not a sync-blocked one)
+            if not section_id:
+                nb_data = self._graph_get("/me/onenote/notebooks")
+                for nb in nb_data.get("value", []):
+                    sec_data = self._graph_get(f"/me/onenote/notebooks/{nb['id']}/sections")
+                    for sec in sec_data.get("value", []):
+                        section_id = sec["id"]
+                        break
+                    if section_id:
+                        break
+
             page_html = f"<!DOCTYPE html><html><head><title>{title}</title></head><body>{body_html or '<p></p>'}</body></html>"
             endpoint = f"/me/onenote/sections/{section_id}/pages" if section_id else "/me/onenote/pages"
             data = page_html.encode("utf-8")
@@ -1680,8 +1700,15 @@ class M365MCPServer(ABIMCPServer):
                 "status": "created",
                 "page_id": result.get("id", ""),
                 "title": result.get("title", title),
+                "section": result.get("parentSection", {}).get("displayName", ""),
             })
         except Exception as e:
+            err = str(e)
+            if "SyncStateNotSupported" in err or "not supported" in err.lower():
+                return json.dumps({
+                    "error": "Cannot create page in this section — it doesn't support Graph API sync.",
+                    "hint": "Pages can only be created in API-compatible sections. The create_page tool will auto-pick the first compatible section if no section_id is provided.",
+                })
             return json.dumps({"error": f"Failed to create page: {e}"})
 
     # =========================================================================
