@@ -46,14 +46,18 @@ class TwentyMCPServer(ABIMCPServer):
         return [
             types.Tool(
                 name="list_companies",
-                description="List companies from the CRM.",
+                description="List companies from the CRM. Supports pagination with cursor.",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "limit": {
                             "type": "integer",
-                            "description": "Number of companies to return (default: 20).",
+                            "description": "Number of companies per page (default: 20, max: 100).",
                             "default": 20,
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "description": "Pagination cursor from previous response (pageInfo.endCursor).",
                         },
                         "search": {
                             "type": "string",
@@ -181,9 +185,13 @@ class TwentyMCPServer(ABIMCPServer):
     async def _list_companies(self, args: Dict[str, Any]) -> str:
         try:
             limit = min(args.get("limit", 20), 100)
+            cursor = args.get("cursor", "").strip()
             path = f"companies?limit={limit}"
+            if cursor:
+                path += f"&after={cursor}"
             if args.get("search"):
-                path += f"&search={args['search']}"
+                import urllib.parse
+                path += f"&search={urllib.parse.quote(args['search'], safe='')}"
             data = self._api_request("GET", path)
             companies = []
             for c in data.get("data", {}).get("companies", data.get("companies", [])):
@@ -192,7 +200,15 @@ class TwentyMCPServer(ABIMCPServer):
                     "name": c.get("name", c.get("displayName", "")),
                     "domain": c.get("domainName", ""),
                 })
-            return json.dumps({"companies": companies, "count": len(companies)})
+            page_info = data.get("pageInfo", {})
+            total = data.get("totalCount", len(companies))
+            return json.dumps({
+                "companies": companies,
+                "count": len(companies),
+                "total": total,
+                "has_next_page": page_info.get("hasNextPage", False),
+                "next_cursor": page_info.get("endCursor", ""),
+            })
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
         except Exception as e:
