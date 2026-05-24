@@ -608,16 +608,16 @@ class TwentyMCPServer(ABIMCPServer):
             note_id = note.get("id", "")
             # Link to company/person/opportunity via noteTargets if requested
             link_errors = []
-            for target_type, target_id in [
-                ("company", args.get("company_id")),
-                ("person", args.get("person_id")),
-                ("opportunity", args.get("opportunity_id")),
+            for target_field, target_id in [
+                ("targetCompanyId", args.get("company_id")),
+                ("targetPersonId", args.get("person_id")),
+                ("targetOpportunityId", args.get("opportunity_id")),
             ]:
                 if target_id:
                     try:
-                        self._graphql(f'mutation {{ createNoteTarget(data: {{ noteId: "{note_id}", {target_type}Id: "{target_id}" }}) {{ id }} }}')
+                        self._graphql(f'mutation {{ createNoteTarget(data: {{ noteId: "{note_id}", {target_field}: "{target_id}" }}) {{ id }} }}')
                     except RuntimeError as e:
-                        link_errors.append(f"{target_type}: {e}")
+                        link_errors.append(f"{target_field}: {e}")
             result = {"status": "created", "id": note_id, "title": note.get("title","")}
             if link_errors:
                 result["warnings"] = link_errors
