@@ -156,7 +156,7 @@ class TwentyMCPServer(ABIMCPServer):
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     def _api_request(self, method: str, path: str, data: Optional[Dict] = None) -> Dict:
-        """Make an authenticated request to Twenty CRM."""
+        """Make an authenticated REST request to Twenty CRM."""
         import urllib.request
         import urllib.error
         creds = self._require_creds()
@@ -182,30 +182,63 @@ class TwentyMCPServer(ABIMCPServer):
             error_body = e.read().decode()
             raise RuntimeError(f"HTTP {e.code} on {method} {path}: {error_body}") from e
 
+    def _graphql_request(self, query: str, variables: Optional[Dict] = None) -> Dict:
+        """Make a GraphQL request to Twenty CRM."""
+        import urllib.request
+        import urllib.error
+        creds = self._require_creds()
+        if not creds:
+            raise ValueError("Not authenticated. Call twenty_login first.")
+
+        base_url = creds["base_url"].rstrip("/")
+        url = f"{base_url}/graphql"
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        data = json.dumps(payload).encode()
+        headers = {
+            "Authorization": f"Bearer {creds['api_key']}",
+            "content-type": "application/json",
+            "User-Agent": "Opteia-ABI-MCP/1.0",
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+            if result.get("errors"):
+                msgs = [e.get("message", str(e)) for e in result["errors"]]
+                raise RuntimeError(f"GraphQL errors: {'; '.join(msgs)}")
+            return result.get("data", {})
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            raise RuntimeError(f"HTTP {e.code} on GraphQL: {error_body}") from e
+
     async def _list_companies(self, args: Dict[str, Any]) -> str:
         try:
             limit = min(args.get("limit", 20), 100)
             cursor = args.get("cursor", "").strip()
-            path = f"companies?limit={limit}"
-            if cursor:
-                path += f"&after={cursor}"
-            if args.get("search"):
-                import urllib.parse
-                path += f"&search={urllib.parse.quote(args['search'], safe='')}"
-            data = self._api_request("GET", path)
+            # Build GraphQL query with cursor-based pagination
+            after_clause = f', after: "{cursor}"' if cursor else ""
+            query = f"""{{ companies(first: {limit}{after_clause}) {{
+                edges {{ node {{ id name domainName }} }}
+                pageInfo {{ hasNextPage endCursor }}
+                totalCount
+            }} }}"""
+            data = self._graphql_request(query)
+            comp_data = data.get("companies", {})
             companies = []
-            for c in data.get("data", {}).get("companies", data.get("companies", [])):
+            for edge in comp_data.get("edges", []):
+                node = edge.get("node", {})
                 companies.append({
-                    "id": c.get("id", ""),
-                    "name": c.get("name", c.get("displayName", "")),
-                    "domain": c.get("domainName", ""),
+                    "id": node.get("id", ""),
+                    "name": node.get("name", ""),
+                    "domain": node.get("domainName", ""),
                 })
-            page_info = data.get("pageInfo", {})
-            total = data.get("totalCount", len(companies))
+            page_info = comp_data.get("pageInfo", {})
             return json.dumps({
                 "companies": companies,
                 "count": len(companies),
-                "total": total,
+                "total": comp_data.get("totalCount", len(companies)),
                 "has_next_page": page_info.get("hasNextPage", False),
                 "next_cursor": page_info.get("endCursor", ""),
             })
