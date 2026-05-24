@@ -359,11 +359,12 @@ class TwentyMCPServer(ABIMCPServer):
             if args.get("search"):
                 where = f', where: {{ name: {{ ilike: "%{self._esc(args["search"])}%" }} }}'
 
-            data = self._graphql(f"""{{{{
-                companies(first: {limit}{after}{where}) {{{{
-                    edges {{ node {{ id name domainName }} }} {PAGE_INFO} totalCount
-                }}}}
-            }}}}'""")
+            query = (
+                "{ companies(first: " + str(limit) + after + where + ") {"
+                " edges { node { id name domainName } } " + PAGE_INFO + " totalCount"
+                " } }"
+            )
+            data = self._graphql(query)
             return self._format_connection(data.get("companies", {}), "companies",
                 lambda n: {"id": n.get("id",""), "name": n.get("name",""), "domain": n.get("domainName","")})
         except RuntimeError as e:
@@ -423,13 +424,14 @@ class TwentyMCPServer(ABIMCPServer):
                 where += f', where: {{ companyId: {{ eq: "{args["company_id"]}" }} }}'
             if args.get("search"):
                 search_where = f'name: {{ or: [{{ firstName: {{ ilike: "%{self._esc(args["search"])}%" }} }}, {{ lastName: {{ ilike: "%{self._esc(args["search"])}%" }} }}] }}'
-                where += f', where: {{ {search_where} }}' if not where else f''  # simplify
+                where += f', where: {{ {search_where} }}' if not where else ""
 
-            data = self._graphql(f"""{{{{
-                people(first: {limit}{after}{where}) {{{{
-                    edges {{ node {{ id name {{ firstName lastName }} jobTitle email }} }} {PAGE_INFO} totalCount
-                }}}}
-            }}}}'""")
+            query = (
+                "{ people(first: " + str(limit) + after + where + ") {"
+                " edges { node { id name { firstName lastName } jobTitle email } } " + PAGE_INFO + " totalCount"
+                " } }"
+            )
+            data = self._graphql(query)
             return self._format_connection(data.get("people", {}), "people",
                 lambda n: {
                     "id": n.get("id",""),
@@ -507,11 +509,12 @@ class TwentyMCPServer(ABIMCPServer):
             if args.get("company_id"):
                 where = f', where: {{ companyId: {{ eq: "{args["company_id"]}" }} }}'
 
-            data = self._graphql(f"""{{{{
-                opportunities(first: {limit}{after}{where}) {{{{
-                    edges {{ node {{ id name amount stage company {{ id name }} }} }} {PAGE_INFO} totalCount
-                }}}}
-            }}}}'""")
+            query = (
+                "{ opportunities(first: " + str(limit) + after + where + ") {"
+                " edges { node { id name amount stage company { id name } } } " + PAGE_INFO + " totalCount"
+                " } }"
+            )
+            data = self._graphql(query)
             return self._format_connection(data.get("opportunities", {}), "opportunities",
                 lambda n: {
                     "id": n.get("id",""),
@@ -583,11 +586,12 @@ class TwentyMCPServer(ABIMCPServer):
             elif args.get("person_id"):
                 where = f', where: {{ noteTargets: {{ some: {{ person: {{ id: {{ eq: "{args["person_id"]}" }} }} }} }} }}'
 
-            data = self._graphql(f"""{{{{
-                notes(first: {limit}{after}{where}) {{{{
-                    edges {{ node {{ id title createdAt }} }} {PAGE_INFO} totalCount
-                }}}}
-            }}}}'""")
+            query = (
+                "{ notes(first: " + str(limit) + after + where + ") {"
+                " edges { node { id title createdAt } } " + PAGE_INFO + " totalCount"
+                " } }"
+            )
+            data = self._graphql(query)
             return self._format_connection(data.get("notes", {}), "notes",
                 lambda n: {"id": n.get("id",""), "title": n.get("title",""), "created_at": n.get("createdAt","")})
         except RuntimeError as e:
@@ -657,11 +661,12 @@ class TwentyMCPServer(ABIMCPServer):
             cursor = args.get("cursor", "").strip()
             after = f', after: "{cursor}"' if cursor else ""
 
-            data = self._graphql(f"""{{{{
-                tasks(first: {limit}{after}) {{{{
-                    edges {{ node {{ id title status dueAt assignee {{ id name {{ firstName lastName }} }} }} }} {PAGE_INFO} totalCount
-                }}}}
-            }}}}'""")
+            query = (
+                "{ tasks(first: " + str(limit) + after + ") {"
+                " edges { node { id title status dueAt assignee { id name { firstName lastName } } } } " + PAGE_INFO + " totalCount"
+                " } }"
+            )
+            data = self._graphql(query)
             return self._format_connection(data.get("tasks", {}), "tasks",
                 lambda n: {
                     "id": n.get("id",""),
