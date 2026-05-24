@@ -20,6 +20,15 @@ Tools:
     twenty_update_opportunity — Update an opportunity
     twenty_delete_opportunity — Delete an opportunity
 
+    twenty_list_notes         — List notes (cursor pagination)
+    twenty_create_note        — Create a note (optionally linked to company/person/opportunity)
+    twenty_delete_note        — Delete a note
+
+    twenty_list_tasks         — List tasks (cursor pagination)
+    twenty_create_task        — Create a task
+    twenty_update_task        — Update a task (status, assignee)
+    twenty_delete_task        — Delete a task
+
 Auth: API key from Twenty CRM settings.
 All operations use GraphQL (Twenty's native API).
 """
@@ -163,6 +172,71 @@ class TwentyMCPServer(ABIMCPServer):
                     "id": {"type": "string", "description": "Opportunity ID to delete."},
                 }, "required": ["id"]},
             ),
+            # --- Notes ---
+            types.Tool(
+                name="list_notes",
+                description="List notes. Supports cursor-based pagination.",
+                inputSchema={"type": "object", "properties": {
+                    "limit": {"type": "integer", "description": "Per page (default 20, max 100).", "default": 20},
+                    "cursor": {"type": "string", "description": "Pagination cursor from next_cursor."},
+                    "company_id": {"type": "string", "description": "Filter by linked company ID."},
+                    "person_id": {"type": "string", "description": "Filter by linked person ID."},
+                }, "required": []},
+            ),
+            types.Tool(
+                name="create_note",
+                description="Create a note. Optionally link to company, person, or opportunity.",
+                inputSchema={"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Note title."},
+                    "body": {"type": "string", "description": "Note body text."},
+                    "company_id": {"type": "string", "description": "Link to company ID."},
+                    "person_id": {"type": "string", "description": "Link to person ID."},
+                    "opportunity_id": {"type": "string", "description": "Link to opportunity ID."},
+                }, "required": ["title"]},
+            ),
+            types.Tool(
+                name="delete_note",
+                description="Delete a note.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Note ID to delete."},
+                }, "required": ["id"]},
+            ),
+            # --- Tasks ---
+            types.Tool(
+                name="list_tasks",
+                description="List tasks. Supports cursor-based pagination.",
+                inputSchema={"type": "object", "properties": {
+                    "limit": {"type": "integer", "description": "Per page (default 20, max 100).", "default": 20},
+                    "cursor": {"type": "string", "description": "Pagination cursor from next_cursor."},
+                }, "required": []},
+            ),
+            types.Tool(
+                name="create_task",
+                description="Create a task.",
+                inputSchema={"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Task title."},
+                    "body": {"type": "string", "description": "Task description."},
+                    "due_at": {"type": "string", "description": "Due date (ISO 8601, e.g. 2026-06-01T00:00:00Z)."},
+                    "assignee_id": {"type": "string", "description": "Person ID to assign."},
+                }, "required": ["title"]},
+            ),
+            types.Tool(
+                name="update_task",
+                description="Update a task (status, title, assignee).",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Task ID."},
+                    "title": {"type": "string", "description": "New title."},
+                    "status": {"type": "string", "description": "New status (TODO, IN_PROGRESS, DONE)."},
+                    "assignee_id": {"type": "string", "description": "New assignee person ID."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="delete_task",
+                description="Delete a task.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Task ID to delete."},
+                }, "required": ["id"]},
+            ),
         ]
 
     # =========================================================================
@@ -249,6 +323,13 @@ class TwentyMCPServer(ABIMCPServer):
             "create_opportunity": self._create_opportunity,
             "update_opportunity": self._update_opportunity,
             "delete_opportunity": self._delete_opportunity,
+            "list_notes": self._list_notes,
+            "create_note": self._create_note,
+            "delete_note": self._delete_note,
+            "list_tasks": self._list_tasks,
+            "create_task": self._create_task,
+            "update_task": self._update_task,
+            "delete_task": self._delete_task,
         }
         handler = dispatch.get(name)
         if handler:
@@ -473,6 +554,138 @@ class TwentyMCPServer(ABIMCPServer):
             return json.dumps({"error": "id is required."})
         try:
             self._graphql(f'mutation {{ deleteOpportunity(id: "{args["id"]}") {{ id }} }}')
+            return json.dumps({"status": "deleted", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    # =========================================================================
+    # Notes
+    # =========================================================================
+
+    async def _list_notes(self, args: Dict[str, Any]) -> str:
+        try:
+            limit = min(args.get("limit", 20), 100)
+            cursor = args.get("cursor", "").strip()
+            after = f', after: "{cursor}"' if cursor else ""
+            where = ""
+            if args.get("company_id"):
+                where = f', where: {{ noteTargets: {{ some: {{ company: {{ id: {{ eq: "{args["company_id"]}" }} }} }} }} }}'
+            elif args.get("person_id"):
+                where = f', where: {{ noteTargets: {{ some: {{ person: {{ id: {{ eq: "{args["person_id"]}" }} }} }} }} }}'
+
+            data = self._graphql(f"""{{{{
+                notes(first: {limit}{after}{where}) {{{{
+                    edges {{ node {{ id title createdAt }} }} {PAGE_INFO} totalCount
+                }}}}
+            }}}}'""")
+            return self._format_connection(data.get("notes", {}), "notes",
+                lambda n: {"id": n.get("id",""), "title": n.get("title",""), "created_at": n.get("createdAt","")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _create_note(self, args: Dict[str, Any]) -> str:
+        if not args.get("title"):
+            return json.dumps({"error": "title is required."})
+        try:
+            fields = f'title: "{self._esc(args["title"])}", bodyV2: {{}}'
+            data = self._graphql(f'mutation {{ createNote(data: {{ {fields} }}) {{ id title }} }}')
+            note = data.get("createNote", {})
+            note_id = note.get("id", "")
+            # Link to company/person/opportunity via noteTargets if requested
+            link_errors = []
+            for target_type, target_id in [
+                ("company", args.get("company_id")),
+                ("person", args.get("person_id")),
+                ("opportunity", args.get("opportunity_id")),
+            ]:
+                if target_id:
+                    try:
+                        self._graphql(f'mutation {{ createNoteTarget(data: {{ noteId: "{note_id}", {target_type}Id: "{target_id}" }}) {{ id }} }}')
+                    except RuntimeError as e:
+                        link_errors.append(f"{target_type}: {e}")
+            result = {"status": "created", "id": note_id, "title": note.get("title","")}
+            if link_errors:
+                result["warnings"] = link_errors
+            return json.dumps(result)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_note(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._graphql(f'mutation {{ deleteNote(id: "{args["id"]}") {{ id }} }}')
+            return json.dumps({"status": "deleted", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    # =========================================================================
+    # Tasks
+    # =========================================================================
+
+    async def _list_tasks(self, args: Dict[str, Any]) -> str:
+        try:
+            limit = min(args.get("limit", 20), 100)
+            cursor = args.get("cursor", "").strip()
+            after = f', after: "{cursor}"' if cursor else ""
+
+            data = self._graphql(f"""{{{{
+                tasks(first: {limit}{after}) {{{{
+                    edges {{ node {{ id title status dueAt assignee {{ id name {{ firstName lastName }} }} }} }} {PAGE_INFO} totalCount
+                }}}}
+            }}}}'""")
+            return self._format_connection(data.get("tasks", {}), "tasks",
+                lambda n: {
+                    "id": n.get("id",""),
+                    "title": n.get("title",""),
+                    "status": n.get("status",""),
+                    "due_at": n.get("dueAt",""),
+                    "assignee": ((n.get("assignee") or {}).get("name") or {}).get("firstName",""),
+                })
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _create_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("title"):
+            return json.dumps({"error": "title is required."})
+        try:
+            fields = [f'title: "{self._esc(args["title"])}"', 'status: "TODO"']
+            if args.get("due_at"):
+                fields.append(f'dueAt: "{self._esc(args["due_at"])}"')
+            if args.get("assignee_id"):
+                fields.append(f'assigneeId: "{args["assignee_id"]}"')
+            data_str = ", ".join(fields)
+            data = self._graphql(f'mutation {{ createTask(data: {{ {data_str} }}) {{ id title status }} }}')
+            t = data.get("createTask", {})
+            return json.dumps({"status": "created", "id": t.get("id",""), "title": t.get("title",""), "task_status": t.get("status","")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _update_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            fields = []
+            if args.get("title"):
+                fields.append(f'title: "{self._esc(args["title"])}"')
+            if args.get("status"):
+                fields.append(f'status: "{self._esc(args["status"])}"')
+            if args.get("assignee_id"):
+                fields.append(f'assigneeId: "{args["assignee_id"]}"')
+            if not fields:
+                return json.dumps({"error": "Provide at least one field to update (title, status, assignee_id)."})
+            data_str = ", ".join(fields)
+            data = self._graphql(f'mutation {{ updateTask(id: "{args["id"]}", data: {{ {data_str} }}) {{ id title status }} }}')
+            t = data.get("updateTask", {})
+            return json.dumps({"status": "updated", "id": t.get("id",""), "title": t.get("title",""), "task_status": t.get("status","")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._graphql(f'mutation {{ deleteTask(id: "{args["id"]}") {{ id }} }}')
             return json.dumps({"status": "deleted", "id": args["id"]})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
