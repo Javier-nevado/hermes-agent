@@ -195,6 +195,15 @@ class TwentyMCPServer(ABIMCPServer):
                 }, "required": ["title"]},
             ),
             types.Tool(
+                name="update_note",
+                description="Update an existing note.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Note ID."},
+                    "title": {"type": "string", "description": "New title."},
+                    "body": {"type": "string", "description": "New body text."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
                 name="delete_note",
                 description="Delete a note.",
                 inputSchema={"type": "object", "properties": {
@@ -325,6 +334,7 @@ class TwentyMCPServer(ABIMCPServer):
             "delete_opportunity": self._delete_opportunity,
             "list_notes": self._list_notes,
             "create_note": self._create_note,
+            "update_note": self._update_note,
             "delete_note": self._delete_note,
             "list_tasks": self._list_tasks,
             "create_task": self._create_task,
@@ -607,6 +617,24 @@ class TwentyMCPServer(ABIMCPServer):
             if link_errors:
                 result["warnings"] = link_errors
             return json.dumps(result)
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _update_note(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            fields = []
+            if args.get("title"):
+                fields.append(f'title: "{self._esc(args["title"])}"')
+            if args.get("body"):
+                fields.append('bodyV2: {}')
+            if not fields:
+                return json.dumps({"error": "Provide at least one field to update (title, body)."})
+            data_str = ", ".join(fields)
+            data = self._graphql(f'mutation {{ updateNote(id: "{args["id"]}", data: {{ {data_str} }}) {{ id title }} }}')
+            n = data.get("updateNote", {})
+            return json.dumps({"status": "updated", "id": n.get("id",""), "title": n.get("title","")})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
