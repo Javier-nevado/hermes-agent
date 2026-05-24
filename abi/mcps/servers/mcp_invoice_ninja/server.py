@@ -176,24 +176,109 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                 inputSchema={"type": "object", "properties": {}, "required": []},
             ),
             types.Tool(
+                name="create_recurring",
+                description="Create a recurring invoice.",
+                inputSchema={"type": "object", "properties": {
+                    "client_id": {"type": "string", "description": "Client ID."},
+                    "line_items": {"type": "string", "description": "JSON array of line items."},
+                    "frequency": {"type": "string", "description": "Frequency: daily, weekly, biweekly, monthly, quarterly, semiannually, annually (default monthly)."},
+                    "next_send_date": {"type": "string", "description": "First send date (YYYY-MM-DD)."},
+                    "due_date_days": {"type": "string", "description": "Days until due from send date (default '14')."},
+                }, "required": ["client_id", "line_items"]},
+            ),
+            # --- Quotes ---
+            types.Tool(
                 name="list_quotes",
                 description="List quotes.",
                 inputSchema={"type": "object", "properties": {}, "required": []},
             ),
-            # --- Tasks & Projects ---
+            types.Tool(
+                name="create_quote",
+                description="Create a quote.",
+                inputSchema={"type": "object", "properties": {
+                    "client_id": {"type": "string", "description": "Client ID."},
+                    "line_items": {"type": "string", "description": "JSON array of line items."},
+                    "valid_until": {"type": "string", "description": "Valid until date (YYYY-MM-DD)."},
+                    "public_notes": {"type": "string", "description": "Public notes."},
+                }, "required": ["client_id", "line_items"]},
+            ),
+            types.Tool(
+                name="quote_to_invoice",
+                description="Convert a quote to an invoice.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Quote ID to convert."},
+                }, "required": ["id"]},
+            ),
+            # --- Tasks ---
             types.Tool(
                 name="list_tasks",
                 description="List tasks.",
                 inputSchema={"type": "object", "properties": {
                     "client_id": {"type": "string", "description": "Filter by client ID."},
+                    "project_id": {"type": "string", "description": "Filter by project ID."},
                 }, "required": []},
             ),
+            types.Tool(
+                name="create_task",
+                description="Create a task.",
+                inputSchema={"type": "object", "properties": {
+                    "description": {"type": "string", "description": "Task description."},
+                    "client_id": {"type": "string", "description": "Client ID."},
+                    "project_id": {"type": "string", "description": "Project ID."},
+                    "rate": {"type": "number", "description": "Hourly rate."},
+                }, "required": ["description"]},
+            ),
+            types.Tool(
+                name="update_task",
+                description="Update a task.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Task ID."},
+                    "description": {"type": "string", "description": "New description."},
+                    "rate": {"type": "number", "description": "New hourly rate."},
+                    "project_id": {"type": "string", "description": "New project ID."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="delete_task",
+                description="Delete a task.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Task ID to delete."},
+                }, "required": ["id"]},
+            ),
+            # --- Projects ---
             types.Tool(
                 name="list_projects",
                 description="List projects.",
                 inputSchema={"type": "object", "properties": {
                     "client_id": {"type": "string", "description": "Filter by client ID."},
                 }, "required": []},
+            ),
+            types.Tool(
+                name="create_project",
+                description="Create a project.",
+                inputSchema={"type": "object", "properties": {
+                    "name": {"type": "string", "description": "Project name."},
+                    "client_id": {"type": "string", "description": "Client ID."},
+                    "budget_hours": {"type": "number", "description": "Budget in hours."},
+                    "task_rate": {"type": "number", "description": "Default task hourly rate."},
+                }, "required": ["name"]},
+            ),
+            types.Tool(
+                name="update_project",
+                description="Update a project.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Project ID."},
+                    "name": {"type": "string", "description": "New name."},
+                    "budget_hours": {"type": "number", "description": "New budget hours."},
+                    "task_rate": {"type": "number", "description": "New task rate."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="delete_project",
+                description="Delete a project.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Project ID to delete."},
+                }, "required": ["id"]},
             ),
         ]
 
@@ -289,9 +374,18 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
             "list_products": self._list_products,
             "create_product": self._create_product,
             "list_recurring": self._list_recurring,
+            "create_recurring": self._create_recurring,
             "list_quotes": self._list_quotes,
+            "create_quote": self._create_quote,
+            "quote_to_invoice": self._quote_to_invoice,
             "list_tasks": self._list_tasks,
+            "create_task": self._create_task,
+            "update_task": self._update_task,
+            "delete_task": self._delete_task,
             "list_projects": self._list_projects,
+            "create_project": self._create_project,
+            "update_project": self._update_project,
+            "delete_project": self._delete_project,
         }
         handler = dispatch.get(name)
         if handler:
@@ -587,6 +681,35 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
+    async def _create_recurring(self, args: Dict[str, Any]) -> str:
+        if not args.get("client_id") or not args.get("line_items"):
+            return json.dumps({"error": "client_id and line_items are required."})
+        try:
+            line_items = json.loads(args["line_items"])
+            freq_map = {
+                "daily": "1", "weekly": "2", "biweekly": "3", "monthly": "4",
+                "quarterly": "5", "semiannually": "6", "annually": "7",
+            }
+            payload = {
+                "client_id": args["client_id"],
+                "line_items": line_items,
+                "frequency_id": freq_map.get(args.get("frequency", "monthly"), "4"),
+            }
+            if args.get("next_send_date"):
+                payload["next_send_date"] = args["next_send_date"]
+            if args.get("due_date_days"):
+                payload["due_date_days"] = args["due_date_days"]
+            data = self._api("POST", "recurring_invoices", payload)
+            inv = data.get("data", data)
+            return json.dumps({
+                "status": "created", "id": inv.get("id", ""),
+                "number": inv.get("number", ""), "amount": inv.get("amount", 0),
+            })
+        except json.JSONDecodeError:
+            return json.dumps({"error": "line_items must be valid JSON array."})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
     async def _list_quotes(self, args: Dict[str, Any]) -> str:
         try:
             data = self._api("GET", "quotes")
@@ -605,8 +728,42 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
+    async def _create_quote(self, args: Dict[str, Any]) -> str:
+        if not args.get("client_id") or not args.get("line_items"):
+            return json.dumps({"error": "client_id and line_items are required."})
+        try:
+            line_items = json.loads(args["line_items"])
+            payload = {
+                "client_id": args["client_id"],
+                "line_items": line_items,
+            }
+            if args.get("valid_until"):
+                payload["valid_until"] = args["valid_until"]
+            if args.get("public_notes"):
+                payload["public_notes"] = args["public_notes"]
+            data = self._api("POST", "quotes", payload)
+            q = data.get("data", data)
+            return json.dumps({
+                "status": "created", "id": q.get("id", ""),
+                "number": q.get("number", ""), "amount": q.get("amount", 0),
+            })
+        except json.JSONDecodeError:
+            return json.dumps({"error": "line_items must be valid JSON array."})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _quote_to_invoice(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            data = self._api("PUT", f"quotes/{args['id']}", params={"convert": "true"})
+            inv = data.get("data", data)
+            return json.dumps({"status": "converted", "id": inv.get("id", ""), "number": inv.get("number", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
     # =========================================================================
-    # Tasks & Projects
+    # Tasks
     # =========================================================================
 
     async def _list_tasks(self, args: Dict[str, Any]) -> str:
@@ -614,6 +771,8 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
             params = {}
             if args.get("client_id"):
                 params["client_id"] = args["client_id"]
+            if args.get("project_id"):
+                params["project_id"] = args["project_id"]
             data = self._api("GET", "tasks", params=params)
             tasks = []
             for t in data.get("data", []):
@@ -629,6 +788,55 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
             return json.dumps({"tasks": tasks, "count": len(tasks)})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
+
+    async def _create_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("description"):
+            return json.dumps({"error": "description is required."})
+        try:
+            payload = {"description": args["description"]}
+            if args.get("client_id"):
+                payload["client_id"] = args["client_id"]
+            if args.get("project_id"):
+                payload["project_id"] = args["project_id"]
+            if args.get("rate") is not None:
+                payload["rate"] = args["rate"]
+            data = self._api("POST", "tasks", payload)
+            t = data.get("data", data)
+            return json.dumps({"status": "created", "id": t.get("id", ""), "description": t.get("description", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _update_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            payload = {}
+            if args.get("description"):
+                payload["description"] = args["description"]
+            if args.get("rate") is not None:
+                payload["rate"] = args["rate"]
+            if args.get("project_id"):
+                payload["project_id"] = args["project_id"]
+            if not payload:
+                return json.dumps({"error": "Provide at least one field to update."})
+            data = self._api("PUT", f"tasks/{args['id']}", payload)
+            t = data.get("data", data)
+            return json.dumps({"status": "updated", "id": t.get("id", ""), "description": t.get("description", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_task(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._api("DELETE", f"tasks/{args['id']}")
+            return json.dumps({"status": "deleted", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    # =========================================================================
+    # Projects
+    # =========================================================================
 
     async def _list_projects(self, args: Dict[str, Any]) -> str:
         try:
@@ -646,6 +854,51 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                     "task_rate": p.get("task_rate", 0),
                 })
             return json.dumps({"projects": projects, "count": len(projects)})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _create_project(self, args: Dict[str, Any]) -> str:
+        if not args.get("name"):
+            return json.dumps({"error": "name is required."})
+        try:
+            payload = {"name": args["name"]}
+            if args.get("client_id"):
+                payload["client_id"] = args["client_id"]
+            if args.get("budget_hours") is not None:
+                payload["budget_hours"] = args["budget_hours"]
+            if args.get("task_rate") is not None:
+                payload["task_rate"] = args["task_rate"]
+            data = self._api("POST", "projects", payload)
+            p = data.get("data", data)
+            return json.dumps({"status": "created", "id": p.get("id", ""), "name": p.get("name", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _update_project(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            payload = {}
+            if args.get("name"):
+                payload["name"] = args["name"]
+            if args.get("budget_hours") is not None:
+                payload["budget_hours"] = args["budget_hours"]
+            if args.get("task_rate") is not None:
+                payload["task_rate"] = args["task_rate"]
+            if not payload:
+                return json.dumps({"error": "Provide at least one field to update."})
+            data = self._api("PUT", f"projects/{args['id']}", payload)
+            p = data.get("data", data)
+            return json.dumps({"status": "updated", "id": p.get("id", ""), "name": p.get("name", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_project(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._api("DELETE", f"projects/{args['id']}")
+            return json.dumps({"status": "deleted", "id": args["id"]})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
