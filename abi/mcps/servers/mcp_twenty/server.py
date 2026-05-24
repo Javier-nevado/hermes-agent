@@ -162,7 +162,7 @@ class TwentyMCPServer(ABIMCPServer):
                     "id": {"type": "string", "description": "Opportunity ID."},
                     "name": {"type": "string", "description": "New name."},
                     "amount": {"type": "number", "description": "New amount."},
-                    "stage": {"type": "string", "description": "New pipeline stage."},
+                    "stage": {"type": "string", "description": "Pipeline stage. Valid values: NEW, SCREENING, MEETING, PROPOSAL, CUSTOMER, WON, LOST, COLD."},
                 }, "required": ["id"]},
             ),
             types.Tool(
@@ -448,17 +448,18 @@ class TwentyMCPServer(ABIMCPServer):
         if missing:
             return json.dumps({"error": f"Missing: {', '.join(missing)}."})
         try:
-            fields = [f'firstName: "{self._esc(args["first_name"])}"', f'lastName: "{self._esc(args["last_name"])}"']
+            name_fields = f'firstName: "{self._esc(args["first_name"])}", lastName: "{self._esc(args["last_name"])}"'
+            data_parts = [f'name: {{ {name_fields} }}']
             if args.get("job_title"):
-                fields.append(f'jobTitle: "{self._esc(args["job_title"])}"')
+                data_parts.append(f'jobTitle: "{self._esc(args["job_title"])}"')
             if args.get("company_id"):
-                fields.append(f'companyId: "{args["company_id"]}"')
-            name_fields = ", ".join(fields)
-            data = self._graphql(f'mutation {{ createPerson(data: {{ name: {{ {name_fields} }} }}) {{ id name {{ firstName lastName }} }} }}')
+                data_parts.append(f'companyId: "{args["company_id"]}"')
+            data_str = ", ".join(data_parts)
+            data = self._graphql(f'mutation {{ createPerson(data: {{ {data_str} }}) {{ id name {{ firstName lastName }} jobTitle }} }}')
             p = data.get("createPerson", {})
             n = p.get("name", {})
             return json.dumps({"status": "created", "id": p.get("id",""),
-                "name": f'{n.get("firstName","")} {n.get("lastName","")}'})
+                "name": f'{n.get("firstName","")} {n.get("lastName","")}', "job_title": p.get("jobTitle","")})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
