@@ -86,6 +86,30 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                     "country_id": {"type": "string", "description": "Country ID (e.g., '462' for Malta)."},
                 }, "required": ["name"]},
             ),
+            types.Tool(
+                name="update_client",
+                description="Update an existing client.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Client ID."},
+                    "name": {"type": "string", "description": "New name."},
+                    "email": {"type": "string", "description": "New email."},
+                    "phone": {"type": "string", "description": "New phone."},
+                    "website": {"type": "string", "description": "New website."},
+                    "vat_number": {"type": "string", "description": "New VAT number."},
+                    "address1": {"type": "string", "description": "New address."},
+                    "city": {"type": "string", "description": "New city."},
+                    "state": {"type": "string", "description": "New state."},
+                    "postal_code": {"type": "string", "description": "New postal code."},
+                    "country_id": {"type": "string", "description": "New country ID."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="archive_client",
+                description="Archive a client.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Client ID to archive."},
+                }, "required": ["id"]},
+            ),
             # --- Invoices ---
             types.Tool(
                 name="list_invoices",
@@ -135,6 +159,24 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                     "id": {"type": "string", "description": "Invoice ID to cancel."},
                 }, "required": ["id"]},
             ),
+            types.Tool(
+                name="update_invoice",
+                description="Update an existing invoice.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Invoice ID."},
+                    "line_items": {"type": "string", "description": "New JSON array of line items."},
+                    "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)."},
+                    "public_notes": {"type": "string", "description": "New public notes."},
+                    "po_number": {"type": "string", "description": "New PO number."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="delete_invoice",
+                description="Delete an invoice.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Invoice ID to delete."},
+                }, "required": ["id"]},
+            ),
             # --- Payments ---
             types.Tool(
                 name="list_payments",
@@ -153,6 +195,13 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                     "transaction_reference": {"type": "string", "description": "Transaction reference."},
                 }, "required": ["invoice_id", "amount"]},
             ),
+            types.Tool(
+                name="get_payment",
+                description="Get a payment by ID.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Payment ID."},
+                }, "required": ["id"]},
+            ),
             # --- Products ---
             types.Tool(
                 name="list_products",
@@ -168,6 +217,24 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
                     "cost": {"type": "number", "description": "Unit price."},
                     "tax_rate": {"type": "number", "description": "Tax rate percentage (default 18)."},
                 }, "required": ["product_key", "cost"]},
+            ),
+            types.Tool(
+                name="update_product",
+                description="Update an existing product.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Product ID."},
+                    "product_key": {"type": "string", "description": "New product key/SKU."},
+                    "notes": {"type": "string", "description": "New description."},
+                    "cost": {"type": "number", "description": "New unit price."},
+                    "tax_rate": {"type": "number", "description": "New tax rate."},
+                }, "required": ["id"]},
+            ),
+            types.Tool(
+                name="delete_product",
+                description="Delete a product.",
+                inputSchema={"type": "object", "properties": {
+                    "id": {"type": "string", "description": "Product ID to delete."},
+                }, "required": ["id"]},
             ),
             # --- Recurring ---
             types.Tool(
@@ -363,16 +430,23 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
             "list_clients": self._list_clients,
             "get_client": self._get_client,
             "create_client": self._create_client,
+            "update_client": self._update_client,
+            "archive_client": self._archive_client,
             "list_invoices": self._list_invoices,
             "get_invoice": self._get_invoice,
             "create_invoice": self._create_invoice,
             "send_invoice": self._send_invoice,
             "mark_paid": self._mark_paid,
             "cancel_invoice": self._cancel_invoice,
+            "update_invoice": self._update_invoice,
+            "delete_invoice": self._delete_invoice,
             "list_payments": self._list_payments,
             "create_payment": self._create_payment,
+            "get_payment": self._get_payment,
             "list_products": self._list_products,
             "create_product": self._create_product,
+            "update_product": self._update_product,
+            "delete_product": self._delete_product,
             "list_recurring": self._list_recurring,
             "create_recurring": self._create_recurring,
             "list_quotes": self._list_quotes,
@@ -463,8 +537,36 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
-    # =========================================================================
-    # Invoices
+    async def _update_client(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            payload = {}
+            for field in ["name", "website", "vat_number", "address1", "city", "state", "postal_code", "country_id"]:
+                if args.get(field):
+                    payload[field] = args[field]
+            contact = {}
+            for field in ["email", "phone"]:
+                if args.get(field):
+                    contact[field] = args[field]
+            if contact:
+                payload["contacts"] = [contact]
+            if not payload:
+                return json.dumps({"error": "Provide at least one field to update."})
+            data = self._api("PUT", f"clients/{args['id']}", payload)
+            c = data.get("data", data)
+            return json.dumps({"status": "updated", "id": c.get("id", ""), "name": c.get("name", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _archive_client(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._api("PUT", f"clients/{args['id']}", params={"archive": "true"})
+            return json.dumps({"status": "archived", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
     # =========================================================================
 
     async def _list_invoices(self, args: Dict[str, Any]) -> str:
@@ -579,6 +681,38 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
+    async def _update_invoice(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            payload = {}
+            if args.get("line_items"):
+                payload["line_items"] = json.loads(args["line_items"])
+            if args.get("due_date"):
+                payload["due_date"] = args["due_date"]
+            if args.get("public_notes"):
+                payload["public_notes"] = args["public_notes"]
+            if args.get("po_number"):
+                payload["po_number"] = args["po_number"]
+            if not payload:
+                return json.dumps({"error": "Provide at least one field to update."})
+            data = self._api("PUT", f"invoices/{args['id']}", payload)
+            inv = data.get("data", data)
+            return json.dumps({"status": "updated", "id": inv.get("id", ""), "number": inv.get("number", "")})
+        except json.JSONDecodeError:
+            return json.dumps({"error": "line_items must be valid JSON array."})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_invoice(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._api("DELETE", f"invoices/{args['id']}")
+            return json.dumps({"status": "deleted", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
     # =========================================================================
     # Payments
     # =========================================================================
@@ -620,8 +754,22 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
-    # =========================================================================
-    # Products
+    async def _get_payment(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            data = self._api("GET", f"payments/{args['id']}")
+            p = data.get("data", data)
+            return json.dumps({
+                "id": p.get("id", ""),
+                "amount": p.get("amount", 0),
+                "date": p.get("date", ""),
+                "transaction_reference": p.get("transaction_reference", ""),
+                "client_id": p.get("client_id", ""),
+                "invoices": p.get("invoices", []),
+            })
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
     # =========================================================================
 
     async def _list_products(self, args: Dict[str, Any]) -> str:
@@ -659,8 +807,36 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
 
-    # =========================================================================
-    # Recurring, Quotes
+    async def _update_product(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            payload = {}
+            if args.get("product_key"):
+                payload["product_key"] = args["product_key"]
+            if args.get("notes"):
+                payload["notes"] = args["notes"]
+            if args.get("cost") is not None:
+                payload["cost"] = args["cost"]
+            if args.get("tax_rate") is not None:
+                payload["tax_name1"] = "VAT"
+                payload["tax_rate1"] = str(args["tax_rate"])
+            if not payload:
+                return json.dumps({"error": "Provide at least one field to update."})
+            data = self._api("PUT", f"products/{args['id']}", payload)
+            p = data.get("data", data)
+            return json.dumps({"status": "updated", "id": p.get("id", ""), "product_key": p.get("product_key", "")})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
+
+    async def _delete_product(self, args: Dict[str, Any]) -> str:
+        if not args.get("id"):
+            return json.dumps({"error": "id is required."})
+        try:
+            self._api("DELETE", f"products/{args['id']}")
+            return json.dumps({"status": "deleted", "id": args["id"]})
+        except RuntimeError as e:
+            return json.dumps({"error": str(e)})
     # =========================================================================
 
     async def _list_recurring(self, args: Dict[str, Any]) -> str:
