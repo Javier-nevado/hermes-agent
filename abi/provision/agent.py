@@ -325,6 +325,14 @@ def interactive_main() -> None:
         print("    Must start with lowercase letter, only lowercase/numbers/underscores.")
         name = prompt("Agent name")
     display_name = prompt("Display name", name.replace("_", " ").title())
+
+    # Detect re-provision
+    is_reprovision = run(["id", name], check=False).returncode == 0
+    if is_reprovision:
+        print()
+        print(f"    ⚠ Agent '{name}' already exists — this is a RE-PROVISION.")
+        print(f"    Config, .env, and SOUL.md will be overwritten.")
+        print(f"    The agent service will be restarted to pick up changes.")
     print()
 
     # ── Step 2: Role ────────────────────────────────────────────────
@@ -462,6 +470,10 @@ def interactive_main() -> None:
 
     # ── Summary ─────────────────────────────────────────────────────
     print("  ━━━ Review ━━━")
+    if is_reprovision:
+        print("    Mode:        RE-PROVISION (agent exists, will restart service)")
+    else:
+        print("    Mode:        New agent")
     print(f"    Name:        {name}")
     print(f"    Display:     {display_name}")
     print(f"    Role:        {role}")
@@ -492,6 +504,7 @@ def interactive_main() -> None:
         provider_slug=provider_slug,
         model=model,
         base_url=base_url,
+        is_reprovision=is_reprovision,
     )
 
     sys.exit(0 if result["status"] == "running" else 1)
@@ -784,6 +797,7 @@ def provision(
     provider_slug: str = "zai",
     model: str = "",
     base_url: str = "",
+    is_reprovision: bool = False,
 ) -> Dict:
     """Full agent provisioning (12 steps).
 
@@ -802,6 +816,7 @@ def provision(
         provider_slug: AI provider (zai, anthropic, etc.).
         model: Model name override.
         base_url: API base URL override.
+        is_reprovision: True if agent already exists (triggers restart).
 
     Returns:
         Dict with provisioning results.
@@ -871,7 +886,21 @@ def provision(
     setup_systemd(name, display_name, memory_limit)
 
     step(11, total_steps, "Starting service")
-    enable_and_start(name)
+    if is_reprovision:
+        # For re-provision: clear pycache and restart to pick up new config
+        print("  Re-provision detected: clearing caches and restarting...")
+        run(["find", "/opt/hermes-agent/abi", "-name", "__pycache__", "-type", "d", "-exec", "rm", "-rf", "{}", "+"], check=False)
+        # Get UID for the user
+        uid_result = run(["id", "-u", name], check=True)
+        uid = uid_result.stdout.strip()
+        run([
+            "sudo", "-u", name,
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            "systemctl", "--user", "restart", "abi-agent.service",
+        ], check=False)
+        print("  Service restarted.")
+    else:
+        enable_and_start(name)
 
     step(12, total_steps, "Verifying")
     ok = verify_agent(name, telegram_token)
