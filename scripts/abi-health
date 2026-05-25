@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""ABI Health Check — agent services + DB + Dreamer status.
+
+Usage:
+    sudo scripts/abi-health          # Full status
+    sudo scripts/abi-health --json   # JSON output for monitoring
+"""
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+def get_agent_users():
+    """Find all ABI agent Linux users by checking abi_agents DB table."""
+    try:
+        r = subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-d", "abi_memory", "-t", "-A", "-c",
+             "SELECT username FROM abi_agents WHERE status='active'"],
+            capture_output=True, text=True, timeout=5
+        )
+        agent_names = [line.strip() for line in r.stdout.strip().splitlines() if line.strip()]
+    except Exception:
+        return []
+
+    users = []
+    for name in agent_names:
+        try:
+            uid_result = subprocess.run(["id", "-u", name], capture_output=True, text=True)
+            if uid_result.returncode != 0:
+                users.append({"name": name, "status": "no_user", "memory_mb": 0, "memory_max_mb": 0, "memory_pct": 0, "pid": 0})
+                continue
+            uid = uid_result.stdout.strip()
+            r = subprocess.run(
+                ["sudo", "-u", name, f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                 "systemctl", "--user", "show", "abi-agent.service",
+                 "--property=ActiveState,MemoryCurrent,MemoryMax,MainPID"],
+                capture_output=True, text=True, timeout=5
+            )
+            props = {}
+            for line in r.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k] = v
+            status = props.get("ActiveState", "unknown")
+            mem = int(props.get("MemoryCurrent", "0") or "0")
+            mem_max = int(props.get("MemoryMax", "0") or "0")
+            pid = props.get("MainPID", "0")
+            users.append({
+                "name": name,
+                "status": status,
+                "memory_mb": round(mem / 1024 / 1024, 1),
+                "memory_max_mb": round(mem_max / 1024 / 1024, 1),
+                "memory_pct": round(mem / mem_max * 100, 1) if mem_max else 0,
+                "pid": int(pid) if pid.isdigit() else 0,
+            })
+        except Exception:
+            users.append({"name": name, "status": "error", "memory_mb": 0, "memory_max_mb": 0, "memory_pct": 0, "pid": 0})
+    return users
+
+
+def check_db():
+    """Check PostgreSQL connectivity."""
+    try:
+        r = subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-d", "abi_memory", "-t", "-A", "-c",
+             "SELECT count(*) FROM abi_agents WHERE status='active'"],
+            capture_output=True, text=True, timeout=5
+        )
+        count = int(r.stdout.strip())
+        r2 = subprocess.run(
+            ["sudo", "-u", "postgres", "psql", "-d", "abi_memory", "-t", "-A", "-c",
+             "SELECT count(*) FROM abi_memories"],
+            capture_output=True, text=True, timeout=5
+        )
+        mem_count = int(r2.stdout.strip())
+        return {"connected": True, "active_agents": count, "total_memories": mem_count}
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
+
+
+def main():
+    use_json = "--json" in sys.argv
+    agents = get_agent_users()
+    db = check_db()
+
+    if use_json:
+        print(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "agents": agents, "db": db}, indent=2))
+        return
+
+    print(f"=== ABI Health Check — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC ===\n")
+    db_status = "OK" if db["connected"] else "DOWN"
+    db_detail = f"{db.get('active_agents', '?')} agents, {db.get('total_memories', '?')} memories"
+    print(f"Database: {db_status} ({db_detail})\n")
+    print(f"{'Agent':<12} {'Status':<10} {'Memory':<22} {'PID':<8}")
+    print("-" * 52)
+    for a in agents:
+        mem = f"{a['memory_mb']}/{a['memory_max_mb']}MB ({a['memory_pct']}%)"
+        icon = "ok" if a["status"] == "active" else "!!"
+        print(f"{a['name']:<12} {icon} {a['status']:<8} {mem:<22} {a['pid']:<8}")
+    print()
+
+if __name__ == "__main__":
+    main()
