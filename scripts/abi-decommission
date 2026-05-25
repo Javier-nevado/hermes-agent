@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""ABI Agent Decommission — remove agent user, service, DB records.
+
+Usage:
+    sudo .venv/bin/python3 scripts/abi-decommission <agent_name>
+    sudo .venv/bin/python3 scripts/abi-decommission atlas
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO))
+
+DB_NAME = "abi_memory"
+
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+def get_connection():
+    import psycopg2
+    import os
+    return psycopg2.connect(
+        host=os.environ.get("ABI_DB_HOST", "localhost"),
+        port=os.environ.get("ABI_DB_PORT", "5432"),
+        dbname=DB_NAME,
+        user=os.environ.get("ABI_DB_USER", "abi_agent"),
+        password=os.environ.get("ABI_DB_PASS", "abi_local_dev_2026"),
+    )
+
+
+def decommission(name: str):
+    name = name.strip().lower()
+    if not name:
+        print("Error: agent name required.")
+        sys.exit(1)
+
+    # 0. Confirm
+    print(f"\n=== Decommission Agent: {name} ===\n")
+
+    # Check if agent exists in DB
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT username, display_name, role, status FROM abi_agents WHERE username = %s", (name,))
+        agent = cur.fetchone()
+
+    if not agent:
+        conn.close()
+        print(f"Agent '{name}' not found in abi_agents table.")
+        print("Checking for Linux user anyway...")
+
+    # Show agent info
+    if agent:
+        cols = ["username", "display_name", "role", "status"]
+        info = dict(zip(cols, agent))
+        print(f"  Display name : {info['display_name']}")
+        print(f"  Role         : {info['role']}")
+        print(f"  Status       : {info['status']}")
+
+        # Count memories
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM abi_memories WHERE agent_name = %s", (name,))
+            mem_count = cur.fetchone()[0]
+        print(f"  Memories     : {mem_count}")
+        conn.close()
+
+    # Check Linux user
+    uid_result = run(["id", "-u", name])
+    has_linux_user = uid_result.returncode == 0
+    uid = uid_result.stdout.strip() if has_linux_user else None
+    if has_linux_user:
+        print(f"  Linux user   : exists (UID {uid})")
+    else:
+        print(f"  Linux user   : not found")
+
+    # Check systemd service
+    has_service = False
+    if has_linux_user:
+        svc_result = run([
+            "sudo", "-u", name, f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            "systemctl", "--user", "status", "abi-agent.service",
+        ])
+        has_service = svc_result.returncode in (0, 3)  # 0=active, 3=inactive/failed
+    print(f"  Service      : {'exists' if has_service else 'not found'}")
+
+    print()
+    confirm = input(f"Type '{name}' to confirm decommission: ").strip()
+    if confirm != name:
+        print("Aborted.")
+        sys.exit(0)
+
+    print()
+
+    # 1. Stop + disable systemd service
+    if has_service and has_linux_user:
+        print(f"[1/5] Stopping service...")
+        run(["sudo", "-u", name, f"XDG_RUNTIME_DIR=/run/user/{uid}",
+             "systemctl", "--user", "stop", "abi-agent.service"])
+        run(["sudo", "-u", name, f"XDG_RUNTIME_DIR=/run/user/{uid}",
+             "systemctl", "--user", "disable", "abi-agent.service"])
+        # Remove service file
+        svc_path = Path(f"/home/{name}/.config/systemd/user/abi-agent.service")
+        if svc_path.exists():
+            run(["sudo", "rm", str(svc_path)])
+            run(["sudo", "-u", name, f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                 "systemctl", "--user", "daemon-reload"])
+        print("  Service stopped, disabled, and removed.")
+    else:
+        print("[1/5] No service to stop.")
+
+    # 2. Delete Linux user + home directory
+    if has_linux_user:
+        print(f"[2/5] Removing Linux user '{name}'...")
+        # Kill any remaining processes
+        run(["sudo", "pkill", "-u", name])
+        result = run(["sudo", "userdel", "-r", name])
+        if result.returncode == 0:
+            print(f"  User '{name}' and home directory removed.")
+        else:
+            # Try without -r in case home is already gone
+            run(["sudo", "userdel", name])
+            print(f"  User '{name}' removed (home already gone).")
+    else:
+        print("[2/5] No Linux user to remove.")
+
+    # 3. Delete DB records
+    conn = get_connection()
+    with conn.cursor() as cur:
+        # Delete memories first (foreign key safety)
+        cur.execute("DELETE FROM abi_memories WHERE agent_name = %s", (name,))
+        mem_deleted = cur.rowcount
+        # Delete agent record
+        cur.execute("DELETE FROM abi_agents WHERE username = %s", (name,))
+        agent_deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    print(f"[3/5] DB cleanup: {mem_deleted} memories deleted, agent record {'removed' if agent_deleted else 'not found'}.")
+
+    # 4. Verify
+    print("[4/5] Verifying...")
+    checks = []
+    uid_check = run(["id", name])
+    checks.append(("Linux user removed", uid_check.returncode != 0))
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM abi_agents WHERE username = %s", (name,))
+        checks.append(("DB agent removed", cur.fetchone()[0] == 0))
+        cur.execute("SELECT count(*) FROM abi_memories WHERE agent_name = %s", (name,))
+        checks.append(("DB memories removed", cur.fetchone()[0] == 0))
+    conn.close()
+
+    all_ok = True
+    for label, ok in checks:
+        status = "OK" if ok else "WARN"
+        if not ok:
+            all_ok = False
+        print(f"  {status}: {label}")
+
+    # 5. Summary
+    print(f"\n=== Decommission {'complete' if all_ok else 'finished with warnings'} ===")
+    print(f"  Agent '{name}' fully removed.\n")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    decommission(sys.argv[1])
+
+
+if __name__ == "__main__":
+    main()
