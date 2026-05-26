@@ -623,7 +623,12 @@ class InvoiceNinjaMCPServer(ABIMCPServer):
         if not args.get("id"):
             return json.dumps({"error": "id is required."})
         try:
-            self._api("GET", f"invoices/{args['id']}/send")
+            # Invoice Ninja bulk action endpoint (recommended by IN creator)
+            # POST /api/v1/invoices/bulk with {"action": "email", "ids": [...]}
+            self._api("POST", "invoices/bulk", data={
+                "action": "email",
+                "ids": [args["id"]],
+            })
             return json.dumps({"status": "sent", "id": args["id"]})
         except RuntimeError as e:
             return json.dumps({"error": str(e)})
