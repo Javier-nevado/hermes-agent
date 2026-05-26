@@ -1,10 +1,10 @@
-"""ABI Dreamer — nightly memory insight generator.
+"""ABI Dreamer v2 — nightly memory intelligence pipeline.
 
-Runs as a cron job (or systemd timer). For each active agent:
-1. Reads recent memories (respecting DLP clearance)
-2. Groups memories by topic/pattern
-3. Generates insights stored as new memories at internal/public DLP level
-4. Logs summary to stdout
+4-phase pipeline:
+1. Deduplication: find and remove near-duplicate memories (>90% similarity)
+2. Contradiction detection: flag conflicting facts sharing entities
+3. Consolidation: generate summary insights from entity-grouped memories
+4. Temporal maintenance: flag stale facts and auto-expire dated information
 
 Usage:
     python3 -m abi.dreamer                    # All agents
@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from abi.memory.dlp import dlp_where
 
-# DB connection
 DB_HOST = os.environ.get("ABI_DB_HOST", "localhost")
 DB_PORT = os.environ.get("ABI_DB_PORT", "5432")
 DB_NAME = os.environ.get("ABI_DB_NAME", "abi_memory")
@@ -32,6 +31,7 @@ DB_USER = os.environ.get("ABI_DB_USER", "abi_agent")
 DB_PASS = os.environ.get("ABI_DB_PASS", "abi_local_dev_2026")
 
 import psycopg2
+import psycopg2.extras
 
 
 def get_connection():
@@ -42,131 +42,233 @@ def get_connection():
 
 
 def get_active_agents(conn) -> List[Dict]:
-    """Get all active agents from the registry."""
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT username, display_name, role, clearance FROM abi_agents WHERE status = 'active'")
-        cols = ["username", "display_name", "role", "clearance"]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return cur.fetchall()
 
 
-def get_recent_memories(conn, agent_name: str, clearance: str, days: int = 7) -> List[Dict]:
-    """Fetch recent memories for an agent, filtered by DLP clearance."""
+# --- Phase 1: Deduplication ---
+
+def phase_dedup(conn, agent_name: str, dry_run: bool) -> Dict:
+    """Find and remove near-duplicate memories (>90% embedding similarity)."""
+    stats = {"scanned": 0, "duplicates_found": 0, "removed": 0}
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Self-join to find pairs with high cosine similarity
+        cur.execute("""
+            SELECT m1.id AS id1, m2.id AS id2,
+                   1 - (m1.embedding <=> m2.embedding) AS similarity,
+                   m1.content AS content1, m2.content AS content2,
+                   m1.created_at AS created1, m2.created_at AS created2
+            FROM abi_memories m1
+            JOIN abi_memories m2 ON m1.id < m2.id
+                AND m1.agent_name = m2.agent_name
+                AND m1.embedding IS NOT NULL
+                AND m2.embedding IS NOT NULL
+                AND 1 - (m1.embedding <=> m2.embedding) > 0.90
+            WHERE m1.agent_name = %s
+              AND m1.source_type != 'dreamer'
+              AND m2.source_type != 'dreamer'
+              AND m1.superseded_by IS NULL
+              AND m2.superseded_by IS NULL
+            ORDER BY similarity DESC
+            LIMIT 50
+        """, [agent_name])
+        pairs = cur.fetchall()
+        stats["scanned"] = len(pairs)
+
+    # Keep the newer one, delete the older one
+    to_delete = set()
+    for pair in pairs:
+        stats["duplicates_found"] += 1
+        # Keep the newer memory
+        if pair["created1"] > pair["created2"]:
+            to_delete.add(str(pair["id2"]))
+        else:
+            to_delete.add(str(pair["id1"]))
+
+    if not dry_run and to_delete:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM abi_memories WHERE id::text = ANY(%s) AND agent_name = %s",
+                [list(to_delete), agent_name],
+            )
+            stats["removed"] = cur.rowcount
+            conn.commit()
+
+    return stats
+
+
+# --- Phase 2: Contradiction Detection ---
+
+def phase_contradictions(conn, agent_name: str, clearance: str, dry_run: bool) -> Dict:
+    """Find memories sharing entities but with potentially conflicting content."""
+    stats = {"checked": 0, "contradictions_flagged": 0}
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Find entity pairs that appear in multiple memories
+        cur.execute("""
+            SELECT e.name AS entity_name, e.type AS entity_type,
+                   array_agg(DISTINCT m.id::text) AS memory_ids,
+                   array_agg(DISTINCT m.content) AS contents,
+                   count(DISTINCT m.id) AS memory_count
+            FROM abi_memory_entities me
+            JOIN abi_entities e ON me.entity_id = e.id
+            JOIN abi_memories m ON me.memory_id = m.id
+            WHERE m.agent_name = %s
+              AND m.source_type != 'dreamer'
+              AND m.source_type != 'contradiction_alert'
+              AND m.superseded_by IS NULL
+            GROUP BY e.name, e.type
+            HAVING count(DISTINCT m.id) >= 3
+            ORDER BY memory_count DESC
+            LIMIT 20
+        """, [agent_name])
+        entity_groups = cur.fetchall()
+
+    for group in entity_groups:
+        stats["checked"] += 1
+        contents = group["contents"]
+
+        # Simple heuristic: if contents are about same entity but embedding similarity is low
+        # (< 0.5), they might be contradictory
+        # For now, just flag entities with many memories for agent review
+        if len(contents) >= 3:
+            stats["contradictions_flagged"] += 1
+            if not dry_run:
+                alert_content = (
+                    f"Entity '{group['entity_name']}' ({group['entity_type']}) "
+                    f"has {group['memory_count']} memories. "
+                    f"Consider reviewing for potential contradictions or consolidation."
+                )
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO abi_memories (content, dlp_level, agent_name, source_type, metadata)
+                           VALUES (%s, 'internal', %s, 'contradiction_alert', %s)""",
+                        [alert_content, agent_name,
+                         json.dumps({"entity": group["entity_name"], "type": "contradiction_alert",
+                                     "memory_count": group["memory_count"]})],
+                    )
+                    conn.commit()
+
+    return stats
+
+
+# --- Phase 3: Consolidation ---
+
+def phase_consolidate(conn, agent_name: str, clearance: str, dry_run: bool) -> Dict:
+    """Generate summary insights from entity-grouped memories."""
+    stats = {"groups_processed": 0, "insights_generated": 0}
+
     where_clause, params = dlp_where(clearance, agent_name)
 
-    query = f"""
-        SELECT id, content, dlp_level, agent_name, user_id, source_type, created_at, metadata
-        FROM abi_memories
-        WHERE {where_clause}
-          AND created_at > NOW() - INTERVAL '%s days'
-          AND source_type != 'dreamer'
-        ORDER BY created_at DESC
-        LIMIT 200
-    """
-    params.append(days)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Get memories from last 7 days, grouped by shared entities
+        cur.execute(f"""
+            SELECT e.name AS entity_name, e.type AS entity_type,
+                   array_agg(DISTINCT m.content) AS contents,
+                   count(DISTINCT m.id) AS memory_count
+            FROM abi_memory_entities me
+            JOIN abi_entities e ON me.entity_id = e.id
+            JOIN abi_memories m ON me.memory_id = m.id
+            WHERE m.agent_name = %s
+              AND {where_clause}
+              AND m.source_type != 'dreamer'
+              AND m.source_type != 'contradiction_alert'
+              AND m.created_at > NOW() - INTERVAL '7 days'
+              AND m.superseded_by IS NULL
+            GROUP BY e.name, e.type
+            HAVING count(DISTINCT m.id) >= 2
+            ORDER BY memory_count DESC
+            LIMIT 20
+        """, [agent_name] + params)
+        groups = cur.fetchall()
 
-    with conn.cursor() as cur:
-        cur.execute(query, params)
-        cols = ["id", "content", "dlp_level", "agent_name", "user_id", "source_type", "created_at", "metadata"]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    for group in groups:
+        stats["groups_processed"] += 1
+        contents = group["contents"]
 
-
-def analyze_patterns(memories: List[Dict]) -> List[Dict]:
-    """Analyze memories and identify patterns/topics.
-
-    Simple approach: group by keywords, detect frequency patterns,
-    identify recurring themes. No LLM needed for the MVP.
-    """
-    if not memories:
-        return []
-
-    # Group by source type
-    by_source = {}
-    for m in memories:
-        src = m.get("source_type", "unknown")
-        by_source.setdefault(src, []).append(m)
-
-    insights = []
-
-    # Insight: conversation volume
-    conv_memories = by_source.get("conversation", by_source.get("agent_tool", []))
-    if len(conv_memories) >= 3:
-        insights.append({
-            "type": "activity_summary",
-            "content": f"Agent had {len(conv_memories)} memory entries in the last 7 days. "
-                       f"Topics covered: {', '.join(set(m['content'][:50] for m in conv_memories[:10]))}",
-            "dlp_level": "internal",
-        })
-
-    # Insight: user interactions
-    user_ids = set(m.get("user_id") for m in memories if m.get("user_id"))
-    if len(user_ids) >= 2:
-        insights.append({
-            "type": "multi_user_activity",
-            "content": f"Interacted with {len(user_ids)} different users this week: {', '.join(user_ids)}",
-            "dlp_level": "internal",
-        })
-
-    # Insight: tool usage patterns
-    tool_memories = [m for m in memories if "tool" in m.get("source_type", "")]
-    if len(tool_memories) >= 3:
-        insights.append({
-            "type": "tool_usage",
-            "content": f"Used {len(tool_memories)} tool-related operations. "
-                       f"Most active source: {max(by_source, key=lambda k: len(by_source[k]))}",
-            "dlp_level": "internal",
-        })
-
-    # Insight: topic clustering (simple keyword extraction)
-    all_content = " ".join(m["content"] for m in memories[:50]).lower()
-    keywords = {}
-    stop_words = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-                  "have", "has", "had", "do", "does", "did", "will", "would", "could",
-                  "should", "may", "might", "can", "shall", "for", "to", "of", "in",
-                  "on", "at", "by", "from", "with", "and", "or", "but", "not", "this",
-                  "that", "it", "its", "as", "if", "so", "no", "up", "out", "about"}
-    for word in all_content.split():
-        word = word.strip(".,!?;:\"'()[]{}").strip()
-        if len(word) > 3 and word not in stop_words:
-            keywords[word] = keywords.get(word, 0) + 1
-
-    top_topics = sorted(keywords.items(), key=lambda x: -x[1])[:5]
-    if top_topics:
-        topic_str = ", ".join(f"{word} ({count})" for word, count in top_topics)
-        insights.append({
-            "type": "topic_summary",
-            "content": f"Top topics this week: {topic_str}",
-            "dlp_level": "public",
-        })
-
-    return insights
-
-
-def store_insight(conn, agent_name: str, insight: Dict) -> None:
-    """Store a generated insight as a new memory."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO abi_memories (content, dlp_level, agent_name, source_type, metadata)
-               VALUES (%s, %s, %s, 'dreamer', %s)""",
-            (
-                insight["content"],
-                insight["dlp_level"],
-                agent_name,
-                json.dumps({"type": insight["type"], "generated_by": "dreamer"}),
-            ),
+        # Generate a consolidation insight
+        insight_content = (
+            f"Entity '{group['entity_name']}' ({group['entity_type']}): "
+            f"{len(contents)} related memories this week. "
+            f"Key topics: {', '.join(c[:60] for c in contents[:3])}"
         )
-    conn.commit()
+
+        stats["insights_generated"] += 1
+        if not dry_run:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO abi_memories (content, dlp_level, agent_name, source_type, metadata)
+                       VALUES (%s, 'internal', %s, 'dreamer', %s)""",
+                    [insight_content, agent_name,
+                     json.dumps({"type": "consolidation", "entity": group["entity_name"],
+                                 "source_count": len(contents)})],
+                )
+                conn.commit()
+
+    return stats
+
+
+# --- Phase 4: Temporal Maintenance ---
+
+def phase_temporal(conn, agent_name: str, dry_run: bool) -> Dict:
+    """Flag stale facts and auto-expire dated information."""
+    stats = {"stale_flagged": 0, "auto_expired": 0}
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        # Find facts older than 90 days without valid_to (potentially stale)
+        cur.execute("""
+            SELECT id, content, created_at
+            FROM abi_memories
+            WHERE agent_name = %s
+              AND source_type NOT IN ('dreamer', 'contradiction_alert')
+              AND superseded_by IS NULL
+              AND valid_to IS NULL
+              AND created_at < NOW() - INTERVAL '90 days'
+            LIMIT 20
+        """, [agent_name])
+        stale = cur.fetchall()
+
+    for mem in stale:
+        stats["stale_flagged"] += 1
+        if not dry_run:
+            alert_content = (
+                f"Stale fact review: Memory from {mem['created_at'].strftime('%Y-%m-%d')} "
+                f"may be outdated: {mem['content'][:80]}..."
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO abi_memories (content, dlp_level, agent_name, source_type, metadata)
+                       VALUES (%s, 'internal', %s, 'dreamer', %s)""",
+                    [alert_content, agent_name,
+                     json.dumps({"type": "stale_review", "original_memory": str(mem["id"])})],
+                )
+                conn.commit()
+
+    # Auto-expire: find memories with date entities that are in the past
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT DISTINCT m.id::text, m.content
+            FROM abi_memories m
+            JOIN abi_memory_entities me ON m.id = me.memory_id
+            JOIN abi_entities e ON me.entity_id = e.id
+            WHERE m.agent_name = %s
+              AND e.type = 'date'
+              AND m.superseded_by IS NULL
+              AND m.valid_to IS NULL
+              AND m.source_type NOT IN ('dreamer', 'contradiction_alert')
+        """, [agent_name])
+        dated = cur.fetchall()
+
+    # For now, just count. Actual parsing of dates from entity names for auto-expiry
+    # would require date extraction from entity names like "Q3 2026" or "May 2026"
+    stats["auto_expired"] = 0  # TODO: implement date parsing + auto-expiry
+
+    return stats
 
 
 def run_dreamer(agent_filter: Optional[str] = None, dry_run: bool = False) -> Dict:
-    """Run the Dreamer for all or a single agent.
-
-    Args:
-        agent_filter: Only process this agent username.
-        dry_run: Analyze but don't write insights.
-
-    Returns:
-        Summary dict.
-    """
     conn = get_connection()
     agents = get_active_agents(conn)
 
@@ -177,35 +279,35 @@ def run_dreamer(agent_filter: Optional[str] = None, dry_run: bool = False) -> Di
         print("No active agents found.")
         return {"agents_processed": 0}
 
-    summary = {"agents_processed": 0, "total_insights": 0, "details": {}}
+    summary = {"agents_processed": 0, "phases": {}}
 
     for agent in agents:
         name = agent["username"]
         clearance = agent["clearance"]
+        print(f"\n[{name}] Running Dream Cycle v2...")
 
-        memories = get_recent_memories(conn, name, clearance)
-        if not memories:
-            print(f"[{name}] No recent memories, skipping.")
-            continue
+        # Phase 1: Dedup
+        dedup = phase_dedup(conn, name, dry_run)
+        print(f"  Phase 1 (Dedup): {dedup['duplicates_found']} duplicates found, {dedup['removed']} removed")
 
-        insights = analyze_patterns(memories)
+        # Phase 2: Contradictions
+        contrad = phase_contradictions(conn, name, clearance, dry_run)
+        print(f"  Phase 2 (Contradictions): {contrad['checked']} entities checked, {contrad['contradictions_flagged']} flagged")
 
-        print(f"[{name}] {len(memories)} memories analyzed → {len(insights)} insights")
+        # Phase 3: Consolidation
+        consol = phase_consolidate(conn, name, clearance, dry_run)
+        print(f"  Phase 3 (Consolidation): {consol['groups_processed']} groups, {consol['insights_generated']} insights")
 
-        if not dry_run:
-            for insight in insights:
-                store_insight(conn, name, insight)
-                print(f"  → [{insight['dlp_level']}] {insight['content'][:80]}...")
-        else:
-            print(f"  (dry run, {len(insights)} insights would be generated)")
-            for insight in insights:
-                print(f"  → [{insight['dlp_level']}] {insight['content'][:80]}...")
+        # Phase 4: Temporal
+        temporal = phase_temporal(conn, name, dry_run)
+        print(f"  Phase 4 (Temporal): {temporal['stale_flagged']} stale facts flagged")
 
         summary["agents_processed"] += 1
-        summary["total_insights"] += len(insights)
-        summary["details"][name] = {
-            "memories_analyzed": len(memories),
-            "insights_generated": len(insights),
+        summary["phases"][name] = {
+            "dedup": dedup,
+            "contradictions": contrad,
+            "consolidation": consol,
+            "temporal": temporal,
         }
 
     conn.close()
@@ -213,16 +315,16 @@ def run_dreamer(agent_filter: Optional[str] = None, dry_run: bool = False) -> Di
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ABI Dreamer — nightly insight generator")
+    parser = argparse.ArgumentParser(description="ABI Dreamer v2 — nightly memory intelligence pipeline")
     parser.add_argument("--agent", help="Only process this agent username")
     parser.add_argument("--dry-run", action="store_true", help="Analyze without writing")
     args = parser.parse_args()
 
-    print(f"=== ABI Dreamer — {datetime.now(timezone.utc).isoformat()} ===\n")
+    print(f"=== ABI Dreamer v2 — {datetime.now(timezone.utc).isoformat()} ===")
 
     result = run_dreamer(agent_filter=args.agent, dry_run=args.dry_run)
 
-    print(f"\nDone: {result['agents_processed']} agents, {result['total_insights']} insights")
+    print(f"\nDone: {result['agents_processed']} agents processed")
 
 
 if __name__ == "__main__":

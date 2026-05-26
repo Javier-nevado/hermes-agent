@@ -19,6 +19,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 from .dlp import dlp_where
+from .entities import EntityExtractor
 from .pii import classify_pii
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class ABIMemoryProvider(MemoryProvider):
         self._user_id: Optional[str] = None
         self._session_id: str = ""
         self._embed_fn = None
+        self._entity_extractor = EntityExtractor()
 
     @property
     def name(self) -> str:
@@ -204,37 +206,72 @@ class ABIMemoryProvider(MemoryProvider):
                 where_clause, params = dlp_where(self._clearance, self._agent_name)
 
                 if embedding:
-                    # Semantic search with DLP
-                    cur.execute(
-                        f"""
-                        SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata,
-                               1 - (embedding <=> %s::vector) AS similarity
-                        FROM abi_memories
-                        WHERE {where_clause}
-                        ORDER BY embedding <=> %s::vector
+                    # Hybrid BM25 + vector search with Reciprocal Rank Fusion (RRF)
+                    # RRF score = 1/(k+vector_rank) + 1/(k+bm25_rank), k=60
+                    rrf_k = 60
+                    fetch_limit = limit * 5  # fetch more candidates, rank globally
+
+                    # Build BM25 WHERE clause (fts column + DLP)
+                    bm25_where = where_clause + " AND fts @@ websearch_to_tsquery('english', %s)"
+
+                    sql = f"""
+                        WITH vector_results AS (
+                            SELECT id, content, dlp_level, agent_name, user_id,
+                                   source_type, created_at, metadata,
+                                   ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
+                            FROM abi_memories
+                            WHERE {where_clause}
+                            ORDER BY embedding <=> %s::vector
+                            LIMIT %s
+                        ),
+                        bm25_results AS (
+                            SELECT id, content, dlp_level, agent_name, user_id,
+                                   source_type, created_at, metadata,
+                                   ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
+                            FROM abi_memories
+                            WHERE {bm25_where}
+                            LIMIT %s
+                        )
+                        SELECT COALESCE(v.id, b.id) AS id,
+                               COALESCE(v.content, b.content) AS content,
+                               COALESCE(v.dlp_level, b.dlp_level) AS dlp_level,
+                               COALESCE(v.agent_name, b.agent_name) AS agent_name,
+                               COALESCE(v.created_at, b.created_at) AS created_at,
+                               COALESCE(v.metadata, b.metadata) AS metadata,
+                               COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
+                               COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
+                        FROM vector_results v
+                        FULL OUTER JOIN bm25_results b USING (id)
+                        ORDER BY rrf_score DESC
                         LIMIT %s
-                        """,
-                        [str(embedding), str(embedding)] + params + [limit],
-                    )
+                    """
+                    # Parameter order must match %s placeholders in SQL:
+                    # Vector CTE: embedding (ROW_NUMBER) + params (WHERE) + embedding (ORDER BY) + fetch_limit
+                    # BM25 CTE: query (ts_rank) + query (fts match) + params (WHERE) + query (fts @@) + fetch_limit
+                    # Final: limit
+                    cur.execute(sql, [
+                        str(embedding)] + params + [str(embedding), fetch_limit]  # vector CTE: emb, dlp_params, emb, limit
+                        + [query] + params + [query, fetch_limit]  # bm25 CTE: query, dlp_params, query, limit
+                        + [limit])  # final limit
+
                 else:
-                    # Fallback: full-text search using PostgreSQL plainto_tsquery
-                    # NOTE: Cannot use f-string because {where_clause} contains %s
-                    # placeholders needed by psycopg2, and f-string consumes single quotes.
+                    # Fallback: BM25-only when embeddings unavailable
                     _sql = (
                         "SELECT id, content, dlp_level, agent_name, user_id, "
                         "source_type, created_at, metadata, "
-                        "ts_rank_cd(to_tsvector('english', content), "
-                        "plainto_tsquery('english', %s)) AS rank "
+                        "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                         "FROM abi_memories "
                         "WHERE " + where_clause + " "
-                        "AND to_tsvector('english', content) @@ plainto_tsquery('english', %s) "
+                        "AND fts @@ websearch_to_tsquery('english', %s) "
                         "ORDER BY rank DESC, created_at DESC "
                         "LIMIT %s"
                     )
                     cur.execute(_sql, [query] + params + [query, limit])
 
                 results = cur.fetchall()
+
+            # Graph-boosted ranking: boost memories sharing entities with query
+            results = self._graph_boost(results, query)
 
             memories = []
             for row in results:
@@ -244,8 +281,10 @@ class ABIMemoryProvider(MemoryProvider):
                     "dlp_level": row["dlp_level"],
                     "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
                 }
-                if "similarity" in row:
-                    mem["similarity"] = round(float(row["similarity"]), 3)
+                if "rrf_score" in row:
+                    mem["score"] = round(float(row["rrf_score"]), 4)
+                elif "rank" in row:
+                    mem["score"] = round(float(row["rank"]), 4)
                 memories.append(mem)
 
             return json.dumps({"memories": memories, "count": len(memories)})
@@ -294,15 +333,181 @@ class ABIMemoryProvider(MemoryProvider):
                         [memory_id, content, dlp_level, self._agent_name, self._user_id],
                     )
 
+            # Extract and store entities
+            entity_count = 0
+            edge_count = 0
+            superseded_count = 0
+            try:
+                entities = self._entity_extractor.extract(content)
+                if entities:
+                    entity_count, edge_count = self._store_entities(memory_id, entities, content)
+                    # Temporal supersession: find older memories about same entities
+                    superseded_count = self._supersede_old_memories(memory_id, entities)
+            except Exception as e:
+                logger.warning("Entity extraction failed for memory %s: %s", memory_id, e)
+
             return json.dumps({
                 "status": "remembered",
                 "memory_id": memory_id,
                 "dlp_level": dlp_level,
+                "entities": entity_count,
+                "edges": edge_count,
+                "superseded": superseded_count,
             })
 
         except Exception as e:
             logger.error("Remember failed: %s", e)
             return json.dumps({"error": f"Remember failed: {e}"})
+
+    def _store_entities(self, memory_id: str, entities: list, content: str) -> tuple:
+        """Store extracted entities and their relations for a memory."""
+        if not self._conn:
+            return 0, 0
+
+        entity_ids = {}
+        with self._conn.cursor() as cur:
+            for entity in entities:
+                # Upsert entity (ON CONFLICT DO NOTHING on name+type)
+                cur.execute(
+                    """INSERT INTO abi_entities (name, type) VALUES (%s, %s)
+                       ON CONFLICT (name, type) DO UPDATE SET name = EXCLUDED.name
+                       RETURNING id""",
+                    [entity.name, entity.type],
+                )
+                entity_id = cur.fetchone()[0]
+                entity_ids[entity.name.lower()] = entity_id
+
+                # Link memory → entity
+                cur.execute(
+                    "INSERT INTO abi_memory_entities (memory_id, entity_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    [memory_id, entity_id],
+                )
+
+            # Infer and store edges
+            edges = self._entity_extractor.infer_relations(entities, content)
+            for edge in edges:
+                src_id = entity_ids.get(edge.source.name.lower())
+                tgt_id = entity_ids.get(edge.target.name.lower())
+                if src_id and tgt_id:
+                    cur.execute(
+                        """INSERT INTO abi_edges (source_id, target_id, relation, memory_id)
+                           VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                        [src_id, tgt_id, edge.relation, memory_id],
+                    )
+
+        return len(entity_ids), len(edges)
+
+    def _supersede_old_memories(self, new_memory_id: str, entities: list) -> int:
+        """Mark older memories about the same entities as superseded.
+
+        Only supersedes if:
+        - Old memory shares 2+ entities with the new one
+        - Old memory is from the same agent
+        - Old memory doesn't already have a superseded_by value
+        """
+        if not self._conn or len(entities) < 2:
+            return 0
+
+        entity_names = [e.name.lower() for e in entities]
+        try:
+            with self._conn.cursor() as cur:
+                # Find entity IDs (as strings)
+                cur.execute(
+                    "SELECT id::text FROM abi_entities WHERE lower(name) = ANY(%s)",
+                    [entity_names],
+                )
+                entity_ids = [row[0] for row in cur.fetchall()]
+
+                if len(entity_ids) < 2:
+                    return 0
+
+                # Find memories that share 2+ entities with this new memory
+                cur.execute(
+                    """SELECT me.memory_id, count(DISTINCT me.entity_id) AS shared
+                       FROM abi_memory_entities me
+                       WHERE me.entity_id::text = ANY(%s)
+                       AND me.memory_id::text != %s
+                       GROUP BY me.memory_id
+                       HAVING count(DISTINCT me.entity_id) >= 2""",
+                    [entity_ids, new_memory_id],
+                )
+                candidates = cur.fetchall()
+
+                superseded = 0
+                for row in candidates:
+                    old_id = row[0]
+                    # Check embedding similarity (must be > 0.75 to supersede)
+                    cur.execute(
+                        """SELECT 1 - (m1.embedding <=> m2.embedding) AS sim
+                           FROM abi_memories m1, abi_memories m2
+                           WHERE m1.id::text = %s AND m2.id::text = %s
+                           AND m1.agent_name = %s
+                           AND m1.superseded_by IS NULL""",
+                        [str(old_id), new_memory_id, self._agent_name],
+                    )
+                    sim_row = cur.fetchone()
+                    if sim_row and sim_row[0] and float(sim_row[0]) > 0.75:
+                        cur.execute(
+                            "UPDATE abi_memories SET superseded_by = %s::uuid, valid_to = NOW() WHERE id::text = %s AND superseded_by IS NULL",
+                            [new_memory_id, str(old_id)],
+                        )
+                        superseded += 1
+
+                return superseded
+        except Exception as e:
+            logger.warning("Temporal supersession failed: %s", e)
+            return 0
+
+    def _graph_boost(self, results: list, query: str) -> list:
+        """Boost scores for memories sharing entities with the query."""
+        if not self._conn or not results:
+            return results
+
+        try:
+            # Extract entities from the query itself
+            query_entities = self._entity_extractor.extract(query)
+            if not query_entities:
+                return results
+
+            # Resolve query entity names to IDs (as strings for psycopg2)
+            query_names = [e.name.lower() for e in query_entities]
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, lower(name) FROM abi_entities WHERE lower(name) = ANY(%s)",
+                    [query_names],
+                )
+                query_entity_ids = [str(row[0]) for row in cur.fetchall()]
+
+            if not query_entity_ids:
+                return results
+
+            # For each result, check how many shared entities it has
+            result_ids = [str(r["id"]) for r in results]
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """SELECT me.memory_id, count(DISTINCT me.entity_id) AS shared_count
+                       FROM abi_memory_entities me
+                       WHERE me.entity_id::text = ANY(%s)
+                       AND me.memory_id::text = ANY(%s)
+                       GROUP BY me.memory_id""",
+                    [query_entity_ids, result_ids],
+                )
+                boost_map = {str(row[0]): row[1] for row in cur.fetchall()}
+
+            # Apply boost: +0.005 per shared entity
+            for result in results:
+                mem_id = str(result.get("id", ""))
+                shared = boost_map.get(mem_id, 0)
+                if shared > 0 and "rrf_score" in result:
+                    result["rrf_score"] = float(result["rrf_score"]) + shared * 0.005
+
+            # Re-sort by boosted score
+            results.sort(key=lambda r: float(r.get("rrf_score", 0)), reverse=True)
+
+        except Exception as e:
+            logger.warning("Graph boost failed: %s", e)
+
+        return results
 
     def _handle_forget(self, args: Dict[str, Any]) -> str:
         """Delete a memory (own agent only)."""
