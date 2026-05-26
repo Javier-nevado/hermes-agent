@@ -138,8 +138,18 @@ echo ""
 echo "── Step 4: Permissions ──"
 sudo -u postgres psql -d "$DB_NAME" -c "
     GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;
+    ALTER TABLE abi_memories OWNER TO $DB_USER;
+    ALTER TABLE abi_agents OWNER TO $DB_USER;
+    ALTER TABLE abi_entities OWNER TO $DB_USER;
+    ALTER TABLE abi_edges OWNER TO $DB_USER;
+    ALTER TABLE abi_memory_entities OWNER TO $DB_USER;
     GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;
-    GRANT ALL ON abi_entities, abi_edges, abi_memory_entities, abi_agents TO $DB_USER;
+        GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;
+    ALTER TABLE abi_memories OWNER TO $DB_USER;
+    ALTER TABLE abi_agents OWNER TO $DB_USER;
+    ALTER TABLE abi_entities OWNER TO $DB_USER;
+    ALTER TABLE abi_edges OWNER TO $DB_USER;
+    ALTER TABLE abi_memory_entities OWNER TO $DB_USER;
 " 2>&1 | grep -iE 'error' || true
 ok "Permissions granted"
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/hermes-agent/.venv/bin/python3
 """ABI Health Check — agent services + DB + Dreamer status.
 
 Usage:
