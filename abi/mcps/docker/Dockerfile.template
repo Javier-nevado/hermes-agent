@@ -1,0 +1,25 @@
+FROM python:3.13-alpine
+LABEL maintainer="Opteia <abi@opteia.com>"
+LABEL org.opteia.mcp="{{NAME}}"
+
+WORKDIR /app
+
+# Install deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy MCP server code
+COPY server/ server/
+
+# Copy HTTP adapter + credential store (shared)
+COPY http_adapter.py .
+COPY credential_store.py .
+
+# Credentials mounted read-only by docker-compose
+VOLUME /credentials
+
+EXPOSE {{PORT}}
+ENV MCP_PORT={{PORT}}
+ENV CREDENTIALS_PATH=/credentials
+
+CMD ["python", "http_adapter.py", "{{MODULE}}", "{{CLASS}}", "--port", "{{PORT}}"]

@@ -1,0 +1,173 @@
+#
+# docker-compose.mcp.yml — ABI MCP Server Containers
+#
+# Usage:
+#   docker compose -f docker-compose.mcp.yml up -d
+#   docker compose -f docker-compose.mcp.yml up -d mcp-brevo  # single server
+#
+# All containers bind to 127.0.0.1 only (no external access).
+# Credentials are mounted read-only from agent home directories.
+#
+# Install new servers: sudo /opt/hermes-agent/scripts/abi-mcp-install <name>
+#
+
+services:
+  # === EXISTING SERVERS (5) ===
+
+  mcp-brevo:
+    build: ./abi/mcps/docker/servers/mcp_brevo
+    image: opteia/mcp-brevo:1.0.0
+    container_name: mcp-brevo
+    ports: ["127.0.0.1:5109:5109"]
+    volumes:
+      - /home/ailean/workspace/agent/credentials:/credentials:ro
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      - MCP_PORT=5109
+
+  mcp-m365:
+    build: ./abi/mcps/docker/servers/mcp_m365
+    image: opteia/mcp-m365:1.0.0
+    container_name: mcp-m365
+    ports: ["127.0.0.1:5110:5110"]
+    volumes:
+      - /home/iris/workspace/agent/credentials:/credentials:ro
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      - MCP_PORT=5110
+
+  mcp-twenty:
+    build: ./abi/mcps/docker/servers/mcp_twenty
+    image: opteia/mcp-twenty:1.0.0
+    container_name: mcp-twenty
+    ports: ["127.0.0.1:5111:5111"]
+    volumes:
+      - /home/iris/workspace/agent/credentials:/credentials:ro
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      - MCP_PORT=5111
+
+  mcp-invoice-ninja:
+    build: ./abi/mcps/docker/servers/mcp_invoice_ninja
+    image: opteia/mcp-invoice-ninja:1.0.0
+    container_name: mcp-invoice-ninja
+    ports: ["127.0.0.1:5112:5112"]
+    volumes:
+      - /home/vera/workspace/agent/credentials:/credentials:ro
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      - MCP_PORT=5112
+
+  mcp-proxmox:
+    build: ./abi/mcps/docker/servers/mcp_proxmox
+    image: opteia/mcp-proxmox:1.0.0
+    container_name: mcp-proxmox
+    ports: ["127.0.0.1:5113:5113"]
+    volumes:
+      - /home/atlas/workspace/agent/credentials:/credentials:ro
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      - MCP_PORT=5113
+
+  # === PLANNED SERVERS (8) — uncomment when built ===
+
+  # mcp-opnsense:
+  #   build: ./abi/mcps/docker/servers/mcp_opnsense
+  #   image: opteia/mcp-opnsense:1.0.0
+  #   container_name: mcp-opnsense
+  #   ports: ["127.0.0.1:5101:5101"]
+  #   volumes:
+  #     - /home/atlas/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5101
+
+  # mcp-npm:
+  #   build: ./abi/mcps/docker/servers/mcp_npm
+  #   image: opteia/mcp-npm:1.0.0
+  #   container_name: mcp-npm
+  #   ports: ["127.0.0.1:5102:5102"]
+  #   volumes:
+  #     - /home/atlas/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5102
+
+  # mcp-youtube:
+  #   build: ./abi/mcps/docker/servers/mcp_youtube
+  #   image: opteia/mcp-youtube:1.0.0
+  #   container_name: mcp-youtube
+  #   ports: ["127.0.0.1:5103:5103"]
+  #   volumes:
+  #     - /home/sol/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5103
+
+  # mcp-webstats:
+  #   build: ./abi/mcps/docker/servers/mcp_webstats
+  #   image: opteia/mcp-webstats:1.0.0
+  #   container_name: mcp-webstats
+  #   ports: ["127.0.0.1:5104:5104"]
+  #   volumes:
+  #     - /home/sol/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5104
+
+  # mcp-image-generation:
+  #   build: ./abi/mcps/docker/servers/mcp_image_generation
+  #   image: opteia/mcp-image-generation:1.0.0
+  #   container_name: mcp-image-generation
+  #   ports: ["127.0.0.1:5105:5105"]
+  #   volumes:
+  #     - /home/sol/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5105
+
+  # mcp-plane:
+  #   build: ./abi/mcps/docker/servers/mcp_plane
+  #   image: opteia/mcp-plane:1.0.0
+  #   container_name: mcp-plane
+  #   ports: ["127.0.0.1:5106:5106"]
+  #   volumes:
+  #     - /home/iris/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5106
+
+  # mcp-recall:
+  #   build: ./abi/mcps/docker/servers/mcp_recall
+  #   image: opteia/mcp-recall:1.0.0
+  #   container_name: mcp-recall
+  #   ports: ["127.0.0.1:5107:5107"]
+  #   volumes:
+  #     - /home/iris/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5107
+
+  # mcp-remotion:
+  #   build: ./abi/mcps/docker/servers/mcp_remotion
+  #   image: opteia/mcp-remotion:1.0.0
+  #   container_name: mcp-remotion
+  #   ports: ["127.0.0.1:5108:5108"]
+  #   volumes:
+  #     - /home/sol/workspace/agent/credentials:/credentials:ro
+  #   restart: unless-stopped
+  #   mem_limit: 128m
+  #   environment:
+  #     - MCP_PORT=5108

@@ -1,0 +1,15 @@
+{
+  "name": "proxmox",
+  "version": "1.0.0",
+  "description": "Proxmox VE API accessor",
+  "image": "opteia/mcp-proxmox",
+  "port": 5113,
+  "tools": ["status", "login", "logout", "list_vms", "vm_status", "snapshot"],
+  "credentials": ["api_url", "api_token_id", "api_token_secret"],
+  "dependencies": [],
+  "assign_to": ["atlas"],
+  "hermes_config": {
+    "url": "http://localhost:5113/sse",
+    "transport": "sse"
+  }
+}

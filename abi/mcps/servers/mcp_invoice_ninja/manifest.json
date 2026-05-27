@@ -1,0 +1,15 @@
+{
+  "name": "invoice_ninja",
+  "version": "1.0.0",
+  "description": "Invoice Ninja API accessor",
+  "image": "opteia/mcp-invoice-ninja",
+  "port": 5112,
+  "tools": ["status", "login", "logout", "list_clients", "create_invoice", "list_invoices", "payments", "expenses"],
+  "credentials": ["api_key", "api_url"],
+  "dependencies": [],
+  "assign_to": ["ailean", "vera"],
+  "hermes_config": {
+    "url": "http://localhost:5112/sse",
+    "transport": "sse"
+  }
+}

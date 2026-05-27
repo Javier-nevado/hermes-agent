@@ -1,0 +1,15 @@
+{
+  "name": "twenty",
+  "version": "1.0.0",
+  "description": "Twenty CRM GraphQL API accessor",
+  "image": "opteia/mcp-twenty",
+  "port": 5111,
+  "tools": ["status", "login", "logout", "list_companies", "create_company", "create_person", "create_opportunity", "notes", "tasks"],
+  "credentials": ["api_key"],
+  "dependencies": [],
+  "assign_to": ["ailean", "iris", "caspian"],
+  "hermes_config": {
+    "url": "http://localhost:5111/sse",
+    "transport": "sse"
+  }
+}

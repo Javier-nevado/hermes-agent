@@ -1,0 +1,220 @@
+#!/bin/bash
+# abi-mcp-install — Install and configure MCP Docker containers for Hermes agents.
+#
+# Usage: abi-mcp-install <server-name> [<server-name>...]
+#        abi-mcp-install --all
+#        abi-mcp-install --list
+#
+# For each server:
+#   1. Build Docker image (if not already built)
+#   2. Start container via docker-compose.mcp.yml
+#   3. Generate Hermes config snippet (mcp_servers: block)
+#   4. Inject into assigned agents' config.yaml
+#   5. Restart affected agents
+#
+# Server names: brevo, m365, twenty, invoice_ninja, proxmox,
+#               opnsense, npm, youtube, webstats, image_generation,
+#               plane, recall, remotion
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HERMES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DOCKER_DIR="$HERMES_DIR/abi/mcps/docker"
+COMPOSE_FILE="$HERMES_DIR/docker-compose.mcp.yml"
+SERVERS_DIR="$HERMES_DIR/abi/mcps/servers"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[install]${NC} $*"; }
+warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
+err()  { echo -e "${RED}[error]${NC} $*" >&2; }
+
+# --- List available servers ---
+list_servers() {
+    echo "Available MCP servers:"
+    echo ""
+    printf "%-20s %-8s %-15s %s\n" "SERVER" "PORT" "STATUS" "ASSIGNED TO"
+    printf "%-20s %-8s %-15s %s\n" "------" "----" "-------" "------------"
+    for manifest_dir in "$SERVERS_DIR"/mcp_*/; do
+        [ -d "$manifest_dir" ] || continue
+        manifest="$manifest_dir/manifest.json"
+        [ -f "$manifest" ] || continue
+        name=$(python3 -c "import json; d=json.load(open('$manifest')); print(d['name'])")
+        port=$(python3 -c "import json; d=json.load(open('$manifest')); print(d['port'])")
+        agents=$(python3 -c "import json; d=json.load(open('$manifest')); print(', '.join(d.get('assign_to', [])))")
+        # Container names replace underscores with hyphens
+        container_name="mcp-${name//_/-}"
+        if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+            status="running"
+        elif docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+            status="stopped"
+        else
+            status="not built"
+        fi
+        printf "%-20s %-8s %-15s %s\n" "$name" "$port" "$status" "$agents"
+    done
+}
+
+# --- Build a single server ---
+build_server() {
+    local server_name="$1"
+    local mcp_dir="mcp_${server_name}"
+
+    if [ ! -d "$SERVERS_DIR/$mcp_dir" ]; then
+        err "Server '$server_name' not found at $SERVERS_DIR/$mcp_dir"
+        return 1
+    fi
+
+    local manifest="$SERVERS_DIR/$mcp_dir/manifest.json"
+    if [ ! -f "$manifest" ]; then
+        err "No manifest.json found for $server_name"
+        return 1
+    fi
+
+    local version
+    version=$(python3 -c "import json; print(json.load(open('$manifest'))['version'])")
+
+    log "Building $server_name v${version}..."
+    bash "$DOCKER_DIR/build_server.sh" "$mcp_dir" "$version"
+}
+
+# --- Start a single server container ---
+start_container() {
+    local server_name="$1"
+    local compose_service="mcp-${server_name}"
+
+    # Check if service exists in compose file
+    if ! grep -q "^  ${compose_service}:" "$COMPOSE_FILE"; then
+        err "Service '$compose_service' not found in docker-compose.mcp.yml"
+        err "Add it first or uncomment the entry in the compose file"
+        return 1
+    fi
+
+    log "Starting $compose_service..."
+    docker compose -f "$COMPOSE_FILE" up -d "$compose_service" 2>&1 | tail -3
+
+    # Wait for health check
+    local port
+    port=$(python3 -c "import json; print(json.load(open('$SERVERS_DIR/mcp_${server_name}/manifest.json'))['port'])")
+    local retries=5
+    while [ $retries -gt 0 ]; do
+        if curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
+            log "Container healthy on port $port"
+            return 0
+        fi
+        retries=$((retries - 1))
+        sleep 1
+    done
+    warn "Container not responding on port $port after 5s — check logs: docker logs $compose_service"
+}
+
+# --- Configure an agent to use a Docker MCP server ---
+configure_agent() {
+    local server_name="$1"
+    local manifest="$SERVERS_DIR/mcp_${server_name}/manifest.json"
+
+    local url port transport
+    url=$(python3 -c "import json; d=json.load(open('$manifest')); print(d['hermes_config']['url'])")
+    transport=$(python3 -c "import json; d=json.load(open('$manifest')); print(d['hermes_config']['transport'])")
+    port=$(python3 -c "import json; print(json.load(open('$manifest'))['port'])")
+
+    local agents
+    agents=$(python3 -c "import json; print(' '.join(json.load(open('$manifest')).get('assign_to', [])))")
+
+    log "Config URL: $url ($transport)"
+
+    for agent in $agents; do
+        local config_dir="/home/$agent/.hermes"
+        local config_file="$config_dir/config.yaml"
+
+        if [ ! -f "$config_file" ]; then
+            warn "No config.yaml for agent $agent — skipping"
+            continue
+        fi
+
+        log "Configuring $agent to use Docker $server_name..."
+
+        # Use Python to update YAML cleanly
+        sudo python3 -c "
+import yaml, sys
+with open('$config_file') as f:
+    config = yaml.safe_load(f)
+if 'mcp_servers' not in config:
+    config['mcp_servers'] = {}
+config['mcp_servers']['$server_name'] = {
+    'url': '$url',
+    'transport': '$transport'
+}
+with open('$config_file', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+print('  Updated $server_name in $agent config')
+"
+
+        # Restart the agent
+        local uid
+        uid=$(id -u "$agent" 2>/dev/null || echo "")
+        if [ -n "$uid" ]; then
+            log "Restarting $agent..."
+            sudo -u "$agent" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart abi-agent.service
+        else
+            warn "User $agent not found — skip restart"
+        fi
+    done
+}
+
+# --- Main ---
+if [ $# -eq 0 ]; then
+    echo "Usage: abi-mcp-install <server-name> [<server-name>...]"
+    echo "       abi-mcp-install --all"
+    echo "       abi-mcp-install --list"
+    echo "       abi-mcp-install --build <server-name>"
+    echo "       abi-mcp-install --start <server-name>"
+    echo "       abi-mcp-install --config <server-name>"
+    exit 1
+fi
+
+case "$1" in
+    --list)
+        list_servers
+        ;;
+    --all)
+        for manifest_dir in "$SERVERS_DIR"/mcp_*/; do
+            [ -d "$manifest_dir" ] || continue
+            name=$(python3 -c "import json; print(json.load(open('${manifest_dir}manifest.json'))['name'])")
+            build_server "$name"
+            start_container "$name"
+            configure_agent "$name"
+        done
+        ;;
+    --build)
+        shift
+        for name in "$@"; do
+            build_server "$name"
+        done
+        ;;
+    --start)
+        shift
+        for name in "$@"; do
+            start_container "$name"
+        done
+        ;;
+    --config)
+        shift
+        for name in "$@"; do
+            configure_agent "$name"
+        done
+        ;;
+    *)
+        for name in "$@"; do
+            build_server "$name"
+            start_container "$name"
+            configure_agent "$name"
+        done
+        ;;
+esac

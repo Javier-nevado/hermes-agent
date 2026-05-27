@@ -1,0 +1,15 @@
+{
+  "name": "brevo",
+  "version": "1.0.0",
+  "description": "Brevo email API accessor",
+  "image": "opteia/mcp-brevo",
+  "port": 5109,
+  "tools": ["status", "login", "logout", "send", "events"],
+  "credentials": ["api_key"],
+  "dependencies": [],
+  "assign_to": ["ailean", "iris", "caspian", "sol", "vera", "jen"],
+  "hermes_config": {
+    "url": "http://localhost:5109/sse",
+    "transport": "sse"
+  }
+}
