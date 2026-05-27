@@ -1,6 +1,6 @@
 {
   "name": "invoice_ninja",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Invoice Ninja API accessor",
   "image": "opteia/mcp-invoice-ninja",
   "port": 5112,

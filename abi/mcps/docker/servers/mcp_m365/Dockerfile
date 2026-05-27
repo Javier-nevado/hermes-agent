@@ -10,8 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server/ server/
 COPY http_adapter.py .
 
-VOLUME /credentials
-
 EXPOSE 5110
 ENV MCP_PORT=5110
 

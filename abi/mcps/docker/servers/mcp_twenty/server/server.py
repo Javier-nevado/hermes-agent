@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-from server.base import ABIMCPServer
+from server.docker_base import ABIMCPServer
 from mcp import types
 
 # Shared pagination fields for GraphQL queries

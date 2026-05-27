@@ -1,6 +1,6 @@
 {
   "name": "m365",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Microsoft 365 Graph API accessor",
   "image": "opteia/mcp-m365",
   "port": 5110,
