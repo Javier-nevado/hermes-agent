@@ -23,6 +23,17 @@ logger = logging.getLogger(__name__)
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
+# ABI-PATCH: Track recently written files for auto-delivery
+_recently_written_files = []
+_recently_written_lock = threading.Lock()
+
+def get_and_clear_recently_written():
+    """Return and clear the list of recently written file paths."""
+    with _recently_written_lock:
+        files = list(_recently_written_files)
+        _recently_written_files.clear()
+        return files
+
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
 # We're model-agnostic so we can't count tokens; characters are a safe proxy.
@@ -950,6 +961,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             _update_read_timestamp(path, task_id)
+            # ABI-PATCH: Track written file for auto-delivery
+            if not result_dict.get("error"):
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                _ext = Path(_abi_write_path).suffix.lower()
+                if _ext in _deliverable_exts:
+                    with _recently_written_lock:
+                        _recently_written_files.append(_abi_write_path)
             return json.dumps(result_dict, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
@@ -969,8 +987,22 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
+            # ABI-PATCH: Track written file for auto-delivery
+            if not result_dict.get("error"):
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                _ext = Path(_abi_write_path).suffix.lower()
+                if _ext in _deliverable_exts:
+                    with _recently_written_lock:
+                        _recently_written_files.append(_abi_write_path)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
+                # ABI-PATCH: Track written file for auto-delivery (locked path)
+                if not result_dict.get("error"):
+                    _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                    _ext = Path(_abi_write_path).suffix.lower()
+                    if _ext in _deliverable_exts:
+                        with _recently_written_lock:
+                            _recently_written_files.append(_abi_write_path)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):

@@ -3596,6 +3596,21 @@ class BasePlatformAdapter(ABC):
                 # (helps small models that don't use MEDIA: syntax)
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files)
+                # ABI-PATCH: Auto-deliver files written via write_file
+                # that the model did not include in its response text.
+                # Solves GLM-5.1 not including bare file paths for .html files.
+                try:
+                    from tools.file_tools import get_and_clear_recently_written
+                    _written = get_and_clear_recently_written()
+                    if _written:
+                        for _wp in _written:
+                            _validated = validate_media_delivery_path(_wp)
+                            if _validated and _validated not in local_files:
+                                local_files.append(_validated)
+                                logger.info("[%s] ABI auto-deliver: added written file %s", self.name, _validated)
+                except Exception as _abi_err:
+                    logger.debug("ABI auto-deliver check failed: %s", _abi_err)
+
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
