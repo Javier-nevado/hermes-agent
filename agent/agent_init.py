@@ -1140,9 +1140,10 @@ def init_agent(
                     try:
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
-                        _init_kwargs["agent_identity"] = _profile
+                        _init_kwargs["agent_identity"] = __import__("getpass").getuser()  # Linux username for ABI memory
                         _init_kwargs["agent_workspace"] = "hermes"
                         # ABI-PATCH: Look up agent clearance from abi_agents table
+                        # Use Linux username (ailean, atlas, etc.) not profile name ("default")
                         try:
                             import psycopg2 as _psycopg2
                             _db_url = os.environ.get(
@@ -1151,7 +1152,7 @@ def init_agent(
                             )
                             _clearance_conn = _psycopg2.connect(_db_url)
                             _clearance_cur = _clearance_conn.cursor()
-                            _clearance_cur.execute("SELECT clearance FROM abi_agents WHERE username = %s", [_profile])
+                            _clearance_cur.execute("SELECT clearance FROM abi_agents WHERE username = %s", [__import__("getpass").getuser()])
                             _clearance_row = _clearance_cur.fetchone()
                             _clearance_cur.close()
                             _clearance_conn.close()
