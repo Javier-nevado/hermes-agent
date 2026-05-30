@@ -1142,6 +1142,23 @@ def init_agent(
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
                         _init_kwargs["agent_workspace"] = "hermes"
+                        # ABI-PATCH: Look up agent clearance from abi_agents table
+                        try:
+                            import psycopg2 as _psycopg2
+                            _db_url = os.environ.get(
+                                "ABI_DATABASE_URL",
+                                "postgresql://abi_agent:abi_local_dev_2026@localhost:5432/abi_memory"
+                            )
+                            _clearance_conn = _psycopg2.connect(_db_url)
+                            _clearance_cur = _clearance_conn.cursor()
+                            _clearance_cur.execute("SELECT clearance FROM abi_agents WHERE username = %s", [_profile])
+                            _clearance_row = _clearance_cur.fetchone()
+                            _clearance_cur.close()
+                            _clearance_conn.close()
+                            if _clearance_row:
+                                _init_kwargs["clearance"] = _clearance_row[0]
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
