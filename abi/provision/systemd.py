@@ -18,6 +18,8 @@ Type=simple
 Environment=HERMES_HOME=/home/{username}/.hermes
 Environment=PYTHONPATH=/opt/hermes-agent
 WorkingDirectory=/opt/hermes-agent
+Environment=HERMES_MEDIA_ALLOW_DIRS=/tmp:/home/{username}/workspace:/home/{username}/.hermes/media
+Environment=HERMES_MEDIA_TRUST_RECENT_SECONDS=3600
 ExecStart=/opt/hermes-agent/.venv/bin/hermes gateway
 Restart=on-failure
 RestartSec=10

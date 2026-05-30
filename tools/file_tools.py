@@ -5,6 +5,10 @@ import errno
 import json
 import logging
 import os
+try:
+    from hermes_constants import get_hermes_home as _get_hermes_home
+except ImportError:
+    _get_hermes_home = None
 import threading
 from pathlib import Path
 
@@ -33,6 +37,42 @@ def get_and_clear_recently_written():
         files = list(_recently_written_files)
         _recently_written_files.clear()
         return files
+
+
+
+def _register_file_catalog(write_path: str) -> None:
+    """ABI-PATCH: Register a written file in the abi_agent_files catalog."""
+    try:
+        import psycopg2
+        from gateway.session_context import get_session_env
+        _user = get_session_env("HERMES_SESSION_USER_ID", "")
+        if not _user or not _get_hermes_home:
+            return
+        _agent_name = os.environ.get("HERMES_AGENT_NAME", "")
+        if not _agent_name:
+            import socket
+            _agent_name = os.environ.get("USER", socket.gethostname())
+        _hermes = str(_get_hermes_home())
+        _agent_home = str(Path(_hermes).parent)
+        _real = str(Path(write_path).resolve())
+        _virtual = os.path.relpath(_real, _agent_home)
+        _fname = Path(_real).name
+        _ext = Path(_real).suffix.lower()
+        _size = Path(_real).stat().st_size if Path(_real).exists() else 0
+        conn = psycopg2.connect("postgresql://abi_agent:abi_local_dev_2026@localhost:5432/abi_memory")
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO abi_agent_files (agent, user_id, virtual_path, real_path, filename, extension, size_bytes, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (agent, user_id, virtual_path) DO UPDATE
+            SET real_path = EXCLUDED.real_path, size_bytes = EXCLUDED.size_bytes,
+                updated_at = NOW(), is_deleted = FALSE
+        """, (_agent_name, _user, _virtual, _real, _fname, _ext, _size))
+        cur.close()
+        conn.close()
+    except Exception as _e:
+        logger.debug("File catalog registration failed: %s", _e)
 
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
@@ -136,7 +176,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
         _abi_user = get_session_env("HERMES_SESSION_USER_ID", "")
         if _abi_user:
             from abi.files.sandbox import resolve_path
-            _hermes_home = os.environ.get("HERMES_HOME", "")
+            _hermes_home = str(_get_hermes_home()) if _get_hermes_home else ""
             if _hermes_home:
                 _agent_home = str(Path(_hermes_home).parent)
                 # For absolute paths inside agent home, strip the prefix and sandbox
@@ -154,9 +194,50 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
                     _sandboxed = resolve_path(filepath, _abi_user, _agent_home)
                     Path(_sandboxed).parent.mkdir(parents=True, exist_ok=True)
                     return Path(_sandboxed)
-    except Exception:
+    except Exception as _abi_ex:
+        logger.debug("ABI sandbox resolution failed: %s", _abi_ex)
         pass  # Fall through to default resolution
     # END ABI-PATCH
+
+    # ABI-PATCH: fuzzy-match fallback when resolved path doesn't exist
+    # If the file wasn't found at the literal path, search for the filename
+    # under the user's workspace subtree. Return error with suggestion.
+    try:
+        _abi_user = get_session_env("HERMES_SESSION_USER_ID", "")
+        if _abi_user and _get_hermes_home:
+            _abi_home = str(Path(str(_get_hermes_home())).parent)
+            _abi_resolved = p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
+            if not _abi_resolved.exists():
+                _abi_filename = _abi_resolved.name
+                _abi_user_ws = Path(_abi_home) / "workspace" / "users" / _abi_user
+                if _abi_user_ws.exists():
+                    import subprocess as _sp
+                    _found = _sp.run(
+                        ["find", str(_abi_user_ws), "-name", _abi_filename, "-type", "f"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    _matches = [l for l in _found.stdout.strip().split("\n") if l]
+                    if len(_matches) == 1:
+                        _rel = os.path.relpath(_matches[0], _abi_home)
+                        raise FileNotFoundError(
+                            f"File not found at: {filepath}. "
+                            f"Did you mean: {_rel}? "
+                            f"(Use this path instead.)"
+                        )
+                    elif len(_matches) > 1:
+                        _suggestions = "\n  ".join(
+                            os.path.relpath(m, _abi_home) for m in _matches[:5]
+                        )
+                        raise FileNotFoundError(
+                            f"File not found at: {filepath}. "
+                            f"Multiple matches found:\n  {_suggestions}"
+                        )
+    except FileNotFoundError:
+        raise  # Re-raise our helpful error
+    except Exception:
+        pass  # Fuzzy-match failed, continue with normal flow
+    # END ABI-PATCH fuzzy-match
+
     if not p.is_absolute():
         base = _get_live_tracking_cwd(task_id) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
@@ -963,11 +1044,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             # ABI-PATCH: Track written file for auto-delivery
             if not result_dict.get("error"):
-                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
                 _ext = Path(_abi_write_path).suffix.lower()
                 if _ext in _deliverable_exts:
                     with _recently_written_lock:
                         _recently_written_files.append(_abi_write_path)
+                        _register_file_catalog(_abi_write_path)
             return json.dumps(result_dict, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
@@ -989,20 +1071,22 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             # ABI-PATCH: Track written file for auto-delivery
             if not result_dict.get("error"):
-                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
                 _ext = Path(_abi_write_path).suffix.lower()
                 if _ext in _deliverable_exts:
                     with _recently_written_lock:
                         _recently_written_files.append(_abi_write_path)
+                        _register_file_catalog(_abi_write_path)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
                 # ABI-PATCH: Track written file for auto-delivery (locked path)
                 if not result_dict.get("error"):
-                    _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
+                    _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
                     _ext = Path(_abi_write_path).suffix.lower()
                     if _ext in _deliverable_exts:
                         with _recently_written_lock:
                             _recently_written_files.append(_abi_write_path)
+                        _register_file_catalog(_abi_write_path)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):

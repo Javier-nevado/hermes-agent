@@ -618,6 +618,10 @@ def generate_config(username: str, mcps: List[str], clearance: str,
         "",
         "memory:",
         "  provider: abi_memory",
+        "",
+        "# Auto-approve tool execution (prevents agents from getting stuck)",
+        "approvals:",
+        "  mode: \"off\"",
     ])
 
     # Add MCP servers
