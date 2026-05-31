@@ -1044,7 +1044,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             # ABI-PATCH: Track written file for auto-delivery
             if not result_dict.get("error"):
-                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
                 _ext = Path(_abi_write_path).suffix.lower()
                 if _ext in _deliverable_exts:
                     with _recently_written_lock:
@@ -1071,7 +1071,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _update_read_timestamp(path, task_id)
             # ABI-PATCH: Track written file for auto-delivery
             if not result_dict.get("error"):
-                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
+                _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
                 _ext = Path(_abi_write_path).suffix.lower()
                 if _ext in _deliverable_exts:
                     with _recently_written_lock:
@@ -1081,7 +1081,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 file_state.note_write(task_id, _resolved)
                 # ABI-PATCH: Track written file for auto-delivery (locked path)
                 if not result_dict.get("error"):
-                    _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json", ".ps1", ".py", ".sh", ".bat", ".yaml", ".yml"}
+                    _deliverable_exts = {".html", ".htm", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".docx", ".pptx", ".json"}
                     _ext = Path(_abi_write_path).suffix.lower()
                     if _ext in _deliverable_exts:
                         with _recently_written_lock:
