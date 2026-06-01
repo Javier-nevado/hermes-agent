@@ -13,12 +13,13 @@ import uuid
 from typing import List
 
 import psycopg2.extras
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from abi.memory.dlp import dlp_where
 from abi.memory.pii import classify_pii
 
 from ..deps import get_pool, get_extractor
+from ..license import require_license
 from ..schemas import (
     RememberRequest,
     RememberResponse,
@@ -48,7 +49,7 @@ def _get_embedding(text: str):
 # POST /remember
 # ---------------------------------------------------------------------------
 
-@router.post("/remember", response_model=RememberResponse)
+@router.post("/remember", response_model=RememberResponse, dependencies=[Depends(require_license)])
 def remember(req: RememberRequest):
     """Store a memory with DLP classification, entity extraction, and temporal supersession."""
     pool = get_pool()
@@ -227,7 +228,7 @@ def recall(req: RecallRequest):
 # DELETE /forget
 # ---------------------------------------------------------------------------
 
-@router.delete("/forget", response_model=ForgetResponse)
+@router.delete("/forget", response_model=ForgetResponse, dependencies=[Depends(require_license)])
 def forget(req: ForgetRequest):
     """Delete a memory by ID. Only the owning agent can delete."""
     pool = get_pool()
@@ -255,7 +256,7 @@ def forget(req: ForgetRequest):
 # POST /remember-batch
 # ---------------------------------------------------------------------------
 
-@router.post("/remember-batch", response_model=RememberBatchResponse)
+@router.post("/remember-batch", response_model=RememberBatchResponse, dependencies=[Depends(require_license)])
 def remember_batch(req: RememberBatchRequest):
     """Batch store memories (max 50)."""
     results = []
