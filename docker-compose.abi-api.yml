@@ -10,7 +10,7 @@ services:
     ports:
       - "8010:8010"
     environment:
-      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@host.docker.internal:5432/abi_memory
+      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@172.17.0.1:5432/abi_memory
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
       interval: 30s
