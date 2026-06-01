@@ -55,6 +55,33 @@ def health():
     )
 
 
+@router.get("/agent/clearance")
+def agent_clearance(agent_name: str):
+    """Look up an agent's clearance from abi_agents table."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT clearance, display_name, role FROM abi_agents WHERE username = %s",
+                [agent_name],
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "agent_name": agent_name,
+                    "clearance": row[0],
+                    "display_name": row[1],
+                    "role": row[2],
+                }
+            return {"agent_name": agent_name, "clearance": "external"}
+    except Exception as e:
+        logger.error("Clearance lookup failed: %s", e)
+        return {"agent_name": agent_name, "clearance": "external"}
+    finally:
+        pool.putconn(conn)
+
+
 @router.get("/stats", response_model=StatsResponse)
 def stats():
     """Return memory, entity, and edge counts."""
