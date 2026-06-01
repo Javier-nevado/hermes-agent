@@ -1096,6 +1096,55 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+def deliver_file_tool(path: str, task_id: str = "default") -> str:
+    """Queue an existing file for delivery to the user as a native attachment.
+
+    Use this AFTER creating a file via execute_code, terminal, or any method
+    other than write_file. The file will be sent as an attachment in the chat
+    (PDF, HTML, CSV, image, script, etc.).
+    """
+    sensitive_err = _check_sensitive_path(path, task_id)
+    if sensitive_err:
+        return tool_error(sensitive_err)
+
+    try:
+        resolved = _resolve_path_for_task(path, task_id)
+    except (ValueError, OSError) as e:
+        return tool_error(f"Path resolution failed: {e}")
+
+    resolved_str = str(resolved)
+
+    if not resolved.exists():
+        return tool_error(f"File not found: {path}. Use search_files to locate it.")
+    if not resolved.is_file():
+        return tool_error(f"Not a regular file: {path}")
+
+    file_size = resolved.stat().st_size
+    file_name = resolved.name
+
+    # Add to auto-delivery queue (deduplicated)
+    with _recently_written_lock:
+        if resolved_str not in _recently_written_files:
+            _recently_written_files.append(resolved_str)
+            _register_file_catalog(resolved_str)
+
+    if file_size >= 1_048_576:
+        size_display = f"{file_size / 1_048_576:.1f} MB"
+    elif file_size >= 1024:
+        size_display = f"{file_size / 1024:.1f} KB"
+    else:
+        size_display = f"{file_size} bytes"
+
+    return json.dumps({
+        "success": True,
+        "path": resolved_str,
+        "filename": file_name,
+        "extension": resolved.suffix.lower(),
+        "size_bytes": file_size,
+        "size_human": size_display,
+    }, ensure_ascii=False)
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False) -> str:
@@ -1363,6 +1412,28 @@ WRITE_FILE_SCHEMA = {
     }
 }
 
+DELIVER_FILE_SCHEMA = {
+    "name": "deliver_file",
+    "description": (
+        "Queue an existing file for delivery to the user as a native attachment. "
+        "Use AFTER creating a file via execute_code, terminal, or any method other "
+        "than write_file — the file will be sent as an attachment (PDF, HTML, CSV, "
+        "image, etc.). write_file auto-delivers supported types, so you only need "
+        "deliver_file for files created outside write_file, or for types that "
+        "write_file doesn't auto-deliver (.py, .sh, .ps1, etc.)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to deliver. Resolved through the user's sandbox workspace.",
+            },
+        },
+        "required": ["path"],
+    },
+}
+
 PATCH_SCHEMA = {
     "name": "patch",
     "description": (
@@ -1490,3 +1561,13 @@ registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, han
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+
+
+def _handle_deliver_file(args, **kw):
+    tid = kw.get("task_id") or "default"
+    if not args.get("path") or not isinstance(args.get("path"), str):
+        return tool_error("deliver_file: missing required field 'path'.")
+    return deliver_file_tool(path=args["path"], task_id=tid)
+
+
+registry.register(name="deliver_file", toolset="file", schema=DELIVER_FILE_SCHEMA, handler=_handle_deliver_file, check_fn=_check_file_reqs, emoji="📦")
