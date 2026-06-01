@@ -1,0 +1,76 @@
+"""Health and stats routes."""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from fastapi import APIRouter, HTTPException
+
+from ..deps import get_pool, get_start_time
+from ..schemas import HealthResponse, StatsResponse
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.get("/health", response_model=HealthResponse)
+def health():
+    """Check DB connection, embedding availability, and uptime."""
+    pool = get_pool()
+    start_time = get_start_time()
+
+    # DB check
+    db_status = "ok"
+    try:
+        conn = pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        pool.putconn(conn)
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    # Embedding check
+    emb_status = "ok"
+    try:
+        from abi.memory.embeddings import get_embedding
+        result = get_embedding("health check")
+        if result is None:
+            emb_status = "unavailable"
+    except Exception as e:
+        emb_status = f"error: {e}"
+
+    return HealthResponse(
+        status="ok" if db_status == "ok" else "degraded",
+        db=db_status,
+        embeddings=emb_status,
+        uptime_seconds=round(time.time() - start_time, 1),
+    )
+
+
+@router.get("/stats", response_model=StatsResponse)
+def stats():
+    """Return memory, entity, and edge counts."""
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM abi_memories")
+            memory_count = cur.fetchone()[0]
+
+            cur.execute("SELECT count(*) FROM abi_entities")
+            entity_count = cur.fetchone()[0]
+
+            cur.execute("SELECT count(*) FROM abi_edges")
+            edge_count = cur.fetchone()[0]
+
+        return StatsResponse(
+            memory_count=memory_count,
+            entity_count=entity_count,
+            edge_count=edge_count,
+        )
+    except Exception as e:
+        logger.error("Stats query failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        pool.putconn(conn)

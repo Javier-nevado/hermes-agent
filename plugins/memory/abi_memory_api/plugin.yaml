@@ -1,0 +1,8 @@
+name: abi_memory_api
+version: "1.0.0"
+description: "HTTP client for ABI Memory API — routes memory operations through FastAPI REST API instead of direct DB access"
+author: Opteia
+requires:
+  - httpx
+env_vars:
+  - ABI_MEMORY_API_URL
