@@ -717,7 +717,13 @@ def run_conversation(
     # present are surfaced in an advisory footer so the model cannot
     # over-claim success while the file is actually unchanged on disk.
     agent._turn_failed_file_mutations: Dict[str, Dict[str, Any]] = {}
-    
+
+    # Phantom file-write detection: track basenames successfully written
+    # this turn so we can detect when the model mentions a file in its
+    # response text without actually calling write_file.
+    agent._turn_written_file_basenames: set = set()
+    agent._phantom_write_retries: int = 0
+
     # Record the execution thread so interrupt()/clear_interrupt() can
     # scope the tool-level interrupt signal to THIS agent's thread only.
     # Must be set before any thread-scoped interrupt syncing.
@@ -4227,6 +4233,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_phantom_write_retry")
                     )
                 ):
                     messages.pop()
@@ -4234,6 +4241,64 @@ def run_conversation(
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+
+                # ── Phantom file-write detection ──────────────────────
+                # Models sometimes claim a file was created in their text
+                # response without ever calling write_file.  Detect this
+                # and inject a retry telling the model to actually write.
+                if (
+                    final_response
+                    and not interrupted
+                    and getattr(agent, "_phantom_write_retries", 0) < 1
+                    and agent._file_mutation_verifier_enabled()
+                ):
+                    try:
+                        from agent.tool_result_classification import (
+                            extract_deliverable_filenames_from_text,
+                        )
+                        _mentioned = extract_deliverable_filenames_from_text(final_response)
+                        _written = getattr(agent, "_turn_written_file_basenames", None) or set()
+                        import os as _os
+                        _phantom = [
+                            f for f in _mentioned
+                            if f not in _written
+                            and not _os.path.exists(f)
+                        ]
+                        if _phantom:
+                            agent._phantom_write_retries += 1
+                            logger.info(
+                                "Phantom file-write: model mentions %s but "
+                                "write_file never called. Injecting retry (%d/1).",
+                                _phantom, agent._phantom_write_retries,
+                            )
+                            # Append premature assistant message for role alternation
+                            premature = agent._build_assistant_message(
+                                assistant_message, finish_reason,
+                            )
+                            premature["_phantom_write_retry"] = True
+                            messages.append(premature)
+                            # Inject synthetic user nudge
+                            file_list = ", ".join(f"`{f}`" for f in _phantom)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[System] You mentioned creating file(s) "
+                                    f"{file_list} in your response above, but "
+                                    f"you did not actually call write_file to "
+                                    f"create them. Call write_file now for each "
+                                    f"file, then provide your final response."
+                                ),
+                                "_phantom_write_retry": True,
+                            })
+                            final_response = None
+                            agent._session_messages = messages
+                            continue  # Back into the conversation loop
+                    except Exception as _pw_err:
+                        logger.debug(
+                            "Phantom file-write detection failed: %s",
+                            _pw_err,
+                        )
+
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break

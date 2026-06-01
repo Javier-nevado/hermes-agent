@@ -2125,6 +2125,11 @@ class AIAgent:
         else:
             for path in targets:
                 state.pop(path, None)
+            # Track successful writes for phantom-write detection.
+            _written = getattr(self, "_turn_written_file_basenames", None)
+            if _written is not None:
+                for path in targets:
+                    _written.add(Path(path).name.lower())
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
