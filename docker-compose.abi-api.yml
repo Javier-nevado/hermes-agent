@@ -1,0 +1,19 @@
+# ABI Memory API Server
+# Overlay with: docker compose -f docker-compose.yml -f docker-compose.abi-api.yml up -d abi-api
+services:
+  abi-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.abi-api
+    container_name: abi-memory-api
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@host.docker.internal:5432/abi_memory
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
