@@ -7,7 +7,7 @@ routes = [
 ]
 
 kv_namespaces = [
-  { binding = "LICENSES", id = "PLACEHOLDER_KV_NAMESPACE_ID" }
+  { binding = "LICENSES", id = "b88b0aed85fd4e199cee3d4c4558db3a" }
 ]
 
 [vars]
