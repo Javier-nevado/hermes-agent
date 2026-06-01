@@ -7,7 +7,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from ..deps import get_pool, get_start_time
+from ..deps import get_pool, get_start_time, get_license_manager
 from ..schemas import HealthResponse, StatsResponse
 
 logger = logging.getLogger(__name__)
@@ -40,11 +40,18 @@ def health():
     except Exception as e:
         emb_status = f"error: {e}"
 
+    # License check
+    license_mgr = get_license_manager()
+    lic = license_mgr.get_status()
+
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
         embeddings=emb_status,
         uptime_seconds=round(time.time() - start_time, 1),
+        license_status=lic["status"],
+        license_tier=lic.get("tier"),
+        license_expires=lic.get("expires"),
     )
 
 

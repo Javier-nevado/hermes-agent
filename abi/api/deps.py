@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 _db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 _entity_extractor: Optional[EntityExtractor] = None
 _start_time: Optional[float] = None
+_license_manager = None
 
 
 def init_deps() -> None:
@@ -66,3 +67,16 @@ def get_start_time() -> float:
     if _start_time is None:
         raise RuntimeError("Server not started")
     return _start_time
+
+
+def init_license() -> None:
+    """Initialize the license manager."""
+    global _license_manager
+    from .license import LicenseManager
+    _license_manager = LicenseManager()
+
+
+def get_license_manager():
+    if _license_manager is None:
+        raise RuntimeError("License manager not initialized")
+    return _license_manager

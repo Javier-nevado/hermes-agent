@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir \
     tokenizers \
     numpy \
     httpx \
-    pydantic
+    pydantic \
+    PyJWT[crypto]==2.12.1
 
 # Copy ABI code
 COPY abi/ ./abi/

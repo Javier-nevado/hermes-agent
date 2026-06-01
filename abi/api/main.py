@@ -7,18 +7,22 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from .deps import init_deps, get_pool
+from .deps import init_deps, init_license, get_license_manager, get_pool
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: initialize DB pool, embeddings, entity extractor."""
+    """Startup: initialize DB pool, embeddings, entity extractor, license."""
     init_deps()
-    logger.info("ABI Memory API server ready")
+    init_license()
+    mgr = get_license_manager()
+    await mgr.start_refresh()
+    logger.info("ABI Memory API server ready (license: %s)", mgr.get_status()["status"])
     yield
-    # Shutdown: close DB pool
+    # Shutdown: cancel refresh, close DB pool
+    mgr.stop_refresh()
     try:
         pool = get_pool()
         pool.closeall()

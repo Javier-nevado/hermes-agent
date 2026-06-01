@@ -103,6 +103,9 @@ class HealthResponse(BaseModel):
     db: str
     embeddings: str
     uptime_seconds: float
+    license_status: str = "unknown"
+    license_tier: Optional[str] = None
+    license_expires: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
