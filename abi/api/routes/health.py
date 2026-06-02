@@ -47,6 +47,9 @@ def health():
     # Encryption check
     enc_status = "active" if get_encryptor() else "disabled"
 
+    # Tables check
+    tables_status = "enabled" if get_license_manager().tables_enabled() else "disabled"
+
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
@@ -56,6 +59,7 @@ def health():
         license_tier=lic.get("tier"),
         license_expires=lic.get("expires"),
         encryption=enc_status,
+        tables=tables_status,
     )
 
 

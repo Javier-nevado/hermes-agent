@@ -138,6 +138,12 @@ class LicenseManager:
         """Return the cached Data Encryption Key (for content encryption)."""
         return self._dek
 
+    def tables_enabled(self) -> bool:
+        """Check if the license includes custom tables access."""
+        if self._claims:
+            return bool(self._claims.get("tables_enabled", False))
+        return False
+
     def _start_grace(self) -> None:
         """Start the grace period timer if not already started."""
         if self._grace_start is None:
@@ -210,5 +216,25 @@ def require_license():
                 "error": "license_required",
                 "message": "Write access requires a valid license. Read access is always available.",
                 "license_status": status["status"],
+            },
+        )
+
+
+def require_tables_license():
+    """FastAPI dependency: raises 403 if tables not enabled in license."""
+    from .deps import get_license_manager
+
+    mgr = get_license_manager()
+    if not mgr.is_write_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "license_required", "message": "Write access requires a valid license."},
+        )
+    if not mgr.tables_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "tables_not_enabled",
+                "message": "Custom tables require Core+Forge tier or higher.",
             },
         )
