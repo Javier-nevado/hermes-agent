@@ -7,7 +7,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from ..deps import get_pool, get_start_time, get_license_manager
+from ..deps import get_pool, get_start_time, get_license_manager, get_encryptor
 from ..schemas import HealthResponse, StatsResponse
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,9 @@ def health():
     license_mgr = get_license_manager()
     lic = license_mgr.get_status()
 
+    # Encryption check
+    enc_status = "active" if get_encryptor() else "disabled"
+
     return HealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
@@ -52,6 +55,7 @@ def health():
         license_status=lic["status"],
         license_tier=lic.get("tier"),
         license_expires=lic.get("expires"),
+        encryption=enc_status,
     )
 
 

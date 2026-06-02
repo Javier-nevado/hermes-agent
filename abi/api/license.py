@@ -16,6 +16,8 @@ import os
 import time
 from typing import Any, Dict, Optional
 
+import base64
+
 import httpx
 import jwt
 
@@ -41,6 +43,7 @@ class LicenseManager:
         self._revoked: bool = False
         self._grace_start: Optional[float] = None
         self._refresh_task: Optional[asyncio.Task] = None
+        self._dek: Optional[bytes] = None
 
         if not self._license_key:
             logger.error("OPTEIA_LICENSE_KEY not set — all writes will be blocked")
@@ -65,6 +68,15 @@ class LicenseManager:
                 self._fetched_at = time.time()
                 self._revoked = False
                 self._grace_start = None
+
+                # Cache DEK for content encryption
+                dek_b64 = data.get("dek")
+                if dek_b64:
+                    self._dek = base64.b64decode(dek_b64)
+                    logger.info("DEK received from license Worker")
+                else:
+                    logger.warning("No DEK in license response — encryption disabled")
+
                 logger.info(
                     "License verified: tier=%s customer=%s expires=%s",
                     self._claims.get("tier"),
@@ -121,6 +133,10 @@ class LicenseManager:
             logger.error("Grace period expired — writes blocked")
 
         return False
+
+    def get_dek(self) -> Optional[bytes]:
+        """Return the cached Data Encryption Key (for content encryption)."""
+        return self._dek
 
     def _start_grace(self) -> None:
         """Start the grace period timer if not already started."""

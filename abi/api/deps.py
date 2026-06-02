@@ -20,6 +20,7 @@ _db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 _entity_extractor: Optional[EntityExtractor] = None
 _start_time: Optional[float] = None
 _license_manager = None
+_encryptor = None
 
 
 def init_deps() -> None:
@@ -80,3 +81,20 @@ def get_license_manager():
     if _license_manager is None:
         raise RuntimeError("License manager not initialized")
     return _license_manager
+
+
+def init_encryptor() -> None:
+    """Initialize the encryption service from the cached DEK."""
+    global _encryptor
+    from .crypto import EncryptionService
+    dek = get_license_manager().get_dek()
+    if dek:
+        _encryptor = EncryptionService(dek)
+        logger.info("Encryption service initialized (AES-256-GCM)")
+    else:
+        logger.warning("No DEK available — encryption disabled, content stored plaintext")
+
+
+def get_encryptor():
+    """Return the EncryptionService, or None if encryption is disabled."""
+    return _encryptor

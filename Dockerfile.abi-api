@@ -22,7 +22,8 @@ RUN pip install --no-cache-dir \
     numpy \
     httpx \
     pydantic \
-    PyJWT[crypto]==2.12.1
+    PyJWT[crypto]==2.12.1 \
+    cryptography>=44.0.0
 
 # Copy ABI code
 COPY abi/ ./abi/

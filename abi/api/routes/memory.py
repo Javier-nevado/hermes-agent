@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from abi.memory.dlp import dlp_where
 from abi.memory.pii import classify_pii
 
-from ..deps import get_pool, get_extractor
+from ..deps import get_pool, get_extractor, get_encryptor
 from ..license import require_license
 from ..schemas import (
     RememberRequest,
@@ -68,38 +68,66 @@ def remember(req: RememberRequest):
     embedding = _get_embedding(content)
     memory_id = str(uuid.uuid4())
 
+    # Save plaintext for entity extraction and FTS before encrypting
+    plaintext = content
+    encryptor = get_encryptor()
+    if encryptor:
+        content = encryptor.encrypt(plaintext)
+
     conn = pool.getconn()
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
             if embedding:
-                cur.execute(
-                    """
-                    INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
-                    VALUES (%s, %s, %s::vector, %s, %s, %s, 'api')
-                    RETURNING id
-                    """,
-                    [memory_id, content, str(embedding), dlp_level, agent_name, user_id],
-                )
+                if encryptor:
+                    # Encrypted path: pass fts explicitly from plaintext
+                    cur.execute(
+                        """
+                        INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type, fts)
+                        VALUES (%s, %s, %s::vector, %s, %s, %s, 'api', to_tsvector('english', %s))
+                        RETURNING id
+                        """,
+                        [memory_id, content, str(embedding), dlp_level, agent_name, user_id, plaintext],
+                    )
+                else:
+                    # Plaintext path: trigger generates fts automatically
+                    cur.execute(
+                        """
+                        INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
+                        VALUES (%s, %s, %s::vector, %s, %s, %s, 'api')
+                        RETURNING id
+                        """,
+                        [memory_id, content, str(embedding), dlp_level, agent_name, user_id],
+                    )
             else:
-                cur.execute(
-                    """
-                    INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
-                    VALUES (%s, %s, %s, %s, %s, 'api')
-                    RETURNING id
-                    """,
-                    [memory_id, content, dlp_level, agent_name, user_id],
-                )
+                if encryptor:
+                    cur.execute(
+                        """
+                        INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type, fts)
+                        VALUES (%s, %s, %s, %s, %s, 'api', to_tsvector('english', %s))
+                        RETURNING id
+                        """,
+                        [memory_id, content, dlp_level, agent_name, user_id, plaintext],
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
+                        VALUES (%s, %s, %s, %s, %s, 'api')
+                        RETURNING id
+                        """,
+                        [memory_id, content, dlp_level, agent_name, user_id],
+                    )
 
-        # Entity extraction + storage
+        # Entity extraction + storage (always from plaintext)
         entity_count = 0
         edge_count = 0
         superseded_count = 0
         try:
-            entities = extractor.extract(content)
+            entities = extractor.extract(plaintext)
             if entities:
                 entity_count, edge_count = _store_entities(
-                    conn, memory_id, entities, content
+                    conn, memory_id, entities, plaintext
                 )
                 superseded_count = _supersede_old_memories(
                     conn, memory_id, entities, agent_name
@@ -201,6 +229,13 @@ def recall(req: RecallRequest):
                 cur.execute(_sql, [query] + params + [query, limit])
 
             results = cur.fetchall()
+
+        # Decrypt content if encryption is active
+        encryptor = get_encryptor()
+        if encryptor:
+            for row in results:
+                if row["content"] and encryptor.is_encrypted(row["content"]):
+                    row["content"] = encryptor.decrypt(row["content"])
 
         # Graph boost
         results = _graph_boost(conn, results, query, extractor)
