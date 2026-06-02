@@ -2,7 +2,10 @@
 
 All tables live in the `customer` PostgreSQL schema, isolated from core tables.
 Write endpoints gated by `tables_enabled` in license JWT. Read endpoints always open.
-Text columns encrypted at rest with the same AES-256-GCM used for memories.
+
+Note: Custom table data is NOT encrypted (unlike memories). WHERE/LIKE/ORDER BY
+on text columns must work directly — encryption would break these queries.
+The API is the only access path, and PG port is not exposed.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import psycopg2.extras
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..deps import get_pool, get_encryptor
+from ..deps import get_pool
 from ..license import require_tables_license
 from ..schemas import (
     ColumnDef,
@@ -59,18 +62,6 @@ def _validate_table_name(name: str) -> str:
     if not NAME_RE.match(name):
         raise HTTPException(status_code=400, detail=f"Invalid table name: {name}")
     return name
-
-
-def _get_text_columns(conn, table_name: str) -> List[str]:
-    """Get list of TEXT columns for a table in the customer schema."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT column_name FROM information_schema.columns
-               WHERE table_schema = %s AND table_name = %s AND data_type = 'text'
-               ORDER BY ordinal_position""",
-            [SCHEMA, table_name],
-        )
-        return [row[0] for row in cur.fetchall()]
 
 
 def _get_column_info(conn, table_name: str) -> List[ColumnInfo]:
@@ -210,13 +201,11 @@ def tables_create(req: TableCreateRequest):
 def tables_insert(req: TableInsertRequest):
     """Insert rows into a custom table."""
     pool = get_pool()
-    encryptor = get_encryptor()
     conn = pool.getconn()
     try:
         if not _table_exists(conn, req.table):
             raise HTTPException(status_code=404, detail=f"Table '{req.table}' not found")
 
-        text_columns = _get_text_columns(conn, req.table) if encryptor else []
         auto_columns = {"id", "created_at", "updated_at"}
 
         inserted = 0
@@ -229,13 +218,7 @@ def tables_insert(req: TableInsertRequest):
                     if not NAME_RE.match(col_name):
                         raise HTTPException(status_code=400, detail=f"Invalid column name: {col_name}")
 
-                # Encrypt text values
                 values = dict(row)
-                if encryptor and text_columns:
-                    for tc in text_columns:
-                        if tc in values and isinstance(values[tc], str):
-                            values[tc] = encryptor.encrypt(values[tc])
-
                 cols = list(values.keys())
                 placeholders = ["%s"] * len(cols)
                 sql = f"INSERT INTO {SCHEMA}.{req.table} ({', '.join(cols)}) VALUES ({', '.join(placeholders)})"
@@ -263,13 +246,10 @@ def tables_insert(req: TableInsertRequest):
 def tables_update(req: TableUpdateRequest):
     """Update rows in a custom table with WHERE conditions."""
     pool = get_pool()
-    encryptor = get_encryptor()
     conn = pool.getconn()
     try:
         if not _table_exists(conn, req.table):
             raise HTTPException(status_code=404, detail=f"Table '{req.table}' not found")
-
-        text_columns = _get_text_columns(conn, req.table) if encryptor else []
 
         # Validate column names in values
         params: list = []
@@ -277,8 +257,6 @@ def tables_update(req: TableUpdateRequest):
         for col_name, value in req.values.items():
             if not NAME_RE.match(col_name):
                 raise HTTPException(status_code=400, detail=f"Invalid column name: {col_name}")
-            if encryptor and col_name in text_columns and isinstance(value, str):
-                value = encryptor.encrypt(value)
             set_parts.append(f"{col_name} = %s")
             params.append(value)
 
@@ -406,7 +384,6 @@ def query(req: QueryRequest):
     All table references must be in the customer schema.
     """
     pool = get_pool()
-    encryptor = get_encryptor()
     conn = pool.getconn()
     try:
         sql = req.sql.strip()
@@ -422,12 +399,11 @@ def query(req: QueryRequest):
             raise HTTPException(status_code=400, detail="Only customer schema tables are accessible")
 
         # Qualify unqualified table references with customer schema
-        # Matches table names after FROM or JOIN keywords
         def qualify_table(match):
             prefix = match.group(1)
             table = match.group(2)
             if "." in table:
-                return match.group(0)  # Already qualified
+                return match.group(0)
             return f"{prefix}{SCHEMA}.{table}"
 
         qualified_sql = re.sub(
@@ -441,12 +417,6 @@ def query(req: QueryRequest):
             cur.execute(qualified_sql, params)
             rows = cur.fetchall()
 
-        # Decrypt text columns
-        if encryptor and rows:
-            # Get text columns from the first row's table — infer from column names
-            # We need to figure out which tables are involved
-            _decrypt_result_rows(conn, rows)
-
         return QueryResponse(rows=[dict(r) for r in rows], count=len(rows))
     except HTTPException:
         raise
@@ -455,19 +425,3 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         pool.putconn(conn)
-
-
-def _decrypt_result_rows(conn, rows: list) -> None:
-    """Decrypt encrypted TEXT values in query results."""
-    encryptor = get_encryptor()
-    if not encryptor or not rows:
-        return
-
-    # Collect all column names that contain string values that look encrypted
-    for row in rows:
-        for key, value in row.items():
-            if isinstance(value, str) and encryptor.is_encrypted(value):
-                try:
-                    row[key] = encryptor.decrypt(value)
-                except Exception:
-                    pass  # Not actually encrypted, just looks like base64
