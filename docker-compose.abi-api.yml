@@ -1,14 +1,22 @@
 # ABI Memory API Server — PostgreSQL + API in Docker
-# Usage: docker compose -f docker-compose.abi-api.yml up -d
+#
+# All secrets loaded from .env file (gitignored). Create .env with:
+#   ABI_DB_USER=abi_agent
+#   ABI_DB_PASSWORD=<per-deployment-password>
+#   ABI_DB_NAME=abi_memory
+#   OPTEIA_LICENSE_KEY=<license-key>
+#   LICENSE_JWT_SECRET=<jwt-secret>
+#
+# Usage: docker compose --env-file .env -f docker-compose.abi-api.yml up -d
 services:
   abi-db:
     image: pgvector/pgvector:pg17
     container_name: abi-memory-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: abi_agent
-      POSTGRES_PASSWORD: abi_local_dev_2026
-      POSTGRES_DB: abi_memory
+      POSTGRES_USER: ${ABI_DB_USER:-abi_agent}
+      POSTGRES_PASSWORD: ${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      POSTGRES_DB: ${ABI_DB_NAME:-abi_memory}
     volumes:
       - abi-db-data:/var/lib/postgresql/data
     networks:
@@ -29,9 +37,9 @@ services:
     ports:
       - "8010:8010"
     environment:
-      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@abi-db:5432/abi_memory
-      - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:-}
-      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
+      - ABI_DATABASE_URL=postgresql://${ABI_DB_USER:-abi_agent}:${ABI_DB_PASSWORD}@abi-db:5432/${ABI_DB_NAME:-abi_memory}
+      - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?OPTEIA_LICENSE_KEY required}
+      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:?LICENSE_JWT_SECRET required}
       - OPTEIA_API_VERSION=1.0.0
     networks:
       - opteia-net
