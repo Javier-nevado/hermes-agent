@@ -45,10 +45,12 @@ def create_app() -> FastAPI:
     from .routes.memory import router as memory_router
     from .routes.health import router as health_router
     from .routes.entities import router as entities_router
+    from .routes.tables import router as tables_router
 
     app.include_router(memory_router, tags=["memory"])
     app.include_router(health_router, tags=["health"])
     app.include_router(entities_router, tags=["entities"])
+    app.include_router(tables_router, tags=["tables"])
 
     return app
 
