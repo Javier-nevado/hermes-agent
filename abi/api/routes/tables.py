@@ -113,6 +113,15 @@ def _table_exists(conn, table_name: str) -> bool:
         return cur.fetchone() is not None
 
 
+def _column_exists(conn, table_name: str, column_name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+            [SCHEMA, table_name, column_name],
+        )
+        return cur.fetchone() is not None
+
+
 def _build_where_clause(conditions: List[WhereCondition], params: list) -> str:
     """Build WHERE clause from conditions. Appends values to params list."""
     allowed_ops = {"=", "!=", "<", ">", "<=", ">=", "LIKE", "ILIKE", "IN", "IS", "IS NOT"}
@@ -260,8 +269,9 @@ def tables_update(req: TableUpdateRequest):
             set_parts.append(f"{col_name} = %s")
             params.append(value)
 
-        # Add updated_at = NOW()
-        set_parts.append("updated_at = NOW()")
+        # Add updated_at = NOW() only if column exists
+        if _column_exists(conn, req.table, "updated_at"):
+            set_parts.append("updated_at = NOW()")
 
         where_sql = _build_where_clause(req.where, params)
 
