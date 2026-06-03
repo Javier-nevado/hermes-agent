@@ -1,6 +1,25 @@
-# ABI Memory API Server
-# Overlay with: docker compose -f docker-compose.yml -f docker-compose.abi-api.yml up -d abi-api
+# ABI Memory API Server — PostgreSQL + API in Docker
+# Usage: docker compose -f docker-compose.abi-api.yml up -d
 services:
+  abi-db:
+    image: pgvector/pgvector:pg17
+    container_name: abi-memory-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: abi_agent
+      POSTGRES_PASSWORD: abi_local_dev_2026
+      POSTGRES_DB: abi_memory
+    volumes:
+      - abi-db-data:/var/lib/postgresql/data
+    networks:
+      - opteia-net
+    # No ports exposed to host — internal only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U abi_agent -d abi_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   abi-api:
     build:
       context: .
@@ -10,13 +29,25 @@ services:
     ports:
       - "8010:8010"
     environment:
-      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@172.17.0.1:5432/abi_memory
+      - ABI_DATABASE_URL=postgresql://abi_agent:abi_local_dev_2026@abi-db:5432/abi_memory
       - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:-}
       - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
       - OPTEIA_API_VERSION=1.0.0
+    networks:
+      - opteia-net
+    depends_on:
+      abi-db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+networks:
+  opteia-net:
+    driver: bridge
+
+volumes:
+  abi-db-data:
