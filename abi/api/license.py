@@ -138,9 +138,21 @@ class LicenseManager:
         """Return the cached Data Encryption Key (for content encryption)."""
         return self._dek
 
+    # Tiers that include custom tables access
+    TABLES_TIERS = {"forge", "partner", "internal"}
+
     def tables_enabled(self) -> bool:
-        """Check if the license includes custom tables access."""
+        """Check if the license tier includes custom tables access.
+
+        Tables are available on forge (paid), partner (strategic), and
+        internal (dev) tiers. Trial, free, and core tiers do not include
+        custom tables.
+        """
         if self._claims:
+            tier = self._claims.get("tier", "")
+            # Also support legacy KV entries with tables_enabled flag
+            if tier in self.TABLES_TIERS:
+                return True
             return bool(self._claims.get("tables_enabled", False))
         return False
 
