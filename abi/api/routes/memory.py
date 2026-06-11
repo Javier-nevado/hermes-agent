@@ -232,10 +232,26 @@ def recall(req: RecallRequest):
 
         # Decrypt content if encryption is active
         encryptor = get_encryptor()
-        if encryptor:
-            for row in results:
-                if row["content"] and encryptor.is_encrypted(row["content"]):
+        from ..crypto import EncryptionService
+        encrypted_count = 0
+        for row in results:
+            if row["content"] and EncryptionService.is_encrypted(row["content"]):
+                encrypted_count += 1
+                if encryptor:
                     row["content"] = encryptor.decrypt(row["content"])
+                else:
+                    logger.error(
+                        "Memory %s is encrypted but no DEK available — returning ciphertext. "
+                        "License/encryption may be misconfigured.",
+                        row["id"],
+                    )
+                    row["content"] = "[encrypted — decryption key unavailable]"
+        if encrypted_count and not encryptor:
+            logger.error(
+                "%d/%d memories are encrypted but encryptor is disabled. "
+                "Check DEK delivery from license Worker.",
+                encrypted_count, len(results),
+            )
 
         # Graph boost
         results = _graph_boost(conn, results, query, extractor)

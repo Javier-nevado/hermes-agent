@@ -101,8 +101,12 @@ class LicenseManager:
             return False
 
     def _decode_jwt(self, token: str) -> Dict[str, Any]:
-        """Decode and validate JWT locally using the shared secret."""
-        return jwt.decode(token, self._jwt_secret, algorithms=["HS256"])
+        """Decode and validate JWT locally using the shared secret.
+
+        30s leeway handles clock skew between Cloudflare edge and local host.
+        Without it, PyJWT rejects tokens where iat is a few seconds in the future.
+        """
+        return jwt.decode(token, self._jwt_secret, algorithms=["HS256"], leeway=30)
 
     def is_write_allowed(self) -> bool:
         """Check if write operations are allowed."""
