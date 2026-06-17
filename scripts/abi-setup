@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
-# ABI Platform Setup — one-command bootstrap for fresh installs
-# Usage: sudo bash scripts/abi-setup [--skip-db] [--skip-deps]
+# ABI Platform Setup — one-command bootstrap for fresh installs.
+#
+# Usage:
+#   sudo bash scripts/abi-setup                              # bare-metal (local Postgres)
+#   ABI_DATABASE_URL=postgresql://u:p@host:5432/db \
+#       ABI_DB_USER=u bash scripts/abi-setup --skip-deps      # container/remote Postgres
+#   sudo bash scripts/abi-setup --skip-db --skip-deps         # DB already provisioned
 #
 # What it does:
 #   1. Install Python dependencies (psycopg2-binary, sentence-transformers)
-#   2. Create PostgreSQL database + user (if not exists)
-#   3. Run schema migrations
-#   4. Grant permissions
+#   2. PostgreSQL: pgvector ext + (bare-metal) create database/user
+#   3. Run schema migrations  (abi/sql/[0-9][0-9][0-9]_*.sql, sorted)
+#   4. Grant permissions / set table ownership
 #   5. Backfill tsvector for existing memories
-#   6. Verify everything works
+#   6. Verify
 #
-# Prerequisites:
-#   - PostgreSQL 14+ with pgvector extension
-#   - Python 3.11+
-#   - uv package manager (pip install uv)
+# Connection modes:
+#   - Bare-metal (default): connects via `sudo -u postgres psql`; creates the
+#     database, user, and pgvector extension (needs the OS `postgres` user).
+#   - Container/remote: set ABI_DATABASE_URL. Connects through that URL and
+#     assumes the database + user already exist (typical for a Docker pgvector
+#     container). Only ensures the pgvector extension exists in the target DB.
+#
+# Environment:
+#   ABI_DATABASE_URL  libpq URL  -> container/remote mode
+#   ABI_DB_NAME       DB name    (bare-metal default: abi_memory)
+#   ABI_DB_USER       DB role    (default: abi_agent; used for grants + 004 schema)
+#   ABI_DB_PASS       DB password (bare-metal user creation only)
 
 set -euo pipefail
 
@@ -29,10 +42,7 @@ for arg in "$@"; do
         --skip-db)   SKIP_DB=true ;;
         --skip-deps) SKIP_DEPS=true ;;
         --help|-h)
-            echo "Usage: sudo bash scripts/abi-setup [--skip-db] [--skip-deps]"
-            echo ""
-            echo "  --skip-db    Skip PostgreSQL setup (DB already configured)"
-            echo "  --skip-deps  Skip pip install (deps already installed)"
+            sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
     esac
@@ -47,8 +57,23 @@ ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 
+# ── Resolve psql connection ──────────────────────────────────────
+# PSQL_DB = command prefix that connects to the TARGET database.
+if [ -n "${ABI_DATABASE_URL:-}" ]; then
+    CONTAINER_MODE=true
+    PSQL_DB=(psql -v ON_ERROR_STOP=1 "$ABI_DATABASE_URL")
+else
+    CONTAINER_MODE=false
+    PSQL_DB=(sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME")
+fi
+
 echo "=== ABI Platform Setup ==="
 echo "Repo: $REPO_DIR"
+if [ "$CONTAINER_MODE" = true ]; then
+    echo "Mode: container/remote (ABI_DATABASE_URL)"
+else
+    echo "Mode: bare-metal (sudo -u postgres)"
+fi
 echo ""
 
 # ── 1. Dependencies ──────────────────────────────────────────────
@@ -69,11 +94,10 @@ else
 fi
 
 # ── 2. PostgreSQL ────────────────────────────────────────────────
-if [ "$SKIP_DB" = false ]; then
-    echo ""
-    echo "── Step 2: PostgreSQL setup ──"
-
-    # Check pgvector extension
+echo ""
+echo "── Step 2: PostgreSQL setup ──"
+if [ "$SKIP_DB" = false ] && [ "$CONTAINER_MODE" = false ]; then
+    # Bare-metal: ensure pgvector extension + create database/user.
     if sudo -u postgres psql -d postgres -c "SELECT 1 FROM pg_extension WHERE extname='vector'" -tAc | grep -q 1; then
         ok "pgvector extension installed"
     else
@@ -83,7 +107,6 @@ if [ "$SKIP_DB" = false ]; then
         ok "pgvector extension installed"
     fi
 
-    # Create database + user
     if sudo -u postgres psql -lqt | cut -d '|' -f 1 | grep -qw "$DB_NAME"; then
         ok "Database '$DB_NAME' exists"
     else
@@ -92,73 +115,54 @@ if [ "$SKIP_DB" = false ]; then
         sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector"
         ok "Database '$DB_NAME' created"
     fi
-
-    # Grant pgvector usage
     sudo -u postgres psql -d "$DB_NAME" -c "GRANT USAGE ON EXTENSION vector TO $DB_USER" 2>/dev/null || true
+elif [ "$CONTAINER_MODE" = true ]; then
+    # Container/remote: assume DB + user exist; just ensure pgvector in target DB.
+    if "${PSQL_DB[@]}" -c "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null 2>&1; then
+        ok "pgvector extension ready in target DB"
+    else
+        warn "Could not CREATE EXTENSION vector (need superuser) — enable it manually, then re-run"
+    fi
 fi
 
 # ── 3. Schema Migrations ─────────────────────────────────────────
 echo ""
 echo "── Step 3: Schema migrations ──"
-
-# Migration 001: abi_memories table (inline — was created before file-based migrations)
-if sudo -u postgres psql -d "$DB_NAME" -c "SELECT 1 FROM abi_memories LIMIT 0" 2>/dev/null; then
-    ok "abi_memories table exists"
+shopt -s nullglob
+migrations=( $(printf '%s\n' "$REPO_DIR"/abi/sql/[0-9][0-9][0-9]_*.sql | sort) )
+shopt -u nullglob
+if [ "${#migrations[@]}" -eq 0 ]; then
+    warn "No migration files found in $REPO_DIR/abi/sql/"
 else
-    sudo -u postgres psql -d "$DB_NAME" << 'SQL'
-CREATE TABLE IF NOT EXISTS abi_memories (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    content TEXT NOT NULL,
-    embedding vector(384),
-    dlp_level TEXT NOT NULL DEFAULT 'internal'
-        CHECK (dlp_level IN ('public', 'internal', 'confidential')),
-    agent_name TEXT NOT NULL,
-    user_id TEXT,
-    source_type TEXT DEFAULT 'agent_tool',
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    fts tsvector
-);
-CREATE INDEX IF NOT EXISTS idx_abi_memories_embedding ON abi_memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-CREATE INDEX IF NOT EXISTS idx_abi_memories_fts ON abi_memories USING GIN(fts);
-SQL
-    ok "abi_memories table created"
+    for migration in "${migrations[@]}"; do
+        if "${PSQL_DB[@]}" -v db_user="$DB_USER" -f "$migration"; then
+            ok "Applied $(basename "$migration")"
+        else
+            fail "Migration failed: $(basename "$migration")"
+        fi
+    done
 fi
 
-# Migration 002: abi_agents table
-for migration in "$REPO_DIR"/abi/sql/002_*.sql; do
-    if [ -f "$migration" ]; then
-        sudo -u postgres psql -d "$DB_NAME" -f "$migration" 2>&1 | grep -iE 'error|already exists' || true
-        ok "Applied $(basename $migration)"
-    fi
-done
-
-# ── 4. Permissions ───────────────────────────────────────────────
+# ── 4. Permissions / ownership ───────────────────────────────────
 echo ""
 echo "── Step 4: Permissions ──"
-sudo -u postgres psql -d "$DB_NAME" -c "
-    GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;
-    ALTER TABLE abi_memories OWNER TO $DB_USER;
-    ALTER TABLE abi_agents OWNER TO $DB_USER;
-    ALTER TABLE abi_entities OWNER TO $DB_USER;
-    ALTER TABLE abi_edges OWNER TO $DB_USER;
-    ALTER TABLE abi_memory_entities OWNER TO $DB_USER;
-    GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;
-        GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;
-    ALTER TABLE abi_memories OWNER TO $DB_USER;
-    ALTER TABLE abi_agents OWNER TO $DB_USER;
-    ALTER TABLE abi_entities OWNER TO $DB_USER;
-    ALTER TABLE abi_edges OWNER TO $DB_USER;
-    ALTER TABLE abi_memory_entities OWNER TO $DB_USER;
-" 2>&1 | grep -iE 'error' || true
+"${PSQL_DB[@]}" -v db_user="$DB_USER" <<SQL
+GRANT ALL ON ALL TABLES IN SCHEMA public TO $DB_USER;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;
+ALTER TABLE IF EXISTS abi_memories        OWNER TO $DB_USER;
+ALTER TABLE IF EXISTS abi_agents          OWNER TO $DB_USER;
+ALTER TABLE IF EXISTS abi_entities        OWNER TO $DB_USER;
+ALTER TABLE IF EXISTS abi_edges           OWNER TO $DB_USER;
+ALTER TABLE IF EXISTS abi_memory_entities OWNER TO $DB_USER;
+SQL
 ok "Permissions granted"
 
 # ── 5. Backfill tsvector ─────────────────────────────────────────
 echo ""
 echo "── Step 5: tsvector backfill ──"
-COUNT=$(sudo -u postgres psql -d "$DB_NAME" -tAc "SELECT count(*) FROM abi_memories WHERE fts IS NULL")
-if [ "$COUNT" -gt 0 ]; then
-    sudo -u postgres psql -d "$DB_NAME" -c "UPDATE abi_memories SET fts = to_tsvector('english', COALESCE(content, '')) WHERE fts IS NULL"
+COUNT=$("${PSQL_DB[@]}" -tAc "SELECT count(*) FROM abi_memories WHERE fts IS NULL" | tr -d '[:space:]')
+if [ "${COUNT:-0}" -gt 0 ]; then
+    "${PSQL_DB[@]}" -c "UPDATE abi_memories SET fts = to_tsvector('english', COALESCE(content, '')) WHERE fts IS NULL"
     ok "Backfilled tsvector for $COUNT memories"
 else
     ok "All memories have tsvector (no backfill needed)"
@@ -167,36 +171,36 @@ fi
 # ── 6. Verify ────────────────────────────────────────────────────
 echo ""
 echo "── Step 6: Verification ──"
-
-# Check Python imports
-"$REPO_DIR/.venv/bin/python3" -c "
+PY="$REPO_DIR/.venv/bin/python3"
+if [ -x "$PY" ]; then
+    "$PY" -c "
 from abi.memory.entities import EntityExtractor
 from abi.memory.provider import ABIMemoryProvider
 from abi.memory.embeddings import get_embedding
 print('  All ABI modules import OK')
 " 2>&1 || warn "Some imports failed — check .venv has sentence-transformers"
-
-# Check DB tables
-TABLES=$(sudo -u postgres psql -d "$DB_NAME" -tAc "
-    SELECT count(*) FROM information_schema.tables
-    WHERE table_name IN ('abi_memories','abi_agents','abi_entities','abi_edges','abi_memory_entities')
-")
-if [ "$TABLES" -eq 5 ]; then
-    ok "All 5 tables present"
 else
-    warn "Expected 5 tables, found $TABLES"
+    warn "No .venv python at $PY — skipping Python verification"
 fi
 
-# Check entity extraction
-"$REPO_DIR/.venv/bin/python3" -c "
-import sys; sys.path.insert(0, '$REPO_DIR')
-from abi.memory.entities import EntityExtractor
-ext = EntityExtractor()
-ents = ext.extract('Javier Nevado is CEO of Opteia Limited, targeting €10K MRR by Q3 2026')
-print(f'  Entity extraction: {len(ents)} entities found')
-for e in ents:
-    print(f'    {e.type}: {e.name}')
-" 2>&1
+TABLES=$("${PSQL_DB[@]}" -tAc "
+    SELECT count(*) FROM information_schema.tables
+    WHERE table_name IN ('abi_memories','abi_agents','abi_entities','abi_edges','abi_memory_entities')
+" | tr -d '[:space:]')
+if [ "${TABLES:-0}" -eq 5 ]; then
+    ok "All 5 core tables present"
+else
+    warn "Expected 5 core tables, found ${TABLES:-0}"
+fi
+
+# Show the embedding index type (sanity: should be hnsw)
+IDXDEF=$("${PSQL_DB[@]}" -tAc "SELECT indexdef FROM pg_indexes WHERE tablename='abi_memories' AND indexname='idx_abi_memories_embedding'" 2>/dev/null | tr -d '[:space:]' || true)
+case "$IDXDEF" in
+    *USINGhnsw*)    ok "embedding index type: hnsw" ;;
+    *USINGivfflat*) warn "embedding index type: ivfflat (expected hnsw)" ;;
+    "")             warn "idx_abi_memories_embedding not found" ;;
+    *)              warn "embedding index type: unknown" ;;
+esac
 
 echo ""
 echo "=== Setup Complete ==="
