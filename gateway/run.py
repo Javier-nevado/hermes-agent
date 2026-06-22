@@ -9526,6 +9526,36 @@ class GatewayRunner:
         return "\n".join(lines)
 
 
+    def _is_home_channel_owner(self, source: "SessionSource") -> bool:
+        """Best-effort trust check for sensitive commands when slash-access
+        gating is disabled (the default).
+
+        The home channel is the operator's trusted line to the bot. When one
+        is configured for the source's platform, only that exact chat (and
+        thread, if set) counts as the owner. When no home channel is set,
+        direct messages are trusted — the operator's own DM is the natural
+        trusted path.
+        """
+        try:
+            home = self.config.get_home_channel(source.platform)
+        except Exception:
+            home = None
+        if home and getattr(home, "chat_id", None):
+            if str(source.chat_id) != str(home.chat_id):
+                return False
+            home_thread = getattr(home, "thread_id", None)
+            src_thread = str(getattr(source, "thread_id", "") or "")
+            if (
+                home_thread
+                and str(home_thread) not in {"", "1"}
+                and src_thread != str(home_thread)
+            ):
+                return False
+            return True
+        # No home channel configured — trust DMs only.
+        chat_type = (getattr(source, "chat_type", "") or "").lower()
+        return chat_type in {"dm", "direct", "private", ""}
+
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
     ) -> Optional[str]:
@@ -9544,6 +9574,24 @@ class GatewayRunner:
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
+
+        # Sensitive commands are always admin-only, even when slash-access
+        # gating is disabled (the default, where every allowed user is
+        # treated as admin). OAuth login writes credentials, so without this
+        # floor any user in a chat where the bot lives could run /login and
+        # clobber the agent's tokens.
+        if canonical_cmd in self._ALWAYS_ADMIN_COMMANDS:
+            if policy.enabled:
+                if not policy.is_admin(source.user_id):
+                    return f"⛔ /{canonical_cmd} is admin-only."
+            elif not self._is_home_channel_owner(source):
+                return (
+                    f"⛔ /{canonical_cmd} is admin-only. Run it from the "
+                    "operator's home channel (or a DM), or set "
+                    "`allow_admin_from` to grant access."
+                )
+            return None
+
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -11723,6 +11771,13 @@ class GatewayRunner:
     # Providers whose device-code login is implemented in-chat. Others get a
     # "use the CLI" hint.
     _LOGIN_INCHAT_PROVIDERS = {"openai-codex"}
+
+    # Commands that are ALWAYS admin-only, even when slash-access gating is
+    # disabled (the default, where every allowed user is treated as admin).
+    # These perform sensitive operations — e.g. /login writes OAuth tokens —
+    # so they must not be runnable by just anyone in a chat where the bot
+    # lives. Enforced in _check_slash_access (both cold + running-agent paths).
+    _ALWAYS_ADMIN_COMMANDS = frozenset({"login"})
 
     async def _handle_login_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /login — connect an OAuth provider via an in-chat device-code flow.
