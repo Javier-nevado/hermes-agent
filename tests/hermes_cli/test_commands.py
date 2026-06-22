@@ -336,13 +336,18 @@ class TestSlackNativeSlashes:
             )
 
     def test_includes_aliases_as_first_class_slashes(self):
-        """Aliases (/btw, /bg, /reset, /q) must be registered as standalone
-        slashes — this is the whole point of native-slashes parity."""
+        """Aliases (/btw, /bg, /reset) must be registered as standalone
+        slashes — this is the whole point of native-slashes parity.
+
+        Slack caps apps at 50 slash commands, so the manifest is curated to
+        fit (see ``test_under_fifty_command_cap`` and the curation policy in
+        ``test_telegram_parity``). With /login added, the manifest is full and
+        /queue's alias /q no longer holds a first-class slot — it's still
+        reachable via ``/queue`` and ``/hermes q``."""
         names = {n for n, _d, _h in slack_native_slashes()}
         assert "btw" in names
         assert "bg" in names
         assert "reset" in names
-        assert "q" in names
 
     def test_telegram_parity(self):
         """Every Telegram bot command must be registerable on Slack too.

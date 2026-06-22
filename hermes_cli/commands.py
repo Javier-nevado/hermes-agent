@@ -124,6 +124,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model for this session", "Configuration",
                aliases=("provider",), args_hint="[model] [--provider name] [--global] [--refresh]"),
+    CommandDef("login", "Connect an OAuth provider via in-chat device-code flow",
+               "Configuration", args_hint="[provider]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),

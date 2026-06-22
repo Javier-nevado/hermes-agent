@@ -1875,6 +1875,11 @@ class GatewayRunner:
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
+        # In-flight in-chat OAuth logins keyed by session key. Prevents
+        # duplicate concurrent device-code flows per chat. In-memory only — a
+        # restart just cancels the pending login (the user re-runs /login).
+        self._pending_logins: Dict[str, Dict[str, Any]] = {}
+
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -7584,6 +7589,9 @@ class GatewayRunner:
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "login":
+            return await self._handle_login_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -11703,6 +11711,198 @@ class GatewayRunner:
                 reason=result["reason"],
             )
         return t("gateway.rollback.restore_failed", error=result["error"])
+
+    # ==================== /login — in-chat OAuth device-code flow ====================
+
+    # Maps a /login argument (canonical provider id or alias) to a provider id.
+    _LOGIN_PROVIDER_ALIASES = {
+        "openai-codex": "openai-codex",
+        "codex": "openai-codex",
+        "openai": "openai-codex",
+    }
+    # Providers whose device-code login is implemented in-chat. Others get a
+    # "use the CLI" hint.
+    _LOGIN_INCHAT_PROVIDERS = {"openai-codex"}
+
+    async def _handle_login_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /login — connect an OAuth provider via an in-chat device-code flow.
+
+        Lets a customer complete an OAuth login from Telegram (no CLI access):
+
+          /login                    — list connectable providers
+          /login openai-codex       — start the Codex device-code flow
+                                      (aliases: codex, openai)
+        """
+        raw_args = event.get_command_args().strip().lower()
+        source = event.source
+
+        if not raw_args:
+            return self._login_help_text()
+
+        provider_id = self._resolve_login_provider(raw_args)
+        if provider_id is None:
+            return self._login_help_text(unknown=raw_args)
+
+        if provider_id not in self._LOGIN_INCHAT_PROVIDERS:
+            return (
+                f"⏳ `/login {provider_id}` isn't available in-chat yet. "
+                "Use `hermes auth add` from the CLI for now. "
+                "(More providers coming soon.)"
+            )
+
+        # One pending login per session — prevent duplicate concurrent flows.
+        session_key = self._session_key_for_source(source)
+        if session_key in self._pending_logins:
+            return (
+                "🔐 A login is already in progress for this chat. "
+                "Open the link and enter the code, or wait for it to time out "
+                "(then run `/login` again)."
+            )
+
+        if provider_id == "openai-codex":
+            return await self._start_codex_device_login(source, session_key)
+        return self._login_help_text(unknown=provider_id)
+
+    def _resolve_login_provider(self, raw: str) -> Optional[str]:
+        """Map a /login argument (canonical id or alias) to a provider id."""
+        pid = self._LOGIN_PROVIDER_ALIASES.get(raw)
+        if pid:
+            return pid
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+        except Exception:
+            return None
+        # Accept a canonical OAuth provider id directly.
+        if raw in PROVIDER_REGISTRY:
+            return raw
+        return None
+
+    def _login_help_text(self, unknown: Optional[str] = None) -> str:
+        lines = []
+        if unknown:
+            lines.append(f"❓ Unknown provider `{unknown}`.\n")
+        lines.append("*Connect a provider:*")
+        lines.append("• `/login openai-codex` — OpenAI Codex (ChatGPT)")
+        lines.append("\nOther providers: use `hermes auth add` from the CLI.")
+        return "\n".join(lines)
+
+    async def _start_codex_device_login(
+        self, source: "SessionSource", session_key: str
+    ) -> str:
+        """Request a Codex device code, show it, then poll in the background."""
+        from hermes_cli.auth import AuthError, request_codex_device_code
+
+        # Request the device code now so we can return it in THIS reply.
+        try:
+            dc = await asyncio.to_thread(request_codex_device_code)
+        except AuthError as exc:
+            return f"❌ Couldn't start login: {exc}"
+        except Exception as exc:
+            logger.warning("codex device-code request failed: %s", exc)
+            return f"❌ Couldn't start login: {exc}"
+
+        self._pending_logins[session_key] = {
+            "provider": "openai-codex",
+            "started_at": time.time(),
+            "device_auth_id": dc["device_auth_id"],
+            "user_code": dc["user_code"],
+        }
+
+        _task = asyncio.create_task(
+            self._run_codex_login_poller(source, session_key, dc)
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        return (
+            "🔐 *OpenAI Codex login*\n\n"
+            f"1. Open: {dc['verification_url']}\n"
+            f"2. Enter code: `{dc['user_code']}`\n\n"
+            "⏳ Expires in 15 minutes. I'll confirm here once you've signed in."
+        )
+
+    async def _run_codex_login_poller(
+        self, source: "SessionSource", session_key: str, dc: Dict[str, Any]
+    ) -> None:
+        """Poll a Codex device-code flow to completion; persist + notify on success.
+
+        All blocking HTTP/file work runs in ``asyncio.to_thread`` so the
+        gateway event loop never blocks. Messages are delivered back to the
+        originating chat via the platform adapter.
+        """
+        import httpx
+        from hermes_cli.auth import (
+            AuthError,
+            _save_codex_tokens,
+            exchange_codex_device_code,
+            poll_codex_device_code,
+        )
+
+        adapter = self.adapters.get(source.platform)
+        metadata = self._thread_metadata_for_source(source)
+        chat_id = str(source.chat_id) if source.chat_id is not None else None
+
+        async def _notify(text: str) -> None:
+            if not adapter or chat_id is None:
+                logger.warning("login notify skipped (no adapter/chat)")
+                return
+            try:
+                await adapter.send(chat_id, text, metadata=metadata)
+            except Exception as exc:
+                logger.warning("login notify failed: %s", exc)
+
+        interval = dc["interval"]
+        deadline = time.monotonic() + dc["expires_in"]
+
+        try:
+            # Poll until the user authorizes (or the device code expires).
+            def _poll_loop():
+                code_resp = None
+                with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+                    while time.monotonic() < deadline:
+                        time.sleep(interval)
+                        code_resp = poll_codex_device_code(
+                            dc["device_auth_id"], dc["user_code"], client=client
+                        )
+                        if code_resp is not None:
+                            break
+                return code_resp
+
+            code_resp = await asyncio.to_thread(_poll_loop)
+
+            if code_resp is None:
+                await _notify(
+                    "⏰ Codex login timed out (15 min). "
+                    "Run `/login openai-codex` again."
+                )
+                return
+
+            # Exchange the authorization code for tokens and persist.
+            def _exchange_and_save():
+                creds = exchange_codex_device_code(
+                    code_resp.get("authorization_code", ""),
+                    code_resp.get("code_verifier", ""),
+                )
+                _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
+                return creds
+
+            await asyncio.to_thread(_exchange_and_save)
+
+            await _notify(
+                "✅ *OpenAI Codex connected.*\n"
+                "Credentials saved to this agent's auth store.\n"
+                "Use `/model --provider openai-codex` to switch to it.\n\n"
+                "ℹ️ Codex keeps a single active session per ChatGPT account — "
+                "if you use Codex CLI / VS Code on the same account, a token "
+                "refresh by one client may invalidate the other."
+            )
+        except AuthError as exc:
+            await _notify(f"❌ Codex login failed: {exc}")
+        except Exception as exc:
+            logger.exception("codex login poller crashed")
+            await _notify(f"❌ Codex login failed unexpectedly: {exc}")
+        finally:
+            self._pending_logins.pop(session_key, None)
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
