@@ -1948,38 +1948,38 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
         }
 
     if provider_id == "openai-codex":
-        # Codex uses fixed OpenAI device-auth endpoints; reuse the helper.
-        sid, _ = _new_oauth_session("openai-codex", "device_code")
-        # Use the helper but in a thread because it polls inline.
-        # We can't extract just the start step without refactoring auth.py,
-        # so we run the full helper in a worker and proxy the user_code +
-        # verification_url back via the session dict. The helper prints
-        # to stdout — we capture nothing here, just status.
+        # Codex uses fixed OpenAI device-auth endpoints. Request the device
+        # code up front (so the dashboard renders it immediately) via the
+        # shared primitive, then poll to completion in the background — same
+        # shape as the Nous branch above.
+        from hermes_cli.auth import request_codex_device_code
+
+        try:
+            dc = await asyncio.get_running_loop().run_in_executor(
+                None, request_codex_device_code
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"device-auth failed: {e}")
+
+        sid, sess = _new_oauth_session("openai-codex", "device_code")
+        sess["user_code"] = dc["user_code"]
+        sess["verification_url"] = dc["verification_url"]
+        sess["device_auth_id"] = dc["device_auth_id"]
+        sess["interval"] = dc["interval"]
+        sess["expires_in"] = dc["expires_in"]
+        sess["expires_at"] = time.time() + dc["expires_in"]
+
         threading.Thread(
-            target=_codex_full_login_worker, args=(sid,), daemon=True,
+            target=_codex_device_poller, args=(sid,), daemon=True,
             name=f"oauth-codex-{sid[:6]}",
         ).start()
-        # Block briefly until the worker has populated the user_code, OR error.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            with _oauth_sessions_lock:
-                s = _oauth_sessions.get(sid)
-            if s and (s.get("user_code") or s["status"] != "pending"):
-                break
-            await asyncio.sleep(0.1)
-        with _oauth_sessions_lock:
-            s = _oauth_sessions.get(sid, {})
-        if s.get("status") == "error":
-            raise HTTPException(status_code=500, detail=s.get("error_message") or "device-auth failed")
-        if not s.get("user_code"):
-            raise HTTPException(status_code=504, detail="device-auth timed out before returning a user code")
         return {
             "session_id": sid,
             "flow": "device_code",
-            "user_code": s["user_code"],
-            "verification_url": s["verification_url"],
-            "expires_in": int(s.get("expires_in") or 900),
-            "poll_interval": int(s.get("interval") or 5),
+            "user_code": dc["user_code"],
+            "verification_url": dc["verification_url"],
+            "expires_in": dc["expires_in"],
+            "poll_interval": dc["interval"],
         }
 
     if provider_id == "minimax-oauth":
@@ -2210,107 +2210,58 @@ def _minimax_poller(session_id: str) -> None:
             sess["error_message"] = str(e)
 
 
-def _codex_full_login_worker(session_id: str) -> None:
-    """Run the complete OpenAI Codex device-code flow.
+def _codex_device_poller(session_id: str) -> None:
+    """Drive an OpenAI Codex device-code flow to completion.
 
-    Codex doesn't use the standard OAuth device-code endpoints; it has its
-    own ``/api/accounts/deviceauth/usercode`` (JSON body, returns
-    ``device_auth_id``) and ``/api/accounts/deviceauth/token`` (JSON body
-    polled until 200). On success the response carries an
-    ``authorization_code`` + ``code_verifier`` that get exchanged at
-    CODEX_OAUTH_TOKEN_URL with grant_type=authorization_code.
-
-    The flow is replicated inline (rather than calling
-    _codex_device_code_login) because that helper prints/blocks/polls in a
-    single function — we need to surface the user_code to the dashboard the
-    moment we receive it, well before polling completes.
+    The device code has already been requested and stored in the session by
+    :func:`_start_device_code_flow`. This background thread polls the OpenAI
+    device-auth token endpoint, exchanges the resulting ``authorization_code``
+    for tokens, and persists them to the credential pool (dashboard
+    ``device_code`` source). The HTTP steps use the shared primitives in
+    ``hermes_cli.auth`` (:func:`poll_codex_device_code` /
+    :func:`exchange_codex_device_code`).
     """
     try:
         import httpx
         from hermes_cli.auth import (
-            CODEX_OAUTH_CLIENT_ID,
-            CODEX_OAUTH_TOKEN_URL,
-            DEFAULT_CODEX_BASE_URL,
+            exchange_codex_device_code,
+            poll_codex_device_code,
         )
-        issuer = "https://auth.openai.com"
 
-        # Step 1: request device code
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": CODEX_OAUTH_CLIENT_ID},
-                headers={"Content-Type": "application/json"},
-            )
-        if resp.status_code != 200:
-            raise RuntimeError(f"deviceauth/usercode returned {resp.status_code}")
-        device_data = resp.json()
-        user_code = device_data.get("user_code", "")
-        device_auth_id = device_data.get("device_auth_id", "")
-        poll_interval = max(3, int(device_data.get("interval", "5")))
-        if not user_code or not device_auth_id:
-            raise RuntimeError("device-code response missing user_code or device_auth_id")
-        verification_url = f"{issuer}/codex/device"
         with _oauth_sessions_lock:
             sess = _oauth_sessions.get(session_id)
             if not sess:
                 return
-            sess["user_code"] = user_code
-            sess["verification_url"] = verification_url
-            sess["device_auth_id"] = device_auth_id
-            sess["interval"] = poll_interval
-            sess["expires_in"] = 15 * 60  # OpenAI's effective limit
-            sess["expires_at"] = time.time() + sess["expires_in"]
+            device_auth_id = sess["device_auth_id"]
+            user_code = sess["user_code"]
+            interval = sess["interval"]
+            deadline = time.monotonic() + sess["expires_in"]
 
-        # Step 2: poll until authorized
-        deadline = time.monotonic() + sess["expires_in"]
+        # Poll until the user authorizes (or the device code expires)
         code_resp = None
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while time.monotonic() < deadline:
-                time.sleep(poll_interval)
-                poll = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
+                time.sleep(interval)
+                code_resp = poll_codex_device_code(
+                    device_auth_id, user_code, client=client
                 )
-                if poll.status_code == 200:
-                    code_resp = poll.json()
+                if code_resp is not None:
                     break
-                if poll.status_code in {403, 404}:
-                    continue  # user hasn't authorized yet
-                raise RuntimeError(f"deviceauth/token poll returned {poll.status_code}")
 
         if code_resp is None:
             with _oauth_sessions_lock:
-                sess["status"] = "expired"
-                sess["error_message"] = "Device code expired before approval"
+                sess = _oauth_sessions.get(session_id)
+                if sess:
+                    sess["status"] = "expired"
+                    sess["error_message"] = "Device code expired before approval"
             return
 
-        # Step 3: exchange authorization_code for tokens
-        authorization_code = code_resp.get("authorization_code", "")
-        code_verifier = code_resp.get("code_verifier", "")
-        if not authorization_code or not code_verifier:
-            raise RuntimeError("device-auth response missing authorization_code/code_verifier")
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            token_resp = client.post(
-                CODEX_OAUTH_TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": authorization_code,
-                    "redirect_uri": f"{issuer}/deviceauth/callback",
-                    "client_id": CODEX_OAUTH_CLIENT_ID,
-                    "code_verifier": code_verifier,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-        if token_resp.status_code != 200:
-            raise RuntimeError(f"token exchange returned {token_resp.status_code}")
-        tokens = token_resp.json()
-        access_token = tokens.get("access_token", "")
-        refresh_token = tokens.get("refresh_token", "")
-        if not access_token:
-            raise RuntimeError("token exchange did not return access_token")
+        # Exchange + persist (reuse the dashboard's pool-direct persistence)
+        creds = exchange_codex_device_code(
+            code_resp.get("authorization_code", ""),
+            code_resp.get("code_verifier", ""),
+        )
 
-        # Persist via credential pool — same shape as auth_commands.add_command
         from agent.credential_pool import (
             PooledCredential,
             load_pool,
@@ -2319,10 +2270,6 @@ def _codex_full_login_worker(session_id: str) -> None:
         )
         import uuid as _uuid
         pool = load_pool("openai-codex")
-        base_url = (
-            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-            or DEFAULT_CODEX_BASE_URL
-        )
         entry = PooledCredential(
             provider="openai-codex",
             id=_uuid.uuid4().hex[:6],
@@ -2330,16 +2277,18 @@ def _codex_full_login_worker(session_id: str) -> None:
             auth_type=AUTH_TYPE_OAUTH,
             priority=0,
             source=f"{SOURCE_MANUAL}:dashboard_device_code",
-            access_token=access_token,
-            refresh_token=refresh_token,
-            base_url=base_url,
+            access_token=creds["tokens"]["access_token"],
+            refresh_token=creds["tokens"]["refresh_token"],
+            base_url=creds["base_url"],
         )
         pool.add_entry(entry)
         with _oauth_sessions_lock:
-            sess["status"] = "approved"
+            sess = _oauth_sessions.get(session_id)
+            if sess:
+                sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
-        _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
+        _log.warning("codex device-code poller failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
             s = _oauth_sessions.get(session_id)
             if s:
