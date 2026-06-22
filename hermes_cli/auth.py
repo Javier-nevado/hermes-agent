@@ -7040,14 +7040,30 @@ def _xai_oauth_loopback_login(
     }
 
 
-def _codex_device_code_login() -> Dict[str, Any]:
-    """Run the OpenAI device code login flow and return credentials dict."""
-    import time as _time
+_CODEX_OAUTH_ISSUER = "https://auth.openai.com"
+_CODEX_DEVICE_CODE_MAX_WAIT = 15 * 60  # seconds (15 minutes)
 
-    issuer = "https://auth.openai.com"
+
+def request_codex_device_code() -> Dict[str, Any]:
+    """Request an OpenAI Codex device code (device-code flow, step 1).
+
+    Returns a dict with the fields a caller needs to display the code and poll
+    for completion::
+
+        user_code          # the code the user enters in the browser
+        device_auth_id     # poll handle
+        interval           # seconds between polls (>= 3)
+        verification_url   # the browser URL
+        expires_in         # seconds until the code expires
+        issuer             # OpenAI auth base URL
+        client_id          # the Codex OAuth client id
+
+    This is the display-only step: it does NOT block on sign-in. Pair with
+    :func:`poll_codex_device_code` and :func:`exchange_codex_device_code`.
+    """
+    issuer = _CODEX_OAUTH_ISSUER
     client_id = CODEX_OAUTH_CLIENT_ID
 
-    # Step 1: Request device code
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             resp = client.post(
@@ -7070,7 +7086,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
     device_data = resp.json()
     user_code = device_data.get("user_code", "")
     device_auth_id = device_data.get("device_auth_id", "")
-    poll_interval = max(3, int(device_data.get("interval", "5")))
+    interval = max(3, int(device_data.get("interval", "5")))
 
     if not user_code or not device_auth_id:
         raise AuthError(
@@ -7078,52 +7094,74 @@ def _codex_device_code_login() -> Dict[str, Any]:
             provider="openai-codex", code="device_code_incomplete",
         )
 
-    # Step 2: Show user the code
-    print("To continue, follow these steps:\n")
-    print("  1. Open this URL in your browser:")
-    print(f"     \033[94m{issuer}/codex/device\033[0m\n")
-    print("  2. Enter this code:")
-    print(f"     \033[94m{user_code}\033[0m\n")
-    print("Waiting for sign-in... (press Ctrl+C to cancel)")
+    return {
+        "user_code": user_code,
+        "device_auth_id": device_auth_id,
+        "interval": interval,
+        "verification_url": f"{issuer}/codex/device",
+        "expires_in": _CODEX_DEVICE_CODE_MAX_WAIT,
+        "issuer": issuer,
+        "client_id": client_id,
+    }
 
-    # Step 3: Poll for authorization code
-    max_wait = 15 * 60  # 15 minutes
-    start = _time.monotonic()
-    code_resp = None
 
-    try:
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            while _time.monotonic() - start < max_wait:
-                _time.sleep(poll_interval)
-                poll_resp = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
-                )
+def poll_codex_device_code(
+    device_auth_id: str,
+    user_code: str,
+    *,
+    client: Optional[httpx.Client] = None,
+) -> Optional[Dict[str, Any]]:
+    """Poll the OpenAI device-auth token endpoint ONCE (device-code flow, step 3).
 
-                if poll_resp.status_code == 200:
-                    code_resp = poll_resp.json()
-                    break
-                elif poll_resp.status_code in {403, 404}:
-                    continue  # User hasn't completed login yet
-                else:
-                    raise AuthError(
-                        f"Device auth polling returned status {poll_resp.status_code}.",
-                        provider="openai-codex", code="device_code_poll_error",
-                    )
-    except KeyboardInterrupt:
-        print("\nLogin cancelled.")
-        raise SystemExit(130)
+    Returns the authorization response dict when the user has completed sign-in
+    (HTTP 200), ``None`` while still waiting (HTTP 403/404), and raises
+    :class:`AuthError` on any other status or network error. Pass a shared
+    ``client`` to reuse one connection across polls in a loop.
+    """
+    issuer = _CODEX_OAUTH_ISSUER
 
-    if code_resp is None:
-        raise AuthError(
-            "Login timed out after 15 minutes.",
-            provider="openai-codex", code="device_code_timeout",
+    def _do(c: httpx.Client) -> httpx.Response:
+        return c.post(
+            f"{issuer}/api/accounts/deviceauth/token",
+            json={"device_auth_id": device_auth_id, "user_code": user_code},
+            headers={"Content-Type": "application/json"},
         )
 
-    # Step 4: Exchange authorization code for tokens
-    authorization_code = code_resp.get("authorization_code", "")
-    code_verifier = code_resp.get("code_verifier", "")
+    try:
+        if client is not None:
+            poll_resp = _do(client)
+        else:
+            with httpx.Client(timeout=httpx.Timeout(15.0)) as c:
+                poll_resp = _do(c)
+    except Exception as exc:
+        raise AuthError(
+            f"Device auth polling failed: {exc}",
+            provider="openai-codex", code="device_code_poll_error",
+        )
+
+    if poll_resp.status_code == 200:
+        return poll_resp.json()
+    if poll_resp.status_code in {403, 404}:
+        return None  # User hasn't completed login yet
+    raise AuthError(
+        f"Device auth polling returned status {poll_resp.status_code}.",
+        provider="openai-codex", code="device_code_poll_error",
+    )
+
+
+def exchange_codex_device_code(
+    authorization_code: str,
+    code_verifier: str,
+) -> Dict[str, Any]:
+    """Exchange a Codex device-flow authorization code for tokens (step 4).
+
+    Returns the credentials dict callers persist::
+
+        {tokens: {access_token, refresh_token}, base_url, last_refresh,
+         auth_mode: "chatgpt", source: "device-code"}
+    """
+    issuer = _CODEX_OAUTH_ISSUER
+    client_id = CODEX_OAUTH_CLIENT_ID
     redirect_uri = f"{issuer}/deviceauth/callback"
 
     if not authorization_code or not code_verifier:
@@ -7183,6 +7221,58 @@ def _codex_device_code_login() -> Dict[str, Any]:
         "auth_mode": "chatgpt",
         "source": "device-code",
     }
+
+
+def _print_codex_device_instructions(verification_url: str, user_code: str) -> None:
+    """Print CLI device-code login instructions to stdout."""
+    print("To continue, follow these steps:\n")
+    print("  1. Open this URL in your browser:")
+    print(f"     \033[94m{verification_url}\033[0m\n")
+    print("  2. Enter this code:")
+    print(f"     \033[94m{user_code}\033[0m\n")
+    print("Waiting for sign-in... (press Ctrl+C to cancel)")
+
+
+def _codex_device_code_login() -> Dict[str, Any]:
+    """Run the OpenAI device code login flow (CLI) and return credentials dict.
+
+    Thin wrapper over :func:`request_codex_device_code`,
+    :func:`poll_codex_device_code`, and :func:`exchange_codex_device_code` that
+    prints instructions and polls synchronously. Non-CLI callers (e.g. the
+    gateway ``/login`` command, the web dashboard) should call the three steps
+    directly so they can surface the code before polling completes.
+    """
+    import time as _time
+
+    dc = request_codex_device_code()
+    _print_codex_device_instructions(dc["verification_url"], dc["user_code"])
+
+    deadline = _time.monotonic() + dc["expires_in"]
+    code_resp: Optional[Dict[str, Any]] = None
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            while _time.monotonic() < deadline:
+                _time.sleep(dc["interval"])
+                code_resp = poll_codex_device_code(
+                    dc["device_auth_id"], dc["user_code"], client=client
+                )
+                if code_resp is not None:
+                    break
+    except KeyboardInterrupt:
+        print("\nLogin cancelled.")
+        raise SystemExit(130)
+
+    if code_resp is None:
+        raise AuthError(
+            "Login timed out after 15 minutes.",
+            provider="openai-codex", code="device_code_timeout",
+        )
+
+    return exchange_codex_device_code(
+        code_resp.get("authorization_code", ""),
+        code_resp.get("code_verifier", ""),
+    )
 
 
 # ==================== MiniMax Portal OAuth ====================

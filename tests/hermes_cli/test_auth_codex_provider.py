@@ -17,9 +17,13 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    _codex_device_code_login,
+    exchange_codex_device_code,
     get_codex_auth_status,
     get_provider_auth_state,
+    poll_codex_device_code,
     refresh_codex_oauth_pure,
+    request_codex_device_code,
     resolve_codex_runtime_credentials,
     resolve_provider,
 )
@@ -661,3 +665,170 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+
+
+# ==================== device-code primitives (request / poll / exchange) ====================
+
+
+class _FakeHttpxResponse:
+    """Minimal httpx.Response stand-in."""
+    def __init__(self, status_code, body=None):
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self):
+        return self._body
+
+
+class _FakeHttpxClient:
+    """Fake httpx.Client: routes POSTs by URL substring to canned responses.
+
+    ``responses`` maps a URL substring to either an _FakeHttpxResponse or a
+    callable returning one (so a sequence of responses can be served). Records
+    every POST in ``self.calls`` for assertions.
+    """
+    def __init__(self, responses):
+        self._responses = responses
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append({"url": url, "kwargs": kwargs})
+        for key, resp in self._responses.items():
+            if key in url:
+                return resp() if callable(resp) else resp
+        raise AssertionError(f"unexpected POST to {url}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_request_codex_device_code_returns_display_fields(monkeypatch):
+    fake = _FakeHttpxClient({
+        "deviceauth/usercode": _FakeHttpxResponse(200, {
+            "user_code": "ABCD-WXYZ",
+            "device_auth_id": "daid-123",
+            "interval": "7",
+        }),
+    })
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: fake)
+
+    dc = request_codex_device_code()
+    assert dc["user_code"] == "ABCD-WXYZ"
+    assert dc["device_auth_id"] == "daid-123"
+    assert dc["interval"] == 7  # parsed + floored at 3
+    assert dc["verification_url"] == "https://auth.openai.com/codex/device"
+    assert dc["expires_in"] == 15 * 60
+    assert dc["issuer"] == "https://auth.openai.com"
+    assert dc["client_id"]  # populated from the constant
+
+
+def test_request_codex_device_code_floors_interval_at_three(monkeypatch):
+    fake = _FakeHttpxClient({
+        "deviceauth/usercode": _FakeHttpxResponse(200, {
+            "user_code": "UC", "device_auth_id": "DA", "interval": "1",
+        }),
+    })
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: fake)
+    assert request_codex_device_code()["interval"] == 3
+
+
+def test_request_codex_device_code_raises_on_non_200(monkeypatch):
+    fake = _FakeHttpxClient({"deviceauth/usercode": _FakeHttpxResponse(500)})
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: fake)
+    with pytest.raises(AuthError) as exc_info:
+        request_codex_device_code()
+    assert exc_info.value.code == "device_code_request_error"
+
+
+def test_request_codex_device_code_raises_on_missing_fields(monkeypatch):
+    fake = _FakeHttpxClient({
+        "deviceauth/usercode": _FakeHttpxResponse(200, {"user_code": "", "device_auth_id": ""}),
+    })
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: fake)
+    with pytest.raises(AuthError) as exc_info:
+        request_codex_device_code()
+    assert exc_info.value.code == "device_code_incomplete"
+
+
+def test_poll_codex_device_code_returns_none_while_waiting():
+    assert poll_codex_device_code("daid", "uc", client=_FakeHttpxClient(
+        {"deviceauth/token": _FakeHttpxResponse(404)})) is None
+    assert poll_codex_device_code("daid", "uc", client=_FakeHttpxClient(
+        {"deviceauth/token": _FakeHttpxResponse(403)})) is None
+
+
+def test_poll_codex_device_code_returns_response_on_success():
+    body = {"authorization_code": "ac", "code_verifier": "cv"}
+    fake = _FakeHttpxClient({"deviceauth/token": _FakeHttpxResponse(200, body)})
+    assert poll_codex_device_code("daid", "uc", client=fake) == body
+
+
+def test_poll_codex_device_code_raises_on_other_status():
+    fake = _FakeHttpxClient({"deviceauth/token": _FakeHttpxResponse(500)})
+    with pytest.raises(AuthError) as exc_info:
+        poll_codex_device_code("daid", "uc", client=fake)
+    assert exc_info.value.code == "device_code_poll_error"
+
+
+def test_exchange_codex_device_code_returns_credentials(monkeypatch):
+    fake = _FakeHttpxClient({
+        "oauth/token": _FakeHttpxResponse(200, {"access_token": "at-1", "refresh_token": "rt-1"}),
+    })
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: fake)
+
+    creds = exchange_codex_device_code("auth-code", "verifier")
+    assert creds["tokens"] == {"access_token": "at-1", "refresh_token": "rt-1"}
+    assert creds["auth_mode"] == "chatgpt"
+    assert creds["source"] == "device-code"
+    assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
+
+    # token-exchange POST must carry the device-flow grant fields
+    posted = fake.calls[-1]["kwargs"]["data"]
+    assert posted["grant_type"] == "authorization_code"
+    assert posted["code"] == "auth-code"
+    assert posted["code_verifier"] == "verifier"
+    assert posted["redirect_uri"].endswith("/deviceauth/callback")
+
+
+def test_exchange_codex_device_code_raises_on_missing_code():
+    with pytest.raises(AuthError) as exc_info:
+        exchange_codex_device_code("", "verifier")
+    assert exc_info.value.code == "device_code_incomplete_exchange"
+
+
+def test_codex_device_code_login_wrapper_success(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth.request_codex_device_code", lambda: {
+        "user_code": "UC", "device_auth_id": "DA", "interval": 0,
+        "verification_url": "u", "expires_in": 60, "issuer": "i", "client_id": "c",
+    })
+    monkeypatch.setattr(
+        "hermes_cli.auth.poll_codex_device_code",
+        lambda *a, **k: {"authorization_code": "ac", "code_verifier": "cv"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.exchange_codex_device_code",
+        lambda ac, cv: {"tokens": {"access_token": "at", "refresh_token": "rt"},
+                        "base_url": "b", "last_refresh": "lr",
+                        "auth_mode": "chatgpt", "source": "device-code"},
+    )
+    monkeypatch.setattr("hermes_cli.auth._print_codex_device_instructions", lambda *a: None)
+
+    creds = _codex_device_code_login()
+    assert creds["tokens"]["access_token"] == "at"
+    assert creds["source"] == "device-code"
+
+
+def test_codex_device_code_login_wrapper_times_out(monkeypatch):
+    monkeypatch.setattr("hermes_cli.auth.request_codex_device_code", lambda: {
+        "user_code": "UC", "device_auth_id": "DA", "interval": 0,
+        "verification_url": "u", "expires_in": 0, "issuer": "i", "client_id": "c",
+    })
+    monkeypatch.setattr("hermes_cli.auth.poll_codex_device_code", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.auth._print_codex_device_instructions", lambda *a: None)
+
+    with pytest.raises(AuthError) as exc_info:
+        _codex_device_code_login()
+    assert exc_info.value.code == "device_code_timeout"
