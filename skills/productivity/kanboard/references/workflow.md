@@ -48,7 +48,8 @@ The poll/trigger scripts are **deploy-side runtime infrastructure** (per-agent
 Setup outline for an operator:
 
 1. Provision each agent: a Kanboard user + API token + project membership, and a
-   per-agent `kanban.json` (the same file this skill reads).
+   per-agent `kanban.json` (`auth_user`/`auth_pass`/`project_id`; the board URL
+   defaults to the local Kanboard — the same file this skill reads).
 2. A `no_agent` cron script that, for the agent, calls `getMe` + `getAllTasks`,
    filters To Do + `owner_id` == self, and on a hit POSTs a wake-up turn to the
    agent's API (`http://127.0.0.1:<port>/v1/chat/completions`). Empty board → exit

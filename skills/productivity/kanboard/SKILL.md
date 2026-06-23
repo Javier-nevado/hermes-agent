@@ -1,7 +1,7 @@
 ---
 name: kanboard
 description: "Work tasks on a shared Kanboard board. List your To Do cards, move them through the workflow, and comment with results. Kanboard JSON-RPC CLI; instance-agnostic (you authenticate as yourself)."
-version: 1.3.0
+version: 1.4.0
 author: Opteia
 license: MIT
 platforms: [linux, macos, windows]
@@ -34,8 +34,13 @@ env vars (in `~/.hermes/.env`), then `$HERMES_HOME/kanban.json`, then
 so the same script works for every agent and you only ever act on cards
 **assigned to you**. No shared/bundled credentials. If none are configured the
 client prints a clear error — ask whoever deploys you to provision a
-`kanban.json` (`api_url`, `web_url`, `auth_user`, `auth_pass`=<API token>,
-`project_id`).
+`kanban.json` (`auth_user`, `auth_pass`=<API token>, `project_id`).
+
+**You always talk to the *local* Kanboard.** The board URL defaults to
+`http://127.0.0.1:8095` — the Kanboard container running on your own host. The
+public hostname is for *human* web access only (behind SSO); agents never use
+it, so it isn't in your config. Set `KANBOARD_URL` only if your deploy uses a
+non-standard port.
 
 ## The board
 
