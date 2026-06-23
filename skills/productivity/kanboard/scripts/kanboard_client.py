@@ -8,9 +8,14 @@ so explicit ``KANBOARD_*`` env vars override the file):
   2. ``$HERMES_HOME/kanban.json``  — repo-standard skill-creds location.
   3. ``$HOME/workspace/agent/credentials/kanban.json`` — ABI per-agent creds.
 
-``kanban.json`` shape::
-    {"api_url": "http://host/jsonrpc.php",
-     "web_url": "http://host",
+The **board URL defaults to the local Kanboard** (``http://127.0.0.1:8095``) —
+agents always talk to the Kanboard container running on their own host over the
+loopback; the public hostname is for *human* web access only and is never used
+by agents. Set ``KANBOARD_URL`` (or a ``web_url``/``api_url`` in the creds file)
+only to override that default.
+
+``kanban.json`` shape (URL fields optional — omitted = local default)::
+    {"web_url": "http://127.0.0.1:8095",   # optional; defaults to the local Kanboard
      "auth_user": "<username>", "auth_pass": "<API token>",
      "project_id": <int>}
 
@@ -46,6 +51,12 @@ def _hermes_home() -> Path:
     return Path(val) if val else Path.home() / ".hermes"
 
 
+# Agents always hit the LOCAL Kanboard (the container on their own host); the
+# public hostname is human web-access only. This default removes the need to put
+# the URL in every creds file. Override via KANBOARD_URL for a non-standard port.
+DEFAULT_LOCAL_URL = "http://127.0.0.1:8095"
+
+
 def _load_env():
     """Populate KANBOARD_* from a per-agent creds file (env vars win via setdefault)."""
     if os.getenv("KANBOARD_TOKEN"):
@@ -68,7 +79,7 @@ def _load_env():
 
 
 _load_env()
-URL = (os.getenv("KANBOARD_URL") or "").rstrip("/")
+URL = (os.getenv("KANBOARD_URL") or DEFAULT_LOCAL_URL).rstrip("/")
 USER = os.getenv("KANBOARD_USER", "")
 TOKEN = os.getenv("KANBOARD_TOKEN", "")
 
@@ -83,8 +94,6 @@ def _rpc(method, params=None):
     if not TOKEN:
         _die("KANBOARD_TOKEN not set. Put KANBOARD_* in ~/.hermes/.env or a kanban.json "
              "at $HERMES_HOME/kanban.json (or ~/workspace/agent/credentials/kanban.json).")
-    if not URL:
-        _die("KANBOARD_URL not set (provide the board base URL in creds/env).")
     _seq[0] += 1
     body = {"jsonrpc": "2.0", "id": _seq[0], "method": method}
     if params is not None:
@@ -202,10 +211,14 @@ def main():
     cp.add_argument("comment", nargs="?", default=None)
     cp.set_defaults(fn=cmd_complete)
     args = p.parse_args()
-    if not TOKEN or not URL:
-        _die("Kanboard credentials not found. Set KANBOARD_* in ~/.hermes/.env, or create a "
-             "kanban.json at $HERMES_HOME/kanban.json (or ~/workspace/agent/credentials/kanban.json) "
-             "with api_url/web_url/auth_user/auth_pass/project_id.")
+    if not TOKEN:
+        _die(
+            "Kanboard credentials not found. Set KANBOARD_TOKEN/KANBOARD_USER/"
+            "KANBOARD_PROJECT_ID in ~/.hermes/.env, or create a kanban.json at "
+            "$HERMES_HOME/kanban.json (or ~/workspace/agent/credentials/kanban.json) "
+            "with auth_user/auth_pass/project_id. The board URL defaults to the "
+            f"local Kanboard ({DEFAULT_LOCAL_URL}); set KANBOARD_URL only to override."
+        )
     print(json.dumps(args.fn(args), indent=2))
 
 
