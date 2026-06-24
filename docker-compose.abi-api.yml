@@ -102,11 +102,29 @@ services:
       kanboard-db-init:
         condition: service_completed_successfully
     environment:
-      # config.php reads the DB password from this env var (never hardcoded).
-      - ABI_DB_PASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
-      - ABI_DB_USER=${ABI_DB_USER:-abi_agent}
+      # Native kanboard env-driven config. The image declares these in
+      # /etc/php84/php-fpm.d/env.conf, so they reach the fpm workers (a custom
+      # config.php reading getenv() does NOT — fpm clear_env strips it).
+      # DB_RUN_MIGRATIONS=true lets kanboard auto-install + upgrade its schema,
+      # so no manual SQL import is needed on a fresh shared DB.
+      - DB_DRIVER=postgres
+      - DB_HOSTNAME=abi-memory-db
+      - DB_PORT=5432
+      - DB_NAME=kanboard
+      - DB_USERNAME=${ABI_DB_USER:-abi_agent}
+      - DB_PASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      - DB_RUN_MIGRATIONS=true
+      - DEBUG=false
+      # Reverse-proxy auth: nginx + cfverify validate the CF Access JWT (auth_request),
+      # then forward CF-Access-Authenticated-User-Email, which kanboard trusts.
+      - REVERSE_PROXY_AUTH=true
+      - REVERSE_PROXY_USER_HEADER=HTTP_CF_ACCESS_AUTHENTICATED_USER_EMAIL
+      - REVERSE_PROXY_EMAIL_HEADER=HTTP_CF_ACCESS_AUTHENTICATED_USER_EMAIL
+      - REVERSE_PROXY_DEFAULT_ADMIN=${KANBOARD_DEFAULT_ADMIN:-admin}
+      - TRUSTED_PROXY_NETWORKS=172.16.0.0/12,127.0.0.1/32
     volumes:
-      - ./kanboard/config.php:/var/www/app/config.php:ro
+      # No config.php mount — native env-driven config. data/ (uploads) + plugins/
+      # (OpteiaSkin theme) stay as bind-mounts; abi-update.sh chowns them pre-extract.
       - ./kanboard/data:/var/www/app/data
       - ./kanboard/plugins:/var/www/app/plugins
     networks:
