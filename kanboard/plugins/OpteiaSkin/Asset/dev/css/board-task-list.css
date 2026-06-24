@@ -1,0 +1,292 @@
+.board-task-list {
+	min-height: 500px;
+	/*background: linear-gradient(180deg, var(--color-greyscale-3), transparent 10%);*/
+    border-radius: var(--size-radius-def);
+	background-image: var(--pattern-dots-def);
+    background-size: var(--pattern-dots-size);
+    border-left: var(--style-border);
+	box-shadow: inset -4rem 0 0 0 var(--color-greyscale-4);
+}
+.board-task-list-compact {
+    max-height: calc(100vh - 16.5rem);
+}
+.task-board {
+	border-radius: var(--size-radius-def);
+	padding: 1rem;
+	border: none;
+	border-bottom: 1px solid;
+	transition: box-shadow .15s, transform .15s;
+	transition-timing-function: ease-in-out;
+	font-size: 1rem;
+	margin-bottom: .5rem;
+	box-shadow: var(--style-shadow-light);
+}
+.task-board:hover {
+	transform: translateY(-2px);
+	box-shadow: var(--style-shadow-heavy);
+}
+.task-board a {
+    color: var(--color-greyscale-1);
+}
+.draggable-placeholder {
+    border: 1.5rem solid var(--color-greyscale-5);
+    background-image: var(--pattern-dots-ph);
+    background-size: var(--pattern-dots-size);
+    margin-bottom: .75rem;
+}
+
+/*collapsed and expand*/
+.task-board-collapsed a.dropdown-menu strong{
+	color: var(--color-greyscale-1);
+}
+.task-board-expanded {
+    overflow: hidden;
+}
+.task-board-expanded .task-board-saving-icon{
+	left: 0;
+    right: 0;
+    bottom: 0;
+    top: 0;
+    color: var(--color-greyscale-6);
+    background-color: rgba(0,0,0,.6);
+}
+.task-board-expanded .task-board-saving-icon i.fa{
+	margin: 0;
+    position: absolute;
+    font-size: 1rem;
+    bottom: 1rem;
+    right: 1rem;
+}
+.task-board-sort-handle i.fa-arrows-alt{
+	padding: 1rem;
+	margin: -.5rem 0 0 -1rem;
+}
+
+/* recent and closed */
+.task-board.task-board-recent,
+.task-board.task-board-status-closed {
+	border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-top: none;
+    border-left: none;
+    border-right: none;
+}
+.task-board.task-board-status-closed .task-board-title {
+	text-decoration: line-through;
+	font-style: italic;
+}
+.task-board.task-board-recent .task-board-header:before {
+	content: "\25CF";
+    position: relative;
+    margin: 0 8px 8px 0;
+    color: var(--color-brand-prim);
+	text-shadow: 1px 2px 6px var(--color-greyscale-2);
+    font-size: var(--size-font-min);
+}
+
+/* header */
+.task-board-header {
+	line-height: 1rem;
+	display: flex;
+	align-items: flex-start;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	margin-bottom: 0;
+}
+.task-board-expanded .task-board-header>a i.fa{
+    color: var(--color-greyscale-1);
+    opacity: .08;
+}
+.task-board-header > .dropdown {
+	margin-bottom: 1rem;
+	min-width: 3.3rem;
+	font-size: var(--size-font-min);
+	line-height: var(--size-font-min);
+}
+body.TR .task-board-header > .dropdown * {
+	color: var(--color-greyscale-1);
+	font-size: var(--size-font-min);
+	line-height: var(--size-font-min);
+}
+.task-board-header > .js-modal-large {
+	padding: 0 0.5rem 0 0;
+	flex: 20px;
+	margin-bottom: 1rem;
+	line-height: var(--size-font-min);
+	font-size: var(--size-font-min);
+}
+
+/* avatar */
+.task-board-avatars {
+	text-align: right;
+    float: right;
+	margin-bottom: 6px;
+}
+.task-list-avatars{
+	position: absolute;
+	top: 1rem;
+	right: 1rem;
+}
+.task-board-avatars .avatar.avatar-inline,
+.task-list-avatars .avatar.avatar-inline {
+	margin-right: 0;
+}
+.task-board-header > .task-board-assignee, .task-avatar-assignee{
+	display: none;
+}
+
+/* title */
+body.TR .task-board-title, body.TR .table-list-title {
+	line-height: 0;
+	margin: 0 0 6px;
+	clear: both;
+	/*display: block;*/
+}
+body.TR .task-board-title{
+	float: left;
+}
+/*body.TR .table-list-title{
+	display: inline;
+	margin-right: 1rem;
+}*/
+body.TR .task-board-title a, body.TR .table-list-title a {
+    font-weight: bold;
+	line-height: calc(1rem + 6px);
+	font-size: 1rem;
+	color: var(--color-greyscale-1);
+	padding-right: 6px;
+}
+
+/* category & tags */
+.task-board .task-board-expanded > .task-board-category-container {
+	margin: 0;
+	text-align: left;
+	display: contents;
+	float: left;
+}
+.task-board .task-tags, .task-board .task-tags ul {
+	display: contents;
+}
+.task-board-category, .task-tags li, .table-list-category, .task-list-tag {
+    border: none;
+	border-bottom: calc(1rem + 6px) solid var(--color-greyscale-2);
+    border-radius: var(--size-radius-def);
+	height: 0;
+    line-height: calc(1rem + 6px);
+    padding: 0 4px;
+    margin: 0 6px 6px 0 !important;
+    font-weight: bold;
+    font-size: var(--size-font-min);;
+	color: var(--color-greyscale-6);
+    background: none !important;
+	float: left;
+	opacity: .85;
+	white-space: nowrap;
+    letter-spacing: -.5px;
+	max-width: calc(100% - 1rem);
+	box-shadow: var(--style-shadow-light);
+}
+.table-list-category, .task-list-tag {
+	float: none;
+	display: inline-block;
+	margin-bottom: 0 !important;
+}
+.task-board-category:hover, .task-tags li:hover, .table-list-category:hover, .task-list-tag:hover{
+	opacity: 1;
+}
+body.TR .task-board-category a, body.TR .table-list-category a{
+    color: var(--color-greyscale-6);
+	font-size: var(--size-font-min);
+    font-weight: bold;
+	line-height: calc(1rem + 6px);
+	display: contents;
+}
+body.TR .task-board-category a:hover, body.TR .table-list-category a:hover {
+    color: var(--color-greyscale-6);
+}
+body.TR .task-board-category a {
+	/*display: block;*/
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+body.TR .task-board-category span.tooltip i.fa, body.TR .table-list-category span.tooltip i.fa{
+    margin: 0;
+    color: var(--color-greyscale-6);
+    vertical-align: middle;
+    opacity: .5;
+}
+
+/* icons */
+.task-date {
+    font-weight: normal;
+    color: var(--color-greyscale-1);
+}
+.task-board-icons, .task-list-icons {
+	clear: both;
+	font-size: 0;
+	text-align: left;
+    line-height: 0;
+    margin-top: calc(1rem - 9px);
+	display: inline-block;
+	width: 100%;
+	transition: opacity .15s;
+	transition-timing-function: ease-in-out;
+}
+.task-board-icons .task-board-icons-row {
+	line-height: 0;
+	display: contents;
+	font-size: 0;
+}
+.task-board-icons .task-board-icons-row br {
+	display: none;
+}
+.task-board:hover .task-board-icons, .task-board:hover .task-board-header>a i.fa, .table-list-row:hover .task-list-icons {
+    opacity: 1;
+}
+.task-board-icons .task-board-icons-row *, .task-list-icons *{
+	margin: 0 .1rem 0 0 !important;
+	font-size: var(--size-font-min);
+	font-weight: normal;
+	color: var(--color-greyscale-1) !important;
+	display: inline;
+}
+.task-board-icons .task-board-icons-row > *, .task-list-icons > *{
+	margin: 0 .5rem 0 0 !important;
+	opacity: 1;
+	display: inline-block;
+	line-height: calc(1rem + 6px);
+}
+.task-board-icons .task-board-icons-row > .metamagik-footer-title, .task-list-icons > .metamagik-footer-title{
+	/*margin: 0 .1rem 0 0 !important;*/
+	display: none;
+}
+.task-board-icons .task-board-icons-row .task-date-overdue, .task-list-icons .task-date-overdue,
+.task-board-icons .task-board-icons-row .task-date-overdue i.fa, .task-list-icons .task-date-overdue i.fa {
+	color: var(--color-warning-prim) !important;
+}
+.task-board-icons .task-board-icons-row .task-icon-age,
+.task-list-icons .task-icon-age{
+	font-size: 0;
+	height: calc(1rem + 6px);
+}
+.task-board-icons .task-board-icons-row .task-icon-age .task-icon-age-total,
+.task-board-icons .task-board-icons-row .task-icon-age .task-icon-age-column,
+.task-list-icons .task-icon-age .task-icon-age-total,
+.task-list-icons .task-icon-age .task-icon-age-column{
+	border: none;
+	background: var(--color-greyscale-2);
+	opacity: 1;
+}
+.task-board-icons .task-board-icons-row .task-icon-age .task-icon-age-total,
+.task-list-icons .task-icon-age .task-icon-age-total {
+	border-top-left-radius: var(--size-radius-def);
+	border-bottom-left-radius: var(--size-radius-def);
+	margin: 0 !important;
+    border-right: 1px solid var(--color-greyscale-2);
+}
+.task-board-icons .task-board-icons-row .task-icon-age .task-icon-age-column,
+.task-list-icons .task-icon-age .task-icon-age-column {
+	border-top-right-radius: var(--size-radius-def);
+	border-bottom-right-radius: var(--size-radius-def);
+	margin: 0;
+}

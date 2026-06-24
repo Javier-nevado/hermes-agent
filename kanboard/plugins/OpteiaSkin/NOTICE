@@ -1,0 +1,16 @@
+Opteia Skin
+===========
+
+This Kanboard plugin is a fork of ThemeRevision
+(https://github.com/greyaz/ThemeRevision) by Greyaz, distributed under the MIT
+License (see LICENSE).
+
+Upstream copyright: Copyright (c) 2022 greyaz.
+
+Modifications by Opteia (2026):
+  - Rebranded namespace and plugin directory to OpteiaSkin.
+  - Opteia brand palette defaults, auto light/dark.
+  - Mobile/responsive refinements (opteia-overrides.css).
+  - PWA support (manifest + service worker).
+
+Kanboard itself is licensed under the MIT License (https://kanboard.org).

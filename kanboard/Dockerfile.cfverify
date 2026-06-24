@@ -1,0 +1,7 @@
+# Tiny Cloudflare-Access JWT verifier for the Kanboard proxy auth_request gate.
+# Pre-installs PyJWT + cryptography so the container doesn't pip-install on every
+# start (the source script is bind-mounted read-only at /app/cf_access_verifier.py).
+FROM python:3-slim
+RUN pip install --no-cache-dir PyJWT cryptography
+WORKDIR /app
+CMD ["python", "/app/cf_access_verifier.py"]

@@ -1,0 +1,162 @@
+#board {
+	border-right: none;
+}
+#board td,
+#board th {
+	border: none;
+	/*border-left: 1px solid var(--color-greyscale-4);*/
+	background: var(--color-greyscale-4);
+	padding: .5rem .75rem;
+}
+#board th.board-column-header{
+	line-height: 0;
+	padding-bottom: 0.25rem;
+}
+#board td:first-child,
+#board th:first-child {
+	border: none;
+	padding-left: 0;
+}
+#board td:last-child,
+#board th:last-child {
+	padding-right: 0;
+}
+#board th.board-swimlane-header{
+	font-size: 1.5rem;
+    line-height: 4rem;
+	padding: 0;
+}
+#board th.board-swimlane-header *{
+	line-height: 4rem;
+    vertical-align: middle;
+}
+#board th.board-swimlane-header .tooltip{
+	font-size: 1rem;
+}
+#board th.board-swimlane-header .tooltip i.fa{
+	color: var(--color-greyscale-2);
+}
+#board th.board-swimlane-header .board-column-header-task-count{
+	font-size: 1rem;
+}
+#board .board-swimlane-columns-first th.board-column-header-collapsed{
+    width: 4.5rem;
+    min-width: 4.5rem;
+}
+#board .board-swimlane-columns-first th.board-column-header-collapsed:last-child{
+    width: 3.75rem;
+    min-width: 3.75rem;
+}
+#board th.board-column-header-collapsed {
+    width: 3rem;
+    min-width: 3rem;
+}
+#board th.board-column-header-collapsed .board-add-icon{
+    display: none;
+}
+#board th.board-column-header-collapsed .board-column-title{
+    display: none;
+}
+#board td {
+	border-color: var(--color-greyscale-3)
+}
+#board .board-swimlane {
+	border-bottom: 2rem solid var(--color-greyscale-4);
+}
+.board-swimlane-header .board-swimlane-toggle i.fa{
+	font-size: 1rem;
+	color: var(--color-greyscale-2);
+	line-height: 4rem;
+    vertical-align: bottom;
+}
+.board-swimlane-header .board-swimlane-toggle i.fa:hover{
+	color: var(--color-greyscale-1);
+}
+#board th.board-column-header-collapsed{
+	text-align: left;
+}
+#board th.board-column-header-collapsed > .board-column-expanded-header{
+	display: none;
+}
+#board th.board-column-header.board-column-compact {
+	padding-top: 0;
+}
+.TR .board-column-collapsed .board-column-header-task-count{
+	padding-left: 1rem;
+}
+.board-column-expanded-header > span{
+	margin-right: 0;
+    display: inline;
+    font-weight: normal;
+}
+.board-column-expanded-header>span[title="Task count"]:not(.board-column-header-task-count){
+    display: none;
+}
+.board-column-expanded-header .board-column-title{
+	display: inline-block;
+}
+.board-column-expanded-header .board-column-title a{
+	font-weight: normal;
+}
+.board-column-expanded-header .pull-right{
+    display: contents;
+}
+.board-column-expanded-header .pull-right > *:last-child{
+    margin-right: .5rem;
+}
+.board-column-expanded-header .pull-right > *:nth-child(3){
+    margin-left: .5rem;
+}
+.board-column-expanded-header .pull-right > .tooltip i.fa{
+    color: var(--color-greyscale-2);
+    margin-bottom: 1px;
+    margin-right: 0;
+    
+}
+.board-column-expanded-header .board-column-header-task-count{
+    margin-right: .5rem;
+}
+#board td.board-column-task-collapsed {
+    line-height: 3rem;
+}
+#board td.board-column-task-collapsed .board-rotation-wrapper{
+    padding: 0;
+}
+.TR .board-column-task-collapsed .board-toggle-column-view{
+    cursor: pointer;
+}
+.TR .board-column-task-collapsed .board-toggle-column-view:hover{
+    color: var(--color-brand-prim);
+}
+.board-add-icon {
+	margin: 0 1rem 0 0;
+	padding: 0;
+	line-height: 1rem;
+}
+.board-add-icon .fa-plus:hover {
+	text-decoration: none;
+}
+table th .board-add-icon:hover .fa-plus:before {
+	color: var(--color-brand-secd);
+	background: var(--color-brand-prim);
+}
+.board-add-icon .fa-plus:before {
+	background: var(--color-greyscale-4);
+	color: var(--color-greyscale-2);
+	padding: 2px;
+	display: block;
+	width: 1.5rem;
+	height: 1.5rem;
+	font-size: 0.5em;
+	line-height: 1.5rem;
+	border-radius: var(--size-radius-def);
+}
+table th:first-child .board-add-icon .fa-plus:before {
+	background: var(--color-brand-prim);
+    color: var(--color-brand-cont);
+    /*border-bottom: var(--style-border);*/
+	box-shadow: var(--style-shadow-light);
+}
+table th:first-child .board-add-icon:hover .fa-plus:before {
+    color: var(--color-brand-secd);
+}

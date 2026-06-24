@@ -1,0 +1,130 @@
+.project-header .dropdown-component,
+.project-header .views-switcher-component {
+	margin: 0 0.5rem 1rem 0;
+}
+.project-header .filter-box-component{
+	margin: 0 0 1rem 0;
+}
+
+.filter-box {
+	max-width: unset;
+}
+
+.page-header ul, .menu-inline ul, .views-switcher-component .views, .project-header > .dropdown-component, .filter-box .input-addon, .fc-state-default, .fc button{
+	background: var(--color-greyscale-6);
+    border-bottom: var(--style-border);
+	border-top: 1px solid var(--color-greyscale-6);
+}
+.page-header ul, .menu-inline ul, .fc-state-default, .fc button {
+	margin: 0;
+	border-radius: var(--size-radius-def);
+	display: inline-block;
+	box-shadow: none;
+}
+.sidebar-content .page-header > ul, #modal-content .page-header > ul, .menu-inline ul, .fc-state-default, .fc button {
+	border: 1px solid var(--color-greyscale-4);
+	border-bottom: var(--style-border);
+	background: var(--color-greyscale-5);
+}
+.sidebar-content .page-header > ul{
+	box-shadow: 0 2rem 0 0 var(--color-greyscale-6);
+}
+.sidebar-content .page-header > ul, #modal-content .page-header > ul {
+	margin: 1rem 0;
+}
+.views-switcher-component .views{
+	margin: 0 1rem 0 0;
+	font-size: 1rem;
+	border-radius: 0 var(--size-radius-def) var(--size-radius-def) 0;
+}
+.project-header > .dropdown-component {
+    padding: 0 0 0 1rem;
+    margin-right: 0;
+	border-radius: var(--size-radius-def) 0 0 var(--size-radius-def);
+}
+
+.views-switcher-component .views li, .page-header li, .menu-inline li, .filter-box .input-addon .input-addon-item, .filter-box .input-addon input[type=text] {
+	line-height: 1rem;
+    margin: 0;
+}
+.page-header li, .menu-inline li {
+	padding: 0;
+	border-left: var(--style-border);
+}
+.page-header li:last-child, .menu-inline li:last-child {
+    border-right: var(--style-border);
+}
+.page > .page-header li:first-child, .page > #main > .page-header li:first-child, .sidebar-content .page-header > ul > li:first-child, #modal-content .page-header > ul > li:first-child{
+    border-left: 0;
+}
+.page-header li.active a, .menu-inline li.active a {
+    box-shadow: inset 0 2px 0 0 var(--color-greyscale-5);
+    background: var(--color-greyscale-6);
+	box-sizing: border-box;
+	font-weight: bold;
+}
+.views-switcher-component .views li, .filter-box .input-addon .input-addon-item, .filter-box .input-addon input[type=text] {
+	padding: .75rem;
+	background: var(--color-greyscale-6);
+	border: 0;
+}
+.views-switcher-component .views li {
+    display: inline-block;
+	min-width: 4rem;
+    text-align: center;
+	box-sizing: border-box;
+}
+.views-switcher-component .views li:first-child {
+	border-top-left-radius: var(--size-radius-def);
+	border-bottom-left-radius: var(--size-radius-def);
+	border-left: 1px solid var(--color-greyscale-6);
+	border-radius: 0;
+}
+.views-switcher-component .views li:last-child {
+	border-top-right-radius: var(--size-radius-def);
+	border-bottom-right-radius: var(--size-radius-def);
+	border-color: var(--color-greyscale-6);
+	border-bottom-color: var(--color-greyscale-3);
+}
+.views-switcher-component .views li.active {
+	background: linear-gradient(to top, var(--color-greyscale-1) 2px, var(--color-greyscale-6) 2px);
+}
+
+.page-header ul a, .menu-inline ul a{
+	padding: .75rem 1.5rem;
+	display: inline-block;
+	min-width: 6rem;
+    text-align: center;
+	box-sizing: border-box;
+}
+.views-switcher-component .views li a, .views-switcher-component .views li.active a {
+	height: 1rem;
+    display: block;
+	color: var(--color-greyscale-1);
+	font-weight: normal;
+}
+.project-header .filter-box-component .input-addon {
+    border-radius: var(--size-radius-def);
+}
+.filter-box .input-addon input[type=text] {
+    font-size: 1rem;
+    height: 1rem;
+	box-shadow: none;
+	border-radius: var(--size-radius-def), 0, 0, var(--size-radius-def);
+	box-sizing: content-box;
+	background: none;
+}
+.filter-box .input-addon .input-addon-item:last-child {
+	border-radius: 0 var(--size-radius-def) var(--size-radius-def) 0;
+}
+.dropdown .action-menu{
+	display: block;
+	padding: .75rem 0;
+	/*font-size: 0;*/
+	box-sizing: border-box;
+}
+.filter-box .input-addon .input-addon-item .dropdown-menu,
+.filter-box .input-addon .input-addon-item .active-dropdown-menu{
+	line-height: 1rem;
+    display: block;
+}

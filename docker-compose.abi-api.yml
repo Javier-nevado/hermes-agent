@@ -68,6 +68,95 @@ services:
     networks:
       - opteia-net
 
+  # ------------------------------------------------------------------
+  # Kanboard (opt-in task board). Enable with COMPOSE_PROFILES=kanban in docker.env.
+  # Shares abi-db (separate `kanboard` DB, created idempotently by kanboard-db-init).
+  # Stock files bind-mounted from ./kanboard/. Per-customer vars: see
+  # kanboard/docker.env.example (KANBOARD_CF_TEAM / KANBOARD_CF_APP_AUD / etc).
+  # ------------------------------------------------------------------
+  kanboard-db-init:
+    profiles: ["kanban"]
+    image: postgres:17-alpine
+    container_name: abi-kanboard-db-init
+    depends_on:
+      abi-db:
+        condition: service_healthy
+    environment:
+      - PGPASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      - PGUSER=${ABI_DB_USER:-abi_agent}
+      - PGHOST=abi-db
+    entrypoint:
+      - sh
+      - -c
+      - 'psql -tAc "SELECT 1 FROM pg_database WHERE datname=''kanboard''" | grep -q 1 || psql -c "CREATE DATABASE kanboard OWNER ${ABI_DB_USER:-abi_agent}"'
+    networks:
+      - opteia-net
+    restart: "no"
+
+  kanboard:
+    profiles: ["kanban"]
+    image: kanboard/kanboard:latest
+    container_name: opteia-kanboard
+    depends_on:
+      kanboard-db-init:
+        condition: service_completed_successfully
+    environment:
+      # config.php reads the DB password from this env var (never hardcoded).
+      - ABI_DB_PASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      - ABI_DB_USER=${ABI_DB_USER:-abi_agent}
+    volumes:
+      - ./kanboard/config.php:/var/www/app/config.php:ro
+      - ./kanboard/data:/var/www/app/data
+      - ./kanboard/plugins:/var/www/app/plugins
+    networks:
+      - opteia-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/healthcheck || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  kanboard-cfverify:
+    profiles: ["kanban"]
+    build:
+      context: ./kanboard
+      dockerfile: Dockerfile.cfverify
+    container_name: opteia-kanboard-cfverify
+    environment:
+      - CF_TEAM=${KANBOARD_CF_TEAM:-opteia}
+      - CF_APP_AUD=${KANBOARD_CF_APP_AUD:-}
+      - ENFORCE=${KANBOARD_ENFORCE:-false}
+    volumes:
+      - ./kanboard/cf_access_verifier.py:/app/cf_access_verifier.py:ro
+    networks:
+      - opteia-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+
+  kanboard-proxy:
+    profiles: ["kanban"]
+    image: nginx:alpine
+    container_name: opteia-kanboard-proxy
+    depends_on:
+      kanboard:
+        condition: service_healthy
+      kanboard-cfverify:
+        condition: service_healthy
+    ports:
+      - "${KANBOARD_PROXY_PORT:-8096}:80"
+    volumes:
+      - ./kanboard/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - opteia-net
+    restart: unless-stopped
+
 networks:
   opteia-net:
     driver: bridge

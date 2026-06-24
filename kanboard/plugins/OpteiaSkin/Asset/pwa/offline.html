@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#7b68ee">
+    <title>Offline — Opteia Kanban</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: #0b1219;
+            color: #e8ebf0;
+            padding: 1.5rem;
+        }
+        .card {
+            max-width: 26rem;
+            text-align: center;
+            background: #141b26;
+            border: 1px solid rgba(255, 255, 255, .08);
+            border-radius: 16px;
+            padding: 2.5rem 2rem;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, .4);
+        }
+        .mark {
+            width: 64px; height: 64px;
+            border-radius: 16px;
+            margin: 0 auto 1.25rem;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 38px; font-weight: 700;
+            color: #fff;
+            background: linear-gradient(160deg, #7b68ee, #6a5acd);
+        }
+        h1 { font-size: 1.4rem; margin: 0 0 .5rem; }
+        p { margin: 0 0 1.5rem; color: #9aa3b2; line-height: 1.5; font-size: .95rem; }
+        button {
+            font: inherit; font-weight: 600;
+            color: #0b1219;
+            background: #9b8aff;
+            border: none;
+            padding: .75rem 1.75rem;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: transform .15s ease, background .15s ease;
+        }
+        button:hover { background: #7b68ee; color: #fff; }
+        button:active { transform: scale(.97); }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="mark">O</div>
+        <h1>You're offline</h1>
+        <p>The Opteia board can't reach the server right now. Reconnect and this page will reload automatically.</p>
+        <button onclick="location.reload()">Retry</button>
+    </div>
+    <script>
+        // Auto-reload as soon as connectivity returns.
+        window.addEventListener('online', () => location.reload());
+    </script>
+</body>
+</html>

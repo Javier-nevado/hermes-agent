@@ -1,0 +1,30 @@
+.project-overview-columns {
+	margin: 0 auto 1rem;
+	background-color: var(--color-greyscale-6);
+	border-radius: var(--size-radius-def);
+	border-bottom: var(--style-border);
+	width: 100%;
+	padding: 1.5rem 0 1rem;
+	box-shadow: var(--style-shadow-heavy);
+}
+.project-overview-column {
+	margin: 1rem 0;
+	padding: 0 3rem;
+	background: var(--color-greyscale-6);
+	border: 0;
+	border-right: var(--style-border);
+	border-radius: var(--size-radius-def);
+	font-size: 2rem;
+	line-height: 2rem;
+}
+.project-overview-column:first-child {
+    border-left: var(--style-border);
+}
+.project-overview-column strong {
+	font-size: 3rem;
+	font-family: var(--style-fontfamily-code);
+}
+.project-overview-column small {
+    padding-top: .75rem;
+    display: block;
+}
