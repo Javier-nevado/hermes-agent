@@ -53,6 +53,21 @@ services:
       retries: 3
       start_period: 10s
 
+  # --- CamoFox Browser (anti-detection browse/search backend) ---
+  # Host agents reach it at http://localhost:9377. Set CAMOFOX_URL=http://localhost:9377
+  # in the agent's ~/.hermes/.env to route the native browser tool through CamoFox
+  # (is_camofox_mode() activates whenever CAMOFOX_URL is set).
+  camofox:
+    image: ghcr.io/jo-inc/camofox-browser:latest
+    container_name: abi-camofox
+    ports:
+      - "9377:9377"
+    environment:
+      - CAMOFOX_PORT=9377
+    restart: unless-stopped
+    networks:
+      - opteia-net
+
 networks:
   opteia-net:
     driver: bridge
