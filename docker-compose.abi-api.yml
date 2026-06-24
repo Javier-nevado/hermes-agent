@@ -85,6 +85,7 @@ services:
       - PGPASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
       - PGUSER=${ABI_DB_USER:-abi_agent}
       - PGHOST=abi-db
+      - PGDATABASE=postgres
     entrypoint:
       - sh
       - -c
@@ -131,7 +132,9 @@ services:
     volumes:
       - ./kanboard/cf_access_verifier.py:/app/cf_access_verifier.py:ro
     networks:
-      - opteia-net
+      opteia-net:
+        aliases:
+          - cf-access-verifier   # matches the upstream name in nginx.conf
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)\""]
