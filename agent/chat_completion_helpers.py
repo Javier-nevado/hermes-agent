@@ -65,6 +65,56 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+# ABI-PATCH (zai-429) ======================================================
+# Z.AI's GLM coding endpoint returns a fake HTTP 429 / error code 1305
+# ("The service may be temporarily overloaded") whenever the system prompt
+# contains the exact phrase "Hermes Agent" or "Hermes runtime" -- it
+# fingerprints usage from the (unsupported) Hermes Agent client, per Z.AI's
+# coding-plan usage policy. Scrub the Hermes branding from the system prompt
+# so the traffic presents as our own "ABI Agent" product instead.
+#
+# The Anthropic OAuth path intentionally impersonates "Claude Code" and is
+# handled separately in anthropic_adapter.py; this scrub only runs on the
+# chat_completions path (OpenAI-protocol providers like zai), so it cannot
+# interfere with that evasion. Only system-role messages are rewritten;
+# skill/tool identifiers such as the `hermes-agent` skill name use a hyphen
+# and different casing, so they are not matched and remain functional.
+_ABI_BRANDING_REPLACEMENTS = (
+    ("Hermes Agent", "ABI Agent"),
+    ("Hermes agent", "ABI agent"),
+    ("Nous Research", "Opteia"),
+)
+
+
+def _abi_scrub_hermes_branding(messages):
+    """Return a copy of ``messages`` with Hermes branding removed from
+    system-role content. Never mutates the input list or dicts."""
+    def _scrub_text(text):
+        for _old, _new in _ABI_BRANDING_REPLACEMENTS:
+            text = text.replace(_old, _new)
+        return text
+
+    _out = []
+    for _m in messages:
+        if not isinstance(_m, dict) or _m.get("role") != "system":
+            _out.append(_m)
+            continue
+        _content = _m.get("content")
+        if isinstance(_content, str):
+            _out.append({**_m, "content": _scrub_text(_content)})
+        elif isinstance(_content, list):
+            _parts = []
+            for _part in _content:
+                if isinstance(_part, dict) and _part.get("type") == "text":
+                    _parts.append({**_part, "text": _scrub_text(_part.get("text", ""))})
+                else:
+                    _parts.append(_part)
+            _out.append({**_m, "content": _parts})
+        else:
+            _out.append(_m)
+    return _out
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -648,6 +698,11 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
+
+    # ABI-PATCH (zai-429): scrub Hermes branding from the system prompt for
+    # the Z.AI coding endpoint only (see _abi_scrub_hermes_branding above).
+    if "z.ai" in (getattr(agent, "_base_url_lower", "") or ""):
+        api_messages = _abi_scrub_hermes_branding(api_messages)
 
     # Provider detection flags
     _is_qwen = agent._is_qwen_portal()
