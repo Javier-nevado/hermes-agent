@@ -1,0 +1,15 @@
+{
+  "name": "vision",
+  "version": "1.0.0",
+  "description": "Image analysis (describe/OCR/Q&A) via the Opteia AI Gateway EU vision model",
+  "image": "opteia/mcp-vision",
+  "port": 5110,
+  "tools": ["status", "login", "logout", "analyze_image"],
+  "credentials": [],
+  "dependencies": [],
+  "assign_to": ["ailean", "sol", "atlas"],
+  "hermes_config": {
+    "url": "http://localhost:5110/sse",
+    "transport": "sse"
+  }
+}
