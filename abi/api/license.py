@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import base64
@@ -37,7 +38,10 @@ class LicenseManager:
         self._api_version: str = os.environ.get("OPTEIA_API_VERSION", "1.0.0")
         self._verify_url: str = os.environ.get("OPTEIA_LICENSE_URL", VERIFY_URL)
 
-        self._token: Optional[str] = None
+        self._token: Optional[str] = None  # backward-compat alias (the verified token)
+        self._token_hs256: Optional[str] = None  # legacy shared-secret token
+        self._token_rs256: Optional[str] = None  # public-key token (preferred)
+        self._public_key_cache: Optional[str] = None  # "" caches a miss
         self._claims: Optional[Dict[str, Any]] = None
         self._fetched_at: Optional[float] = None
         self._revoked: bool = False
@@ -63,8 +67,10 @@ class LicenseManager:
 
             if resp.status_code == 200:
                 data = resp.json()
-                self._token = data["token"]
-                self._claims = self._decode_jwt(self._token)
+                self._token_hs256 = data.get("token")
+                self._token_rs256 = data.get("token_rs256")
+                self._token = self._token_rs256 or self._token_hs256  # backward-compat
+                self._claims = self._decode_jwt()
                 self._fetched_at = time.time()
                 self._revoked = False
                 self._grace_start = None
@@ -100,13 +106,47 @@ class LicenseManager:
             self._start_grace()
             return False
 
-    def _decode_jwt(self, token: str) -> Dict[str, Any]:
-        """Decode and validate JWT locally using the shared secret.
+    def _load_public_key(self) -> Optional[str]:
+        """Lazy-load the RS256 public key shipped in the package.
 
-        30s leeway handles clock skew between Cloudflare edge and local host.
-        Without it, PyJWT rejects tokens where iat is a few seconds in the future.
+        Returns the PEM string or None if absent (older builds without it). A public
+        key belongs in the image, not env, to avoid a second manual-distribution
+        footgun like LICENSE_JWT_SECRET. The miss is cached so we don't re-stat every
+        verify.
         """
-        return jwt.decode(token, self._jwt_secret, algorithms=["HS256"], leeway=30)
+        if self._public_key_cache is not None:
+            return self._public_key_cache or None
+        # license.py lives at abi/api/license.py; the pubkey ships at abi/license/.
+        pub_path = Path(__file__).parent.parent / "license" / "abi-license.pub"
+        try:
+            self._public_key_cache = pub_path.read_text()
+            logger.info("Loaded RS256 license public key from %s", pub_path)
+        except FileNotFoundError:
+            self._public_key_cache = ""  # cache the miss (older build)
+            logger.info("No RS256 public key packaged (%s) — HS256 fallback only", pub_path)
+        return self._public_key_cache or None
+
+    def _decode_jwt(self) -> Dict[str, Any]:
+        """Decode + validate the license JWT, preferring RS256 (public key) over
+        HS256 (shared secret).
+
+        RS256 path: verify token_rs256 with the packaged public key — no secret on
+        the host. HS256 path: legacy fallback for builds/Workers still on the shared
+        secret. 30s leeway absorbs Cloudflare-edge clock skew. algorithms=[] is ALWAYS
+        explicit to defeat alg-confusion (alg:none / HS256-with-RSA-pubkey).
+        """
+        pubkey = self._load_public_key()
+        if pubkey and self._token_rs256:
+            claims = jwt.decode(self._token_rs256, pubkey, algorithms=["RS256"], leeway=30)
+            logger.info("License JWT verified via RS256 (public key)")
+            return claims
+        if self._token_hs256 and self._jwt_secret:
+            claims = jwt.decode(self._token_hs256, self._jwt_secret, algorithms=["HS256"], leeway=30)
+            logger.info("License JWT verified via HS256 (legacy shared secret)")
+            return claims
+        raise jwt.InvalidTokenError(
+            "no verifiable license token (need RS256 pubkey+token_rs256, or HS256 secret+token)"
+        )
 
     def is_write_allowed(self) -> bool:
         """Check if write operations are allowed."""
@@ -116,10 +156,10 @@ class LicenseManager:
         if self._revoked:
             return False
 
-        # Try local JWT validation
-        if self._token and self._jwt_secret:
+        # Try local JWT validation (RS256 preferred, HS256 fallback — see _decode_jwt)
+        if self._token_rs256 or self._token_hs256:
             try:
-                claims = self._decode_jwt(self._token)
+                claims = self._decode_jwt()
                 if claims.get("exp", 0) > time.time():
                     return True
             except jwt.ExpiredSignatureError:

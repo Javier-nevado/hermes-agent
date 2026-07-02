@@ -5,7 +5,9 @@
 #   ABI_DB_PASSWORD=<per-deployment-password>
 #   ABI_DB_NAME=abi_memory
 #   OPTEIA_LICENSE_KEY=<license-key>
-#   LICENSE_JWT_SECRET=<jwt-secret>
+#   LICENSE_JWT_SECRET=<jwt-secret>   # DEPRECATED — RS256 public key is shipped
+#                                     # in the image (abi/license/abi-license.pub).
+#                                     # Keep only during the HS256→RS256 cutover.
 #
 # Usage: docker compose --env-file .env -f docker-compose.abi-api.yml up -d
 services:
@@ -39,7 +41,9 @@ services:
     environment:
       - ABI_DATABASE_URL=postgresql://${ABI_DB_USER:-abi_agent}:${ABI_DB_PASSWORD}@abi-db:5432/${ABI_DB_NAME:-abi_memory}
       - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?OPTEIA_LICENSE_KEY required}
-      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:?LICENSE_JWT_SECRET required}
+      # RS256 (bundled public key) is the primary verifier; LICENSE_JWT_SECRET is the
+      # legacy HS256 fallback, optional post-RS256-cutover (empty = RS256-only boot).
+      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
       - OPTEIA_API_VERSION=1.0.0
     networks:
       - opteia-net
