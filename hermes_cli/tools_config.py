@@ -886,10 +886,12 @@ def _run_post_setup(post_setup_key: str):
         if camofox_dir.exists():
             _print_info("    Start the Camofox server:")
             _print_info("      npx @askjo/camofox-browser")
-            _print_info("    Or use Docker: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
+            _print_info("    Or use Docker: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 "
+                        "-e TAB_INACTIVITY_MS=1800000 -e BROWSER_IDLE_TIMEOUT_MS=3600000 jo-inc/camofox-browser")
         elif not shutil.which("npm"):
             _print_warning("    Node.js not found. Install Camofox via Docker:")
-            _print_info("      docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
+            _print_info("      docker run -p 9377:9377 -e CAMOFOX_PORT=9377 "
+                        "-e TAB_INACTIVITY_MS=1800000 -e BROWSER_IDLE_TIMEOUT_MS=3600000 jo-inc/camofox-browser")
 
     elif post_setup_key == "cua_driver":
         install_cua_driver(upgrade=False)

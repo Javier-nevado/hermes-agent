@@ -5,7 +5,9 @@
 #   ABI_DB_PASSWORD=<per-deployment-password>
 #   ABI_DB_NAME=abi_memory
 #   OPTEIA_LICENSE_KEY=<license-key>
-#   LICENSE_JWT_SECRET=<jwt-secret>
+#   LICENSE_JWT_SECRET=<jwt-secret>   # DEPRECATED — RS256 public key is shipped
+#                                     # in the image (abi/license/abi-license.pub).
+#                                     # Keep only during the HS256→RS256 cutover.
 #
 # Usage: docker compose --env-file .env -f docker-compose.abi-api.yml up -d
 services:
@@ -39,7 +41,9 @@ services:
     environment:
       - ABI_DATABASE_URL=postgresql://${ABI_DB_USER:-abi_agent}:${ABI_DB_PASSWORD}@abi-db:5432/${ABI_DB_NAME:-abi_memory}
       - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?OPTEIA_LICENSE_KEY required}
-      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:?LICENSE_JWT_SECRET required}
+      # RS256 (bundled public key) is the primary verifier; LICENSE_JWT_SECRET is the
+      # legacy HS256 fallback, optional post-RS256-cutover (empty = RS256-only boot).
+      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
       - OPTEIA_API_VERSION=1.0.0
     networks:
       - opteia-net
@@ -64,6 +68,12 @@ services:
       - "9377:9377"
     environment:
       - CAMOFOX_PORT=9377
+      # Idle timeouts — tuned for interactive agent workflows. Defaults (5 min) reap
+      # a tab mid-task during natural review/drafting gaps, which the agent then
+      # misreads as "camofox down". The browser still relaunches on demand regardless
+      # (ensureBrowser()); these just keep a working tab/session alive longer.
+      - TAB_INACTIVITY_MS=1800000      # 30 min — tab survives gaps (default 300000)
+      - BROWSER_IDLE_TIMEOUT_MS=3600000  # 60 min — browser stays warm (default 300000)
     restart: unless-stopped
     networks:
       - opteia-net

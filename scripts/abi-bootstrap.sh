@@ -79,6 +79,13 @@ echo "Waiting for abi-api health..."
 for i in $(seq 1 30); do
   if curl -sf http://localhost:8010/health >/dev/null 2>&1; then
     echo "Health check passed. Version: $(cat VERSION 2>/dev/null)"
+    # Harden the code dir (secure self-update boundary): root-own it so a
+    # compromised agent can't delete-and-replace the root-owned
+    # docker-compose.abi-api.yml / Dockerfile and inject code into the root
+    # `docker build`. Done LAST so it doesn't block .venv / __pycache__ creation
+    # during bring-up; those stay agent-owned (not in the tarball). abi-update.sh
+    # re-asserts this after every apply.
+    sudo chown root:root "$HERMES_DIR" 2>/dev/null || true
     docker compose --env-file "$ENVFILE" -f "$COMPOSE" ps 2>/dev/null || true
     exit 0
   fi
