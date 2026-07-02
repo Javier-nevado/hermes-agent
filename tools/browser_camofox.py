@@ -266,6 +266,21 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
     resp.raise_for_status()
     data = resp.json()
     session["tab_id"] = data.get("tabId")
+    # Default the viewport to 1920x1080 so wide content (QR codes, dashboards,
+    # full-page screenshots) renders unclipped instead of the camoufox 1280x720
+    # default. Non-fatal: on failure the tab keeps the default viewport.
+    try:
+        _post(
+            f"/tabs/{session['tab_id']}/viewport",
+            {"userId": session["user_id"], "width": 1920, "height": 1080},
+            timeout=10,
+        )
+    except Exception:
+        logger.debug(
+            "camoufox viewport resize failed for tab %s; keeping default",
+            session["tab_id"],
+            exc_info=True,
+        )
     return session
 
 
