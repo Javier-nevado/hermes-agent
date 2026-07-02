@@ -68,6 +68,12 @@ services:
       - "9377:9377"
     environment:
       - CAMOFOX_PORT=9377
+      # Idle timeouts — tuned for interactive agent workflows. Defaults (5 min) reap
+      # a tab mid-task during natural review/drafting gaps, which the agent then
+      # misreads as "camofox down". The browser still relaunches on demand regardless
+      # (ensureBrowser()); these just keep a working tab/session alive longer.
+      - TAB_INACTIVITY_MS=1800000      # 30 min — tab survives gaps (default 300000)
+      - BROWSER_IDLE_TIMEOUT_MS=3600000  # 60 min — browser stays warm (default 300000)
     restart: unless-stopped
     networks:
       - opteia-net
