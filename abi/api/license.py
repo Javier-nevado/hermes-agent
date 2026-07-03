@@ -25,7 +25,18 @@ import jwt
 logger = logging.getLogger(__name__)
 
 GRACE_PERIOD_SECONDS = 3 * 86400  # 3 days
-JWT_REFRESH_INTERVAL = 43200      # 12 hours
+JWT_REFRESH_INTERVAL = 43200      # 12 hours (success cadence)
+# On a FAILED verify, retry this often so the instance self-heals quickly
+# (host clock re-syncs, transient Worker 5xx, brief network blip) instead of
+# stranding the customer in the 3-day grace window for up to 12h. Field
+# incident 2026-07-03: a single clock-skewed startup dropped Castor + EYETECH
+# into grace until the next 12h refresh.
+RETRY_INTERVAL_FAILED = int(os.environ.get("LICENSE_RETRY_INTERVAL_FAILED", "300"))  # 5 min
+# JWT decode leeway (seconds) on iat/nbf/exp. Absorbs transient NTP /
+# Cloudflare-edge clock skew. The previous fixed 30s was too tight — skew
+# spikes during boot/NTP-correction exceeded it and rejected an otherwise
+# valid token ("The token is not yet valid (iat)"). 120s default.
+JWT_LEEWAY_SECONDS = int(os.environ.get("LICENSE_JWT_LEEWAY", "120"))
 VERIFY_URL = "https://api.opteia.com/license/verify"
 
 
@@ -48,6 +59,7 @@ class LicenseManager:
         self._grace_start: Optional[float] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._dek: Optional[bytes] = None
+        self._last_fetch_ok: bool = False
 
         if not self._license_key:
             logger.error("OPTEIA_LICENSE_KEY not set — all writes will be blocked")
@@ -102,7 +114,10 @@ class LicenseManager:
             return False
 
         except Exception as e:
-            logger.error("License verify failed (network?): %s", e)
+            # Transient causes (network blip, clock-skewed iat, Worker 5xx) are
+            # retried shortly — see _refresh_loop. Log the real exception so a
+            # clock-skew rejection isn't misread as a network outage.
+            logger.error("License verify failed (will retry in %ds): %s", RETRY_INTERVAL_FAILED, e)
             self._start_grace()
             return False
 
@@ -132,16 +147,17 @@ class LicenseManager:
 
         RS256 path: verify token_rs256 with the packaged public key — no secret on
         the host. HS256 path: legacy fallback for builds/Workers still on the shared
-        secret. 30s leeway absorbs Cloudflare-edge clock skew. algorithms=[] is ALWAYS
-        explicit to defeat alg-confusion (alg:none / HS256-with-RSA-pubkey).
+        secret. JWT_LEEWAY_SECONDS leeway absorbs transient NTP/Cloudflare-edge clock
+        skew on iat/nbf/exp. algorithms=[] is ALWAYS explicit to defeat alg-confusion
+        (alg:none / HS256-with-RSA-pubkey).
         """
         pubkey = self._load_public_key()
         if pubkey and self._token_rs256:
-            claims = jwt.decode(self._token_rs256, pubkey, algorithms=["RS256"], leeway=30)
+            claims = jwt.decode(self._token_rs256, pubkey, algorithms=["RS256"], leeway=JWT_LEEWAY_SECONDS)
             logger.info("License JWT verified via RS256 (public key)")
             return claims
         if self._token_hs256 and self._jwt_secret:
-            claims = jwt.decode(self._token_hs256, self._jwt_secret, algorithms=["HS256"], leeway=30)
+            claims = jwt.decode(self._token_hs256, self._jwt_secret, algorithms=["HS256"], leeway=JWT_LEEWAY_SECONDS)
             logger.info("License JWT verified via HS256 (legacy shared secret)")
             return claims
         raise jwt.InvalidTokenError(
@@ -239,14 +255,23 @@ class LicenseManager:
 
     async def start_refresh(self) -> None:
         """Initial fetch + start background refresh loop."""
-        await self.fetch_jwt()
+        self._last_fetch_ok = await self.fetch_jwt()
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
     async def _refresh_loop(self) -> None:
-        """Background task: refresh JWT every 12 hours."""
+        """Background task: refresh the license JWT.
+
+        On success, refresh every JWT_REFRESH_INTERVAL (12h). On failure,
+        retry every RETRY_INTERVAL_FAILED (5 min) so the instance recovers on
+        its own once the Worker is reachable again or the host clock re-syncs
+        — rather than stranding the customer in the 3-day grace window for up
+        to 12h (field incident: clock-skewed startup → grace until the next
+        12h refresh on Castor + EYETECH, 2026-07-03).
+        """
         while True:
-            await asyncio.sleep(JWT_REFRESH_INTERVAL)
-            await self.fetch_jwt()
+            interval = JWT_REFRESH_INTERVAL if self._last_fetch_ok else RETRY_INTERVAL_FAILED
+            await asyncio.sleep(interval)
+            self._last_fetch_ok = await self.fetch_jwt()
 
     def stop_refresh(self) -> None:
         """Cancel background refresh task."""
