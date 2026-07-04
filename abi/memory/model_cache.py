@@ -37,10 +37,12 @@ DEFAULT_BASE_URL = "https://api.opteia.com/abi-models"
 # A None hash skips verification (development/local builds only).
 MODELS: Dict[str, Dict[str, List[Tuple[str, Optional[str]]]]] = {
     # cross-encoder ms-marco-MiniLM-L-6-v2 (~90MB) — recall reranking + dedup.
+    # Sourced from the Xenova/ms-marco-MiniLM-L-6-v2 ONNX port (faithful export of
+    # cross-encoder/ms-marco-MiniLM-L-6-v2), hosted at ABI_MODELS_BASE_URL/reranker/.
     "reranker": {
         "files": [
-            ("model.onnx", None),
-            ("tokenizer.json", None),
+            ("model.onnx", "c623d0bcb99f4622beb413eaef00cfbe5db20df9f1dd982da4b4f26022881870"),
+            ("tokenizer.json", "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"),
         ],
     },
     # (PR 2) multilingual NER — Davlan/mBERT-NER.
