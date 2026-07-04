@@ -723,6 +723,11 @@ def run_conversation(
     # response text without actually calling write_file.
     agent._turn_written_file_basenames: set = set()
     agent._phantom_write_retries: int = 0
+    # Preserve-and-retry: when a claimed file is missing, stash the
+    # agent's real response so it is delivered after the one capped retry
+    # creates the file.  Never null-and-destroy the analysis.
+    agent._phantom_preserved_response: Optional[str] = None
+    agent._phantom_preserved_claimed: List[str] = []
 
     # Record the execution thread so interrupt()/clear_interrupt() can
     # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -4242,10 +4247,15 @@ def run_conversation(
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
 
-                # ── Phantom file-write detection ──────────────────────
-                # Models sometimes claim a file was created in their text
-                # response without ever calling write_file.  Detect this
-                # and inject a retry telling the model to actually write.
+                # ── Phantom file-write detection (intent + existence) ─────
+                # Detect when the model CLAIMS a deliverable file (write-intent
+                # language: created/saved/wrote/...) that does not actually exist
+                # on disk, then do ONE capped preserve-and-retry: stash the
+                # agent's real response, nudge it to create the file by ANY
+                # method (write_file/execute_code/execute_shell -- even binary
+                # downloads), and deliver the ORIGINAL response afterwards.
+                # Intent-gated + method-agnostic existence so reads/references
+                # (robots.txt, skill.md) and shell/code-created files never trip.
                 if (
                     final_response
                     and not interrupted
@@ -4254,39 +4264,45 @@ def run_conversation(
                 ):
                     try:
                         from agent.tool_result_classification import (
-                            extract_deliverable_filenames_from_text,
+                            extract_claimed_deliverable_files,
+                            resolve_claimed_file_to_path,
                         )
-                        _mentioned = extract_deliverable_filenames_from_text(final_response)
-                        _written = getattr(agent, "_turn_written_file_basenames", None) or set()
-                        import os as _os
+                        _claimed = extract_claimed_deliverable_files(final_response)
                         _phantom = [
-                            f for f in _mentioned
-                            if f not in _written
-                            and not _os.path.exists(f)
+                            f for f in _claimed
+                            if resolve_claimed_file_to_path(f) is None
                         ]
                         if _phantom:
                             agent._phantom_write_retries += 1
                             logger.info(
-                                "Phantom file-write: model mentions %s but "
-                                "write_file never called. Injecting retry (%d/1).",
+                                "Phantom file detection: claimed-but-missing "
+                                "%s. Injecting ONE preserve-and-retry (%d/1).",
                                 _phantom, agent._phantom_write_retries,
                             )
-                            # Append premature assistant message for role alternation
+                            # Stash the original analysis -- never destroy it.
+                            agent._phantom_preserved_response = final_response
+                            agent._phantom_preserved_claimed = list(_phantom)
+                            # Premature assistant msg keeps role alternation valid.
                             premature = agent._build_assistant_message(
                                 assistant_message, finish_reason,
                             )
                             premature["_phantom_write_retry"] = True
                             messages.append(premature)
-                            # Inject synthetic user nudge
+                            # Method-agnostic, non-accusatory nudge.
                             file_list = ", ".join(f"`{f}`" for f in _phantom)
                             messages.append({
                                 "role": "user",
                                 "content": (
-                                    f"[System] You mentioned creating file(s) "
-                                    f"{file_list} in your response above, but "
-                                    f"you did not actually call write_file to "
-                                    f"create them. Call write_file now for each "
-                                    f"file, then provide your final response."
+                                    f"[System] The file(s) {file_list} mentioned "
+                                    f"in your reply could not be found on disk, "
+                                    f"so they cannot be delivered. Save them now "
+                                    f"using whichever tool fits (write_file, "
+                                    f"execute_code, etc. -- including for "
+                                    f"binary/downloaded files), then call "
+                                    f"deliver_file for each (or include the "
+                                    f"absolute path), and reply with a brief "
+                                    f"one-line confirmation. Do not repeat your "
+                                    f"previous answer."
                                 ),
                                 "_phantom_write_retry": True,
                             })
@@ -4295,7 +4311,7 @@ def run_conversation(
                             continue  # Back into the conversation loop
                     except Exception as _pw_err:
                         logger.debug(
-                            "Phantom file-write detection failed: %s",
+                            "Phantom file detection failed: %s",
                             _pw_err,
                         )
 
@@ -4477,6 +4493,42 @@ def run_conversation(
         )
     else:
         logger.info(_diag_msg, *_diag_args)
+
+    # ── Phantom preserve-and-retry: restore the stashed response ──
+    # If this turn triggered a phantom retry, the retry produced a one-line
+    # confirmation (R2) while the REAL answer (R1) is stashed.  Deliver R1
+    # (the analysis) and ensure the now-created file is queued for delivery.
+    # Runs BEFORE the failed-write footer so the footer composes onto R1.
+    # Guard ignores final_response truthiness so a budget-exhausted retry
+    # still delivers the original analysis.
+    if getattr(agent, "_phantom_preserved_response", None) is not None:
+        try:
+            logger.info(
+                "Restoring preserved phantom response (%d chars) over retry one-liner.",
+                len(agent._phantom_preserved_response),
+            )
+            final_response = agent._phantom_preserved_response
+            # Safety-net delivery: if the retry created the file via a non-
+            # write_file path (execute_code/shell), push the resolved path into
+            # the auto-deliver queue the platform drains
+            # (base.py get_and_clear_recently_written) so it is attached even
+            # if the retry one-liner did not call deliver_file.
+            try:
+                from agent.tool_result_classification import resolve_claimed_file_to_path
+                from tools.file_tools import _recently_written_files, _recently_written_lock
+                for _claimed_name in (agent._phantom_preserved_claimed or []):
+                    _resolved = resolve_claimed_file_to_path(_claimed_name)
+                    if _resolved:
+                        with _recently_written_lock:
+                            if _resolved not in _recently_written_files:
+                                _recently_written_files.append(_resolved)
+            except Exception:
+                logger.debug("phantom post-retry delivery queueing skipped")
+            # Clear the stash AFTER the safety-net loop has read it.
+            agent._phantom_preserved_response = None
+            agent._phantom_preserved_claimed = []
+        except Exception as _pr_err:
+            logger.debug("phantom restore failed: %s", _pr_err)
 
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
