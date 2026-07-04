@@ -20,7 +20,7 @@ from abi.memory.dlp import dlp_where
 from abi.memory.pii import classify_pii
 from abi.memory.ranking import finalize_recall_ordering
 
-from ..deps import get_pool, get_extractor, get_encryptor, get_reranker, has_importance_column
+from ..deps import get_pool, get_extractor, get_encryptor, get_reranker, has_importance_column, has_access_tracking
 from ..license import require_license
 from ..schemas import (
     RememberRequest,
@@ -48,6 +48,36 @@ def _rerank_enabled() -> bool:
 
 def _rerank_topn() -> int:
     return int(os.environ.get("ABI_MEMORY_RERANK_TOPN", "20"))
+
+
+def _update_access_tracking(conn, results: list) -> None:
+    """Bump last_accessed/access_count for recalled memories (non-fatal).
+
+    Records the 'frequently used' signal that future relevance/decay and any
+    retention policy depend on. No-op on pre-005 DBs (no columns) and on any
+    error — must never break recall. The recall transaction is read-only up to
+    this point, so committing here is safe.
+    """
+    if not results or not has_access_tracking():
+        return
+    try:
+        ids = [str(r.get("id")) for r in results if r.get("id")]
+        if not ids:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE abi_memories SET last_accessed = NOW(), "
+                "access_count = COALESCE(access_count, 0) + 1 "
+                "WHERE id::text = ANY(%s)",
+                [ids],
+            )
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("Access tracking update failed: %s", e)
 
 
 def _get_embedding(text: str):
@@ -286,6 +316,9 @@ def recall(req: RecallRequest):
             rerank_top_n=_rerank_topn(),
             limit=limit,
         )
+
+        # Record the 'frequently used' signal for returned memories (non-fatal).
+        _update_access_tracking(conn, results)
 
         memories = []
         for row in results:

@@ -24,6 +24,7 @@ _license_manager = None
 _encryptor = None
 _reranker_singleton = None
 _has_importance_cache: Optional[bool] = None
+_has_access_cache: Optional[bool] = None
 
 
 def _env_bool(name: str) -> bool:
@@ -196,3 +197,27 @@ def has_importance_column() -> bool:
     except Exception:
         _has_importance_cache = False
     return _has_importance_cache
+
+
+def has_access_tracking() -> bool:
+    """True if abi_memories has last_accessed/access_count (005 migration). Cached.
+
+    Used to gate the recall access-tracking write so it is a no-op on pre-005 DBs.
+    """
+    global _has_access_cache
+    if _has_access_cache is not None:
+        return _has_access_cache
+    try:
+        conn = get_pool().getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'abi_memories' AND column_name = 'last_accessed'"
+                )
+                _has_access_cache = cur.fetchone() is not None
+        finally:
+            get_pool().putconn(conn)
+    except Exception:
+        _has_access_cache = False
+    return _has_access_cache

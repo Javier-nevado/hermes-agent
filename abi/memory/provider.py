@@ -174,6 +174,8 @@ class ABIMemoryProvider(MemoryProvider):
         # Probe whether the importance column exists (005 migration). Neutral if
         # absent — decay + rerank still work (they need only base columns).
         self._has_importance = self._probe_column("importance")
+        # Access-tracking columns (005) — gates the recall 'frequently used' write.
+        self._has_access_tracking = self._probe_column("last_accessed")
 
         # Reranker lazy-loads on first rerank() (downloads on first run, non-fatal).
         self._reranker = None
@@ -200,6 +202,29 @@ class ABIMemoryProvider(MemoryProvider):
                 return cur.fetchone() is not None
         except Exception:
             return False
+
+    def _update_access_tracking(self, results: list) -> None:
+        """Bump last_accessed/access_count for recalled memories (non-fatal).
+
+        Records the 'frequently used' signal for future relevance/decay and any
+        retention policy. No-op on pre-005 DBs and on any error. self._conn is
+        autocommit, so the UPDATE persists immediately.
+        """
+        if not results or not getattr(self, "_has_access_tracking", False):
+            return
+        try:
+            ids = [str(r.get("id")) for r in results if r.get("id")]
+            if not ids:
+                return
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE abi_memories SET last_accessed = NOW(), "
+                    "access_count = COALESCE(access_count, 0) + 1 "
+                    "WHERE id::text = ANY(%s)",
+                    [ids],
+                )
+        except Exception as e:
+            logger.warning("Access tracking update failed: %s", e)
 
     def system_prompt_block(self) -> str:
         """Tell the agent about its memory capabilities."""
@@ -335,6 +360,9 @@ class ABIMemoryProvider(MemoryProvider):
                 rerank_top_n=self._rerank_topn,
                 limit=limit,
             )
+
+            # Record the 'frequently used' signal for returned memories (non-fatal).
+            self._update_access_tracking(results)
 
             memories = []
             for row in results:
