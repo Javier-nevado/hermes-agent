@@ -69,6 +69,12 @@ _lock = threading.RLock()
 _entries: Dict[str, _ClarifyEntry] = {}
 # session_key → list[clarify_id]  (FIFO; for text-fallback intercept and session cleanup)
 _session_index: Dict[str, List[str]] = {}
+# clarify_id → message_id of the user message that resolved a text clarify.
+# Used by in-chat /login to auto-delete the message containing a pasted
+# secret/API key after reading it. Populated by the gateway text intercept
+# (set_resolved_message_id) and consumed by the waiting background task
+# (pop_resolved_message_id) once wait_for_response returns.
+_resolved_message_ids: Dict[str, Optional[str]] = {}
 
 
 # =========================================================================
@@ -162,6 +168,23 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     return True
 
 
+def set_resolved_message_id(clarify_id: str, message_id: Optional[str]) -> None:
+    """Stash the message id of the user message that resolved a text clarify.
+
+    Called by the gateway text intercept so a background task (e.g. in-chat
+    /login) can later delete that message — used to auto-remove a pasted
+    API key / secret after it has been read.
+    """
+    with _lock:
+        _resolved_message_ids[clarify_id] = message_id
+
+
+def pop_resolved_message_id(clarify_id: str) -> Optional[str]:
+    """Return and clear the stashed resolved-message id for a clarify, or None."""
+    with _lock:
+        return _resolved_message_ids.pop(clarify_id, None)
+
+
 def get_pending_for_session(session_key: str) -> Optional[_ClarifyEntry]:
     """Return the OLDEST pending clarify entry for a session, or None.
 
@@ -210,6 +233,8 @@ def clear_session(session_key: str) -> int:
     with _lock:
         ids = list(_session_index.pop(session_key, []) or [])
         entries = [_entries.pop(cid, None) for cid in ids]
+        for cid in ids:
+            _resolved_message_ids.pop(cid, None)
     cancelled = 0
     for entry in entries:
         if entry is None:

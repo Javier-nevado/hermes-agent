@@ -6963,6 +6963,15 @@ class GatewayRunner:
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
+                # Stash the resolving message's id so a background task (e.g.
+                # in-chat /login) can auto-delete it — used to remove a pasted
+                # API key / secret from the chat after it has been read.
+                try:
+                    _clarify_mod.set_resolved_message_id(
+                        _pending_clarify.clarify_id, getattr(event, "message_id", None)
+                    )
+                except Exception:
+                    pass
                 _resolved = _clarify_mod.resolve_gateway_clarify(
                     _pending_clarify.clarify_id, _raw_clarify_reply,
                 )
@@ -11762,15 +11771,43 @@ class GatewayRunner:
 
     # ==================== /login — in-chat OAuth device-code flow ====================
 
-    # Maps a /login argument (canonical provider id or alias) to a provider id.
+    # Maps a /login argument (alias or shorthand) to a canonical provider id
+    # understood by _LOGIN_CAPABILITY_MAP.
     _LOGIN_PROVIDER_ALIASES = {
         "openai-codex": "openai-codex",
         "codex": "openai-codex",
         "openai": "openai-codex",
+        "zai": "zai",
+        "glm": "zai",
+        "z.ai": "zai",
+        "openai-api": "openai-api",
+        "openrouter": "openrouter",
+        "gemini": "gemini",
+        "custom": "custom",
     }
-    # Providers whose device-code login is implemented in-chat. Others get a
-    # "use the CLI" hint.
-    _LOGIN_INCHAT_PROVIDERS = {"openai-codex"}
+
+    # In-chat-connectable providers, grouped by flow:
+    #   api_key        — paste a key, write a credential-pool entry (registry provider)
+    #   api_key_custom — custom OpenAI-compatible endpoint: pool entry + config.yaml entry
+    #   device_code    — OAuth device-code flow (link + code, polled in background)
+    #   browser_oauth  — browser/loopback OAuth (Phase B)
+    # ``available: False`` marks providers whose in-chat flow isn't shipped yet —
+    # the handler returns a "use the CLI" hint for them, so the map also serves
+    # as the /login help catalogue.
+    _LOGIN_CAPABILITY_MAP = {
+        # API-key (Phase A)
+        "zai": {"flow": "api_key", "label": "Z.AI / GLM"},
+        "openai-api": {"flow": "api_key", "label": "OpenAI API"},
+        "openrouter": {"flow": "api_key", "label": "OpenRouter"},
+        "gemini": {"flow": "api_key", "label": "Google AI Studio (Gemini)"},
+        "custom": {"flow": "api_key_custom", "label": "Custom OpenAI-compatible endpoint"},
+        # Device-code OAuth
+        "openai-codex": {"flow": "device_code", "label": "OpenAI Codex (ChatGPT)"},
+        # Browser/loopback OAuth (Phase B)
+        "xai-oauth": {"flow": "browser_oauth", "label": "xAI Grok", "available": False},
+        "google-gemini-cli": {"flow": "browser_oauth", "label": "Google Gemini CLI", "available": False},
+        "qwen-oauth": {"flow": "browser_oauth", "label": "Qwen OAuth", "available": False},
+    }
 
     # Commands that are ALWAYS admin-only, even when slash-access gating is
     # disabled (the default, where every allowed user is treated as admin).
@@ -11780,29 +11817,46 @@ class GatewayRunner:
     _ALWAYS_ADMIN_COMMANDS = frozenset({"login"})
 
     async def _handle_login_command(self, event: MessageEvent) -> Optional[str]:
-        """Handle /login — connect an OAuth provider via an in-chat device-code flow.
+        """Handle /login — connect a provider in-chat (API key or OAuth).
 
-        Lets a customer complete an OAuth login from Telegram (no CLI access):
+        Lets a customer add a provider from Telegram (no CLI access):
 
-          /login                    — list connectable providers
-          /login openai-codex       — start the Codex device-code flow
-                                      (aliases: codex, openai)
+          /login                       — list connectable providers
+          /login list                  — show connected providers
+          /login <provider>            — connect a provider (API key or OAuth)
+          /login custom name=.. url=.. model=..
+                                       — add a custom OpenAI-compatible endpoint
+                                         (e.g. an internal New-API / OpenAI gateway)
+
+        API keys / OAuth codes are read from the NEXT message and that message
+        is auto-deleted so the secret doesn't linger in chat history.
         """
-        raw_args = event.get_command_args().strip().lower()
+        raw_args = event.get_command_args().strip()
         source = event.source
+
+        # --- subcommands ---
+        if raw_args:
+            first_tok = raw_args.split()[0]
+            head = first_tok.lower()
+            tail = raw_args[len(first_tok):].strip()
+            if head in {"list", "ls"}:
+                return await self._login_list()
+            if head == "remove":
+                return await self._login_remove(tail)
 
         if not raw_args:
             return self._login_help_text()
 
-        provider_id = self._resolve_login_provider(raw_args)
+        provider_token, kv = self._parse_login_args(raw_args)
+        provider_id = self._resolve_login_provider(provider_token)
         if provider_id is None:
-            return self._login_help_text(unknown=raw_args)
+            return self._login_help_text(unknown=provider_token)
 
-        if provider_id not in self._LOGIN_INCHAT_PROVIDERS:
+        cap = self._LOGIN_CAPABILITY_MAP[provider_id]
+        if not cap.get("available", True):
             return (
                 f"⏳ `/login {provider_id}` isn't available in-chat yet. "
-                "Use `hermes auth add` from the CLI for now. "
-                "(More providers coming soon.)"
+                "Use `hermes auth add` from the CLI for now. (More providers coming soon.)"
             )
 
         # One pending login per session — prevent duplicate concurrent flows.
@@ -11810,35 +11864,64 @@ class GatewayRunner:
         if session_key in self._pending_logins:
             return (
                 "🔐 A login is already in progress for this chat. "
-                "Open the link and enter the code, or wait for it to time out "
-                "(then run `/login` again)."
+                "Complete it or wait for it to time out, then run `/login` again."
             )
 
-        if provider_id == "openai-codex":
+        flow = cap["flow"]
+        if flow == "device_code":
+            # Phase A: only openai-codex ships in-chat.
             return await self._start_codex_device_login(source, session_key)
+        if flow in ("api_key", "api_key_custom"):
+            return await self._start_api_key_login(
+                source, session_key, provider_id, kv, custom=(flow == "api_key_custom")
+            )
         return self._login_help_text(unknown=provider_id)
 
     def _resolve_login_provider(self, raw: str) -> Optional[str]:
-        """Map a /login argument (canonical id or alias) to a provider id."""
+        """Map a /login argument (canonical id or alias) to a capability provider id."""
+        if not raw:
+            return None
         pid = self._LOGIN_PROVIDER_ALIASES.get(raw)
         if pid:
             return pid
-        try:
-            from hermes_cli.auth import PROVIDER_REGISTRY
-        except Exception:
-            return None
-        # Accept a canonical OAuth provider id directly.
-        if raw in PROVIDER_REGISTRY:
+        if raw in self._LOGIN_CAPABILITY_MAP:
             return raw
         return None
 
+    def _parse_login_args(self, args: str) -> tuple[str, dict[str, str]]:
+        """Split a /login arg string into (provider, kv-dict).
+
+        First token is the provider (lower-cased). Remaining tokens of the form
+        ``key=value`` become the kv dict (values kept verbatim so URLs/models
+        survive). Tokens without ``=`` are ignored.
+        """
+        tokens = args.split()
+        if not tokens:
+            return "", {}
+        provider = tokens[0].lower()
+        kv: dict[str, str] = {}
+        for tok in tokens[1:]:
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                kv[k.strip().lower()] = v.strip()
+        return provider, kv
+
     def _login_help_text(self, unknown: Optional[str] = None) -> str:
-        lines = []
+        lines: List[str] = []
         if unknown:
             lines.append(f"❓ Unknown provider `{unknown}`.\n")
-        lines.append("*Connect a provider:*")
+        lines.append("*Connect a provider from chat:*\n")
+        lines.append("*API key* — paste the key in your next message; I'll delete it:")
+        for pid in ("zai", "openai-api", "openrouter", "gemini"):
+            cap = self._LOGIN_CAPABILITY_MAP.get(pid, {})
+            lines.append(f"• `/login {pid}` — {cap.get('label', pid)}")
+        lines.append(
+            "• `/login custom name=.. url=.. model=..` — custom OpenAI-compatible "
+            "endpoint (e.g. internal New-API / OpenAI gateway)"
+        )
+        lines.append("\n*OAuth (device code):*")
         lines.append("• `/login openai-codex` — OpenAI Codex (ChatGPT)")
-        lines.append("\nOther providers: use `hermes auth add` from the CLI.")
+        lines.append("\n_Type `/login list` to see connected providers._")
         return "\n".join(lines)
 
     async def _start_codex_device_login(
@@ -11958,6 +12041,375 @@ class GatewayRunner:
             await _notify(f"❌ Codex login failed unexpectedly: {exc}")
         finally:
             self._pending_logins.pop(session_key, None)
+
+    # ==================== /login — API-key + custom endpoint flows ====================
+
+    def _make_login_notifier(self, source: "SessionSource"):
+        """Build an async ``_notify(text)`` closure targeting the login's origin chat.
+
+        Shared by the API-key capture flow (the Codex poller has its own inline
+        equivalent). Messages are delivered via the platform adapter.
+        """
+        adapter = self.adapters.get(source.platform)
+        metadata = self._thread_metadata_for_source(source)
+        chat_id = str(source.chat_id) if source.chat_id is not None else None
+
+        async def _notify(text: str) -> None:
+            if not adapter or chat_id is None:
+                logger.warning("login notify skipped (no adapter/chat)")
+                return
+            try:
+                await adapter.send(chat_id, text, metadata=metadata)
+            except Exception as exc:
+                logger.warning("login notify failed: %s", exc)
+
+        return _notify
+
+    async def _start_api_key_login(
+        self,
+        source: "SessionSource",
+        session_key: str,
+        provider_id: str,
+        kv: dict[str, str],
+        custom: bool,
+    ) -> str:
+        """Register a clarify to capture the pasted API key, then handle it in the background."""
+        import uuid
+
+        if custom:
+            name = kv.get("name", "").strip()
+            base_url = (kv.get("url") or kv.get("base_url") or "").strip()
+            model = kv.get("model", "").strip()
+            if not name or not base_url:
+                return (
+                    "📌 *Add a custom OpenAI-compatible endpoint*\n\n"
+                    "Usage:\n"
+                    "`/login custom name=My-Gateway url=https://host/v1 model=gpt-4o`\n\n"
+                    "Then paste the API key in your next message — I'll delete it.\n"
+                    "_Tip: avoid spaces in `name`; use hyphens._"
+                )
+            label = name
+            capture_base_url = base_url
+        else:
+            model = kv.get("model", "").strip()
+            label = self._LOGIN_CAPABILITY_MAP.get(provider_id, {}).get("label", provider_id)
+            capture_base_url = ""  # resolved from the registry at save time
+
+        from tools import clarify_gateway
+
+        clarify_id = f"login-apikey-{uuid.uuid4().hex[:10]}"
+        clarify_gateway.register(
+            clarify_id, session_key,
+            question=f"Paste the API key for {label}", choices=None,
+        )
+        self._pending_logins[session_key] = {
+            "provider": provider_id,
+            "flow": "api_key",
+            "started_at": time.time(),
+        }
+
+        _task = asyncio.create_task(
+            self._run_api_key_capture(
+                source, session_key, clarify_id, provider_id,
+                label, capture_base_url, model, custom,
+            )
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        return (
+            f"🔑 Paste your *{label}* API key in the next message.\n"
+            "I'll read it, save it, and *delete your message* right after.\n"
+            "_You have ~5 minutes before the prompt times out._"
+        )
+
+    async def _run_api_key_capture(
+        self,
+        source: "SessionSource",
+        session_key: str,
+        clarify_id: str,
+        provider_id: str,
+        label: str,
+        base_url: str,
+        model: str,
+        custom: bool,
+    ) -> None:
+        """Wait for the pasted key, auto-delete it, validate, persist, notify.
+
+        All blocking work (clarify wait, validation HTTP probe, pool/config
+        writes) runs off the event loop via ``asyncio.to_thread``.
+        """
+        from agent.credential_pool import _normalize_custom_pool_name
+        from tools import clarify_gateway
+
+        adapter = self.adapters.get(source.platform)
+        notify = self._make_login_notifier(source)
+        chat_id = str(source.chat_id) if source.chat_id is not None else None
+
+        # 1. Block (off the loop) until the user pastes the key.
+        try:
+            key = await asyncio.to_thread(clarify_gateway.wait_for_response, clarify_id, 300)
+        except Exception:
+            key = None
+
+        if not key:
+            self._pending_logins.pop(session_key, None)
+            await notify("⏰ API-key login timed out (5 min). Run `/login ...` again.")
+            return
+
+        # 2. Auto-delete the pasted message so the key doesn't linger in history.
+        msg_id = clarify_gateway.pop_resolved_message_id(clarify_id)
+        deleted = False
+        if adapter is not None and msg_id and chat_id is not None:
+            try:
+                deleted = await adapter.delete_message(chat_id, str(msg_id))
+            except Exception as exc:
+                logger.warning("delete of pasted api-key message failed: %s", exc)
+                deleted = False
+
+        # 3. Resolve the base_url for registry providers (custom carries its own).
+        if not custom and not base_url:
+            try:
+                from hermes_cli.auth_commands import _provider_base_url
+                base_url = _provider_base_url(provider_id)
+            except Exception:
+                base_url = ""
+
+        pool_key = (
+            f"custom:{_normalize_custom_pool_name(label)}" if custom else provider_id
+        )
+
+        # 4. Validate (best-effort) + persist, both off the loop.
+        ok, detail = await asyncio.to_thread(self._validate_api_key, pool_key, key, base_url)
+        saved, save_note = await asyncio.to_thread(
+            self._save_api_key_provider, pool_key, key, base_url, model, custom, label
+        )
+
+        try:
+            if saved and ok:
+                pick = (
+                    "Use `/model` and pick the new endpoint to switch to it."
+                    if custom else
+                    f"Use `/model --provider {provider_id}` to switch to it."
+                )
+                await notify(f"✅ *{label}* connected. Credential saved.\n{pick}")
+            elif saved and not ok:
+                await notify(
+                    f"⚠️ *{label}* key saved, but validation failed: {detail}.\n"
+                    "If this looks wrong, remove it from the CLI with `hermes auth remove`."
+                )
+            else:
+                await notify(f"❌ Couldn't save *{label}* credential: {save_note}")
+        finally:
+            self._pending_logins.pop(session_key, None)
+
+        if not deleted:
+            await notify(
+                "🧹 I couldn't auto-delete your key message. "
+                "Please delete it from this chat manually to keep the secret safe."
+            )
+
+    def _save_api_key_provider(
+        self,
+        pool_key: str,
+        key: str,
+        base_url: str,
+        model: str,
+        custom: bool,
+        name: str,
+    ) -> tuple[bool, str]:
+        """Persist an API-key credential (port of auth_commands.py API-key branch).
+
+        For custom providers, also ensure a config.yaml ``custom_providers:``
+        entry exists so ``/model`` can list + select the endpoint. Returns
+        ``(ok, note)`` where ``note`` is "" on clean success or follow-up
+        instructions (e.g. managed-box manual edit).
+        """
+        import uuid
+        from agent.credential_pool import (
+            AUTH_TYPE_API_KEY,
+            SOURCE_MANUAL,
+            PooledCredential,
+            load_pool,
+        )
+
+        try:
+            pool = load_pool(pool_key)
+            suffix = pool_key.split(":")[-1]
+            entry_label = f"{suffix}-api-key-{len(pool.entries()) + 1}"
+            entry = PooledCredential(
+                provider=pool_key,
+                id=uuid.uuid4().hex[:6],
+                label=entry_label,
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=0,
+                source=SOURCE_MANUAL,
+                access_token=key,
+                base_url=base_url.rstrip("/"),
+            )
+            pool.add_entry(entry)
+        except Exception as exc:
+            logger.warning("api-key login save failed for %s: %s", pool_key, exc)
+            return False, str(exc)
+
+        note = ""
+        if custom:
+            note = self._ensure_custom_provider_config_entry(name, base_url, model)
+        return True, note
+
+    def _ensure_custom_provider_config_entry(
+        self, name: str, base_url: str, model: str
+    ) -> str:
+        """Append/update a ``custom_providers:`` config entry (dedup by name).
+
+        Returns "" on clean success, otherwise instructions the user must
+        follow (managed box, or write failure) — the credential is already saved.
+        """
+        from agent.credential_pool import _normalize_custom_pool_name
+        from hermes_cli.config import is_managed, load_config, save_config
+
+        norm = _normalize_custom_pool_name(name)
+        url = base_url.rstrip("/")
+
+        def _snippet() -> str:
+            model_line = f'\n  model: "{model}"' if model else ""
+            return f'name: "{name}"\n  base_url: "{url}"\n  api_key: ""{model_line}'
+
+        if is_managed():
+            return (
+                "This box is *managed* — I can't write config.yaml. "
+                "Add this under `custom_providers:` manually:\n"
+                "```yaml\n- " + _snippet() + "\n```"
+            )
+
+        try:
+            config = load_config() or {}
+            cps = config.get("custom_providers")
+            if not isinstance(cps, list):
+                cps = []
+            updated = False
+            for entry in cps:
+                if not isinstance(entry, dict):
+                    continue
+                if _normalize_custom_pool_name(str(entry.get("name", ""))) == norm:
+                    entry["base_url"] = url
+                    entry["api_key"] = ""
+                    if model:
+                        entry["model"] = model
+                    updated = True
+                    break
+            if not updated:
+                new_entry: dict[str, Any] = {"name": name, "base_url": url, "api_key": ""}
+                if model:
+                    new_entry["model"] = model
+                cps.append(new_entry)
+            config["custom_providers"] = cps
+            save_config(config)
+            return ""
+        except Exception as exc:
+            logger.warning("custom provider config write failed: %s", exc)
+            return (
+                f"Key saved, but I couldn't write the config entry ({exc}). "
+                "Add this under `custom_providers:` manually:\n"
+                "```yaml\n- " + _snippet() + "\n```"
+            )
+
+    def _validate_api_key(
+        self, pool_key: str, key: str, base_url: str
+    ) -> tuple[bool, str]:
+        """Best-effort key validation: ``GET {base_url}/models`` with the key.
+
+        Falls back to a 1-token ``chat/completions`` probe when ``/models`` is
+        gated. Returns ``(ok, detail)``. Never raises — validation failure is
+        reported, not fatal (the credential is still saved).
+        """
+        if not base_url:
+            return True, "skipped (no base_url to probe)"
+
+        import httpx
+
+        headers = {"Authorization": f"Bearer {key}"}
+        root = base_url.rstrip("/")
+        try:
+            with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+                resp = client.get(root + "/models", headers=headers)
+            if 200 <= resp.status_code < 300:
+                return True, "ok"
+        except Exception as exc:
+            return False, f"models probe failed: {exc}"
+
+        # Fallback: a 1-token chat completion (some gateways gate /models).
+        try:
+            with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+                cr = client.post(
+                    root + "/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 1,
+                    },
+                )
+            if 200 <= cr.status_code < 300:
+                return True, "ok (chat/completions)"
+            return False, f"HTTP {cr.status_code}"
+        except Exception as exc:
+            return False, str(exc)
+
+    async def _login_list(self) -> str:
+        """List providers with saved credentials in the auth store."""
+        from hermes_cli.auth import read_credential_pool
+
+        data = await asyncio.to_thread(read_credential_pool, None)
+        lines: List[str] = ["*Connected providers:*"]
+        found = False
+        if isinstance(data, dict):
+            for prov in sorted(data.keys()):
+                entries = data.get(prov)
+                if not isinstance(entries, list) or not entries:
+                    continue
+                found = True
+                active = sum(
+                    1 for e in entries
+                    if isinstance(e, dict) and e.get("last_status") != "exhausted"
+                )
+                lines.append(f"• `{prov}` — {len(entries)} key(s), {active} active")
+        if not found:
+            lines.append("_None yet. Use `/login <provider>` to add one._")
+        return "\n".join(lines)
+
+    async def _login_remove(self, target: str) -> str:
+        """Remove a credential: ``/login remove <provider> [label-or-id]``.
+
+        Without a label/id, clears the whole pool for that provider. Best-effort.
+        """
+        if not target:
+            return "Usage: `/login remove <provider> [label-or-id]`"
+        from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+        parts = target.split()
+        prov = parts[0]
+        which = parts[1] if len(parts) > 1 else None
+
+        data = await asyncio.to_thread(read_credential_pool, None)
+        entries = data.get(prov) if isinstance(data, dict) else None
+        if not entries:
+            return f"No credentials found for `{prov}`."
+
+        if which is None:
+            await asyncio.to_thread(write_credential_pool, prov, [])
+            return f"🗑 Removed all credentials for `{prov}`."
+
+        kept = [
+            e for e in entries
+            if isinstance(e, dict)
+            and str(e.get("id", "")) != which
+            and str(e.get("label", "")) != which
+        ]
+        if len(kept) == len(entries):
+            return f"No credential matched `{which}` under `{prov}`."
+        await asyncio.to_thread(write_credential_pool, prov, kept)
+        return f"🗑 Removed `{which}` from `{prov}` ({len(kept)} remaining)."
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.

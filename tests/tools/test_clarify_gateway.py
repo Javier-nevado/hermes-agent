@@ -22,6 +22,7 @@ def _clear_clarify_state():
         cm._entries.clear()
         cm._session_index.clear()
         cm._notify_cbs.clear()
+        cm._resolved_message_ids.clear()
 
 
 class TestClarifyPrimitive:
@@ -56,6 +57,28 @@ class TestClarifyPrimitive:
         pending = cm.get_pending_for_session("sk2")
         assert pending is not None
         assert pending.clarify_id == "id2"
+
+    def test_resolved_message_id_stash_roundtrip(self):
+        """set/pop resolved_message_id lets a background task retrieve the pasted msg id."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id-msg", "sk-msg", "Paste key", None)
+        cm.set_resolved_message_id("id-msg", "msg-42")
+        assert cm.pop_resolved_message_id("id-msg") == "msg-42"
+        # Second pop is None (already consumed).
+        assert cm.pop_resolved_message_id("id-msg") is None
+        # pop on an unknown id is None.
+        assert cm.pop_resolved_message_id("never-registered") is None
+
+    def test_clear_session_drops_resolved_message_ids(self):
+        """clear_session also clears stashed resolved message ids."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id-cs", "sk-cs", "Paste key", None)
+        cm.set_resolved_message_id("id-cs", "msg-7")
+        cancelled = cm.clear_session("sk-cs")
+        assert cancelled == 1
+        assert cm.pop_resolved_message_id("id-cs") is None
 
     def test_button_choice_does_not_auto_await(self):
         """Multi-choice clarify should NOT be in text-capture mode initially."""
