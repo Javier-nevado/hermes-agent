@@ -12183,9 +12183,21 @@ class GatewayRunner:
         )
 
         # 4. Validate (best-effort — also discovers models) + persist, off-loop.
-        ok, detail, models = await asyncio.to_thread(
+        ok, detail, models, resolved_base_url = await asyncio.to_thread(
             self._validate_api_key, pool_key, key, base_url
         )
+        # The probe returns the base_url variant that actually served the
+        # endpoint (e.g. with /v1 appended when the user gave a bare host).
+        # Persist THAT — the runtime OpenAI client posts to base_url +
+        # /chat/completions and needs /v1 baked in, else requests silently
+        # hit the host's HTML frontend and come back empty.
+        normalized_note = ""
+        if resolved_base_url and resolved_base_url.rstrip("/") != base_url.rstrip("/"):
+            normalized_note = (
+                f"_Normalized base URL to `{resolved_base_url}` — "
+                f"the form this endpoint actually serves._\n"
+            )
+            base_url = resolved_base_url
         # Pick the default model: honour an explicit model= arg, else a
         # heuristic over the discovered list. ``default_model`` is "" only
         # when we couldn't enumerate AND the user gave none (flagged below).
@@ -12211,14 +12223,14 @@ class GatewayRunner:
                         shown = ", ".join(f"`{m}`" for m in models[:8])
                         more = f" …(+{len(models) - 8} more)" if len(models) > 8 else ""
                         pick = (
-                            f"{warned_model}"
+                            f"{normalized_note}{warned_model}"
                             f"Found *{len(models)}* models; default set to "
                             f"`{default_model}`. Use `/model` to switch.\n"
                             f"_Available: {shown}{more}_"
                         )
                     else:
                         pick = (
-                            f"{warned_model}"
+                            f"{normalized_note}{warned_model}"
                             "I couldn't read the model list from this endpoint. "
                             "Set one with `/model`, or re-run "
                             f"`/login custom name={label} url={base_url} model=<id>`."
@@ -12401,10 +12413,10 @@ class GatewayRunner:
 
     def _validate_api_key(
         self, pool_key: str, key: str, base_url: str
-    ) -> tuple[bool, str, list[str]]:
+    ) -> tuple[bool, str, list[str], str]:
         """Best-effort key validation + model discovery.
 
-        Probes ``GET {base_url}/models`` via ``fetch_api_models`` — the SAME
+        Probes ``GET {base_url}/models`` via ``probe_api_models`` — the SAME
         helper ``/model`` uses, so URL heuristics (with/without ``/v1``) and
         ``data[].id`` parsing stay consistent — and returns the discovered
         model IDs so the caller can register them under ``custom_providers``.
@@ -12412,42 +12424,66 @@ class GatewayRunner:
         gated (returns an empty model list in that case — key is valid but the
         catalog can't be enumerated).
 
-        Returns ``(ok, detail, models)``. Never raises — validation failure is
-        reported, not fatal (the credential is still saved).
+        Returns ``(ok, detail, models, resolved_base_url)``. ``resolved_base_url``
+        is the base_url variant that actually served the endpoint — when the
+        user gives a bare host (``https://gw.example``) but only the ``/v1``
+        form answers, this is ``https://gw.example/v1``. Callers MUST persist
+        this rather than the raw input: the runtime OpenAI client posts to
+        ``base_url + /chat/completions`` and needs ``/v1`` baked in, otherwise
+        requests hit the host's HTML frontend and come back empty. Empty string
+        only when there was no base_url to probe.
+
+        Never raises — validation failure is reported, not fatal (the credential
+        is still saved).
         """
         if not base_url:
-            return True, "skipped (no base_url to probe)", []
+            return True, "skipped (no base_url to probe)", [], ""
 
-        from hermes_cli.models import fetch_api_models
+        from hermes_cli.models import probe_api_models
 
+        resolved = base_url.rstrip("/")
         try:
-            discovered = fetch_api_models(key, base_url, timeout=15.0)
+            probe = probe_api_models(key, base_url, timeout=15.0)
         except Exception:
-            discovered = None
+            probe = {}
+        discovered = probe.get("models")
         if discovered:
-            return True, "ok", list(discovered)
+            # probe_api_models tried the URL as-given AND the /v1 variant;
+            # whichever served /models is the base the runtime client must use.
+            resolved = (probe.get("resolved_base_url") or "").rstrip("/") or resolved
+            return True, "ok", list(discovered), resolved
 
         # Fallback: a 1-token chat completion (some gateways gate /models).
+        # Mirror probe_api_models' with/without-/v1 candidate logic so a bare
+        # host still resolves to the working /v1 chat path, not the HTML frontend.
         import httpx
 
         headers = {"Authorization": f"Bearer {key}"}
         root = base_url.rstrip("/")
-        try:
-            with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-                cr = client.post(
-                    root + "/chat/completions",
-                    headers=headers,
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 1,
-                    },
-                )
-            if 200 <= cr.status_code < 300:
-                return True, "ok (chat/completions)", []
-            return False, f"HTTP {cr.status_code}", []
-        except Exception as exc:
-            return False, str(exc), []
+        if root.endswith("/v1"):
+            candidates = [root, root[:-3].rstrip("/")]
+        else:
+            candidates = [root, root + "/v1"]
+        last_detail = "no working endpoint"
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            for cand in candidates:
+                try:
+                    cr = client.post(
+                        cand + "/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": "gpt-4o-mini",
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 1,
+                        },
+                    )
+                except Exception as exc:
+                    last_detail = str(exc)
+                    continue
+                if 200 <= cr.status_code < 300:
+                    return True, "ok (chat/completions)", [], cand
+                last_detail = f"HTTP {cr.status_code}"
+        return False, last_detail, [], resolved
 
     async def _login_list(self) -> str:
         """List providers with saved credentials in the auth store."""
