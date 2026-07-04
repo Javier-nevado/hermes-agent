@@ -568,3 +568,97 @@ def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch)
         "gateway-model-c",
     ], "Live models must replace the static subset"
     assert gateway_prov["total_models"] == 3
+
+
+def test_custom_providers_live_discover_via_pooled_secret(monkeypatch):
+    """A custom provider whose secret is in the credential pool (api_key empty
+    in config — e.g. an endpoint added via in-chat ``/login custom``) must
+    live-discover its model catalog on /model, replacing the static snapshot
+    captured at login. Models added on the gateway after login then appear
+    without a re-login."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    calls = []
+
+    def fake_fetch(api_key, base_url):
+        calls.append((api_key, base_url))
+        return ["new-model-1", "new-model-2", "new-model-3"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch)
+
+    class _FakeEntry:
+        access_token = "sk-pooled-secret"
+        runtime_api_key = ""
+
+    class _FakePool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _FakeEntry()
+
+    monkeypatch.setattr(
+        "agent.credential_pool.get_custom_provider_pool_key",
+        lambda base_url, provider_name=None: "custom:new-api",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool", lambda key: _FakePool()
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        custom_providers=[
+            {
+                "name": "New-API",
+                "base_url": "https://ai.example.net/v1",
+                "api_key": "",                   # secret in pool, not config
+                "model": "snapshot-model",       # login-time snapshot
+                "models": {"snapshot-model": {}},
+            }
+        ],
+        max_models=50,
+    )
+
+    row = next(p for p in providers if p.get("api_url") == "https://ai.example.net/v1")
+    # Probed with the POOL secret (the config api_key was empty).
+    assert calls == [("sk-pooled-secret", "https://ai.example.net/v1")]
+    # Live catalog replaces the stale snapshot.
+    assert row["models"] == ["new-model-1", "new-model-2", "new-model-3"]
+    assert row["total_models"] == 3
+
+
+def test_custom_providers_no_pool_keeps_static_snapshot(monkeypatch):
+    """No pooled secret resolvable + empty config api_key + a populated
+    ``models:`` snapshot → don't probe; show the snapshot as-is. The login-time
+    list is the fallback when the pool can't provide a key."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "agent.credential_pool.get_custom_provider_pool_key",
+        lambda base_url, provider_name=None: None,
+    )
+    probed = []
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda *a, **k: probed.append(1) or [],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        custom_providers=[
+            {
+                "name": "New-API",
+                "base_url": "https://ai.example.net/v1",
+                "api_key": "",
+                "models": {"snapshot-a": {}, "snapshot-b": {}},
+            }
+        ],
+        max_models=50,
+    )
+
+    row = next(p for p in providers if p.get("api_url") == "https://ai.example.net/v1")
+    assert probed == []                            # no live probe without a key
+    assert row["models"] == ["snapshot-a", "snapshot-b"]
