@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
@@ -21,6 +22,56 @@ _entity_extractor: Optional[EntityExtractor] = None
 _start_time: Optional[float] = None
 _license_manager = None
 _encryptor = None
+_reranker_singleton = None
+_has_importance_cache: Optional[bool] = None
+_has_access_cache: Optional[bool] = None
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def apply_pending_migrations() -> None:
+    """Apply any ``abi/sql/*.sql`` not yet recorded in ``abi_schema_migrations``.
+
+    Idempotent and per-file isolated: a failing migration is logged but does not
+    abort API startup. Runs as the abi_agent DB user (table owner), so this is
+    also the reliable application path for new migrations on customer docker
+    boxes (the only in-repo runner otherwise globs just ``002_*`` in abi-setup).
+    """
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS abi_schema_migrations ("
+                "filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())"
+            )
+            cur.execute("SELECT filename FROM abi_schema_migrations")
+            applied = {row[0] for row in cur.fetchall()}
+
+        import abi
+        sql_dir = Path(abi.__file__).parent / "sql"
+        for sql_file in sorted(sql_dir.glob("*.sql")):
+            name = sql_file.name
+            if name in applied:
+                continue
+            logger.info("Applying migration %s", name)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql_file.read_text())  # each file wraps in BEGIN/COMMIT
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO abi_schema_migrations (filename) VALUES (%s) "
+                        "ON CONFLICT DO NOTHING",
+                        [name],
+                    )
+                logger.info("Applied migration %s", name)
+            except Exception as exc:
+                logger.error("Migration %s failed (skipping): %s", name, exc)
+    finally:
+        pool.putconn(conn)
 
 
 def init_deps() -> None:
@@ -39,6 +90,12 @@ def init_deps() -> None:
         minconn=2, maxconn=10, dsn=db_url
     )
     logger.info("DB pool initialized (2-10 connections)")
+
+    # Apply pending schema migrations (idempotent; per-file isolated).
+    try:
+        apply_pending_migrations()
+    except Exception as exc:
+        logger.error("Migration runner error (non-fatal): %s", exc)
 
     # Entity extractor
     _entity_extractor = EntityExtractor()
@@ -98,3 +155,69 @@ def init_encryptor() -> None:
 def get_encryptor():
     """Return the EncryptionService, or None if encryption is disabled."""
     return _encryptor
+
+
+def get_reranker():
+    """Return the shared Reranker singleton, or None if reranking is disabled.
+
+    Lazy-loaded on first call (the first recall triggers the one-time model
+    download). Disabled unless ``ABI_MEMORY_RERANK_ENABLED`` is set.
+    """
+    global _reranker_singleton
+    if _reranker_singleton is not None:
+        return _reranker_singleton
+    if not _env_bool("ABI_MEMORY_RERANK_ENABLED"):
+        return None
+    try:
+        from abi.memory.model_cache import get_cache_root
+        from abi.memory.reranker import Reranker
+        _reranker_singleton = Reranker(get_cache_root())
+    except Exception as exc:
+        logger.warning("Reranker init failed: %s", exc)
+        _reranker_singleton = None
+    return _reranker_singleton
+
+
+def has_importance_column() -> bool:
+    """True if abi_memories.importance exists (005 migration applied). Cached."""
+    global _has_importance_cache
+    if _has_importance_cache is not None:
+        return _has_importance_cache
+    try:
+        conn = get_pool().getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'abi_memories' AND column_name = 'importance'"
+                )
+                _has_importance_cache = cur.fetchone() is not None
+        finally:
+            get_pool().putconn(conn)
+    except Exception:
+        _has_importance_cache = False
+    return _has_importance_cache
+
+
+def has_access_tracking() -> bool:
+    """True if abi_memories has last_accessed/access_count (005 migration). Cached.
+
+    Used to gate the recall access-tracking write so it is a no-op on pre-005 DBs.
+    """
+    global _has_access_cache
+    if _has_access_cache is not None:
+        return _has_access_cache
+    try:
+        conn = get_pool().getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'abi_memories' AND column_name = 'last_accessed'"
+                )
+                _has_access_cache = cur.fetchone() is not None
+        finally:
+            get_pool().putconn(conn)
+    except Exception:
+        _has_access_cache = False
+    return _has_access_cache

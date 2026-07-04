@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from typing import List
 
@@ -17,8 +18,9 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from abi.memory.dlp import dlp_where
 from abi.memory.pii import classify_pii
+from abi.memory.ranking import finalize_recall_ordering
 
-from ..deps import get_pool, get_extractor, get_encryptor
+from ..deps import get_pool, get_extractor, get_encryptor, get_reranker, has_importance_column, has_access_tracking
 from ..license import require_license
 from ..schemas import (
     RememberRequest,
@@ -34,6 +36,48 @@ from ..schemas import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _decay_enabled() -> bool:
+    return os.environ.get("ABI_MEMORY_DECAY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rerank_enabled() -> bool:
+    return os.environ.get("ABI_MEMORY_RERANK_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rerank_topn() -> int:
+    return int(os.environ.get("ABI_MEMORY_RERANK_TOPN", "20"))
+
+
+def _update_access_tracking(conn, results: list) -> None:
+    """Bump last_accessed/access_count for recalled memories (non-fatal).
+
+    Records the 'frequently used' signal that future relevance/decay and any
+    retention policy depend on. No-op on pre-005 DBs (no columns) and on any
+    error — must never break recall. The recall transaction is read-only up to
+    this point, so committing here is safe.
+    """
+    if not results or not has_access_tracking():
+        return
+    try:
+        ids = [str(r.get("id")) for r in results if r.get("id")]
+        if not ids:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE abi_memories SET last_accessed = NOW(), "
+                "access_count = COALESCE(access_count, 0) + 1 "
+                "WHERE id::text = ANY(%s)",
+                [ids],
+            )
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("Access tracking update failed: %s", e)
 
 
 def _get_embedding(text: str):
@@ -179,10 +223,15 @@ def recall(req: RecallRequest):
 
                 bm25_where = where_clause + " AND fts @@ websearch_to_tsquery('english', %s)"
 
+                # importance (005 migration) is optional — neutral if absent.
+                imp_cte = "importance, " if has_importance_column() else ""
+                imp_final = ("COALESCE(v.importance, b.importance) AS importance, "
+                             if has_importance_column() else "")
+
                 sql = f"""
                     WITH vector_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata,
+                               source_type, created_at, metadata, {imp_cte}
                                ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
                         FROM abi_memories
                         WHERE {where_clause}
@@ -191,7 +240,7 @@ def recall(req: RecallRequest):
                     ),
                     bm25_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata,
+                               source_type, created_at, metadata, {imp_cte}
                                ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
                         FROM abi_memories
                         WHERE {bm25_where}
@@ -201,8 +250,10 @@ def recall(req: RecallRequest):
                            COALESCE(v.content, b.content) AS content,
                            COALESCE(v.dlp_level, b.dlp_level) AS dlp_level,
                            COALESCE(v.agent_name, b.agent_name) AS agent_name,
+                           COALESCE(v.source_type, b.source_type) AS source_type,
                            COALESCE(v.created_at, b.created_at) AS created_at,
                            COALESCE(v.metadata, b.metadata) AS metadata,
+                           {imp_final}
                            COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
                            COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
                     FROM vector_results v
@@ -216,9 +267,10 @@ def recall(req: RecallRequest):
                     + [limit])
             else:
                 # BM25-only fallback
+                imp_sel = "importance, " if has_importance_column() else ""
                 _sql = (
                     "SELECT id, content, dlp_level, agent_name, user_id, "
-                    "source_type, created_at, metadata, "
+                    "source_type, created_at, metadata, " + imp_sel +
                     "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                     "FROM abi_memories "
                     "WHERE " + where_clause + " "
@@ -256,6 +308,18 @@ def recall(req: RecallRequest):
         # Graph boost
         results = _graph_boost(conn, results, query, extractor)
 
+        # Temporal decay + importance weighting + optional cross-encoder rerank.
+        results = finalize_recall_ordering(
+            results, query,
+            decay_enabled=_decay_enabled(),
+            reranker=get_reranker() if _rerank_enabled() else None,
+            rerank_top_n=_rerank_topn(),
+            limit=limit,
+        )
+
+        # Record the 'frequently used' signal for returned memories (non-fatal).
+        _update_access_tracking(conn, results)
+
         memories = []
         for row in results:
             mem = MemoryItem(
@@ -263,7 +327,7 @@ def recall(req: RecallRequest):
                 content=row["content"],
                 dlp_level=row["dlp_level"],
                 created_at=row["created_at"].isoformat() if row.get("created_at") else None,
-                score=round(float(row.get("rrf_score", row.get("rank", 0))), 4),
+                score=round(float(row.get("score", 0.0)), 4),
             )
             memories.append(mem)
 
