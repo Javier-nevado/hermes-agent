@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -21,8 +22,13 @@ from tools.registry import tool_error
 from .dlp import dlp_where
 from .entities import EntityExtractor
 from .pii import classify_pii
+from .ranking import finalize_recall_ordering
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 # Tool schemas (OpenAI function calling format)
 RECALL_SCHEMA = {
@@ -160,6 +166,41 @@ class ABIMemoryProvider(MemoryProvider):
             logger.warning("Embedding function not available: %s", e)
             self._embed_fn = None
 
+        # Recall ranking config (env-driven; defaults preserve today's behaviour).
+        self._rerank_enabled = _env_bool("ABI_MEMORY_RERANK_ENABLED")
+        self._decay_enabled = _env_bool("ABI_MEMORY_DECAY_ENABLED")
+        self._rerank_topn = int(os.environ.get("ABI_MEMORY_RERANK_TOPN", "20"))
+
+        # Probe whether the importance column exists (005 migration). Neutral if
+        # absent — decay + rerank still work (they need only base columns).
+        self._has_importance = self._probe_column("importance")
+
+        # Reranker lazy-loads on first rerank() (downloads on first run, non-fatal).
+        self._reranker = None
+        if self._rerank_enabled:
+            try:
+                from .model_cache import get_cache_root
+                from .reranker import Reranker
+                self._reranker = Reranker(get_cache_root(hermes_home))
+            except Exception as e:
+                logger.warning("Reranker init failed, reranking disabled: %s", e)
+                self._reranker = None
+
+    def _probe_column(self, column: str) -> bool:
+        """True if ``column`` exists on abi_memories (no-op if DB unavailable)."""
+        if not self._conn:
+            return False
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'abi_memories' AND column_name = %s",
+                    [column],
+                )
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
     def system_prompt_block(self) -> str:
         """Tell the agent about its memory capabilities."""
         return (
@@ -219,10 +260,15 @@ class ABIMemoryProvider(MemoryProvider):
                     # Build BM25 WHERE clause (fts column + DLP)
                     bm25_where = where_clause + " AND fts @@ websearch_to_tsquery('english', %s)"
 
+                    # importance (005 migration) is optional — neutral if absent.
+                    imp_cte = "importance, " if self._has_importance else ""
+                    imp_final = ("COALESCE(v.importance, b.importance) AS importance, "
+                                 if self._has_importance else "")
+
                     sql = f"""
                         WITH vector_results AS (
                             SELECT id, content, dlp_level, agent_name, user_id,
-                                   source_type, created_at, metadata,
+                                   source_type, created_at, metadata, {imp_cte}
                                    ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
                             FROM abi_memories
                             WHERE {where_clause}
@@ -231,7 +277,7 @@ class ABIMemoryProvider(MemoryProvider):
                         ),
                         bm25_results AS (
                             SELECT id, content, dlp_level, agent_name, user_id,
-                                   source_type, created_at, metadata,
+                                   source_type, created_at, metadata, {imp_cte}
                                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
                             FROM abi_memories
                             WHERE {bm25_where}
@@ -241,8 +287,10 @@ class ABIMemoryProvider(MemoryProvider):
                                COALESCE(v.content, b.content) AS content,
                                COALESCE(v.dlp_level, b.dlp_level) AS dlp_level,
                                COALESCE(v.agent_name, b.agent_name) AS agent_name,
+                               COALESCE(v.source_type, b.source_type) AS source_type,
                                COALESCE(v.created_at, b.created_at) AS created_at,
                                COALESCE(v.metadata, b.metadata) AS metadata,
+                               {imp_final}
                                COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
                                COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
                         FROM vector_results v
@@ -261,9 +309,10 @@ class ABIMemoryProvider(MemoryProvider):
 
                 else:
                     # Fallback: BM25-only when embeddings unavailable
+                    imp_sel = "importance, " if self._has_importance else ""
                     _sql = (
                         "SELECT id, content, dlp_level, agent_name, user_id, "
-                        "source_type, created_at, metadata, "
+                        "source_type, created_at, metadata, " + imp_sel +
                         "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                         "FROM abi_memories "
                         "WHERE " + where_clause + " "
@@ -278,6 +327,15 @@ class ABIMemoryProvider(MemoryProvider):
             # Graph-boosted ranking: boost memories sharing entities with query
             results = self._graph_boost(results, query)
 
+            # Temporal decay + importance weighting + optional cross-encoder rerank.
+            results = finalize_recall_ordering(
+                results, query,
+                decay_enabled=self._decay_enabled,
+                reranker=self._reranker if self._rerank_enabled else None,
+                rerank_top_n=self._rerank_topn,
+                limit=limit,
+            )
+
             memories = []
             for row in results:
                 mem = {
@@ -285,11 +343,8 @@ class ABIMemoryProvider(MemoryProvider):
                     "content": row["content"],
                     "dlp_level": row["dlp_level"],
                     "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                    "score": round(float(row.get("score", 0.0)), 4),
                 }
-                if "rrf_score" in row:
-                    mem["score"] = round(float(row["rrf_score"]), 4)
-                elif "rank" in row:
-                    mem["score"] = round(float(row["rank"]), 4)
                 memories.append(mem)
 
             return json.dumps({"memories": memories, "count": len(memories)})
