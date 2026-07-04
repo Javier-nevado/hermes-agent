@@ -53,6 +53,15 @@ MODELS: Dict[str, Dict[str, List[Tuple[str, Optional[str]]]]] = {
 _DOWNLOAD_TIMEOUT = 120
 _MAX_RETRIES = 3
 
+# User-Agent sent on model downloads. REQUIRED: api.opteia.com sits behind
+# Cloudflare Bot Fight Mode, which 403s urllib's default "Python-urllib/x.y" UA
+# (verified 2026-07-04 — only that UA was blocked; curl/custom UAs pass). A
+# descriptive custom UA passes cleanly; env-overridable as a safety valve if a
+# future CF rule ever targets it.
+_USER_AGENT = os.environ.get(
+    "ABI_MODELS_USER_AGENT", "abi-memory-model-cache/1.0 (+https://opteia.com)"
+)
+
 
 def get_cache_root(hermes_home: Optional[str] = None) -> Path:
     """Resolve the model cache root.
@@ -109,7 +118,10 @@ def _download_file(url: str, dest: Path) -> None:
     for attempt in range(1, _MAX_RETRIES + 1):
         tmp: Optional[Path] = None
         try:
-            with urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT) as resp:  # noqa: S310 (trusted Opteia-hosted URL)
+            req = urllib.request.Request(  # noqa: S310 (trusted Opteia-hosted URL)
+                url, headers={"User-Agent": _USER_AGENT}
+            )
+            with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT) as resp:
                 with tempfile.NamedTemporaryFile(dir=str(dest.parent), delete=False) as tmp_fh:
                     tmp = Path(tmp_fh.name)
                     while True:

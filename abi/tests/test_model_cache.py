@@ -98,3 +98,41 @@ def test_get_cache_root_env_override(tmp_path, monkeypatch):
 
 def test_get_cache_root_hermes_home(tmp_path):
     assert model_cache.get_cache_root(str(tmp_path)) == tmp_path / "abi_models"
+
+
+def test_download_file_sets_non_default_user_agent(tmp_path, monkeypatch):
+    """Regression: api.opteia.com sits behind Cloudflare Bot Fight Mode, which 403s
+    urllib's default 'Python-urllib/x.y' UA (verified 2026-07-04). _download_file
+    MUST send a non-default User-Agent, or model fetch fails on every box."""
+    captured = {}
+
+    class _FakeResp:
+        def __init__(self, body):
+            self._buf = body
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                chunk, self._buf = self._buf, b""
+                return chunk
+            chunk, self._buf = self._buf[:n], self._buf[n:]
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["ua"] = req.get_header("User-agent")
+        captured["timeout"] = timeout
+        return _FakeResp(b"payload")
+
+    monkeypatch.setattr(model_cache.urllib.request, "urlopen", fake_urlopen)
+    dest = tmp_path / "f.bin"
+    model_cache._download_file("https://example.invalid/f.bin", dest)
+
+    assert captured["ua"], "no User-Agent header sent"
+    assert "Python-urllib" not in captured["ua"], "default urllib UA must not be used"
+    assert captured["timeout"] == model_cache._DOWNLOAD_TIMEOUT
+    assert dest.read_bytes() == b"payload"
