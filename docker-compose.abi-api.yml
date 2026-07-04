@@ -45,6 +45,13 @@ services:
       # legacy HS256 fallback, optional post-RS256-cutover (empty = RS256-only boot).
       - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
       - OPTEIA_API_VERSION=1.0.0
+      # Memory ranking feature flags (PR #22). Set in docker.env per-deploy.
+      # decay: temporal-recency ranking weight (non-destructive; uses created_at).
+      # rerank: cross-encoder reorder of top-N (needs the ONNX model hosted at
+      #         ABI_MODELS_BASE_URL — gracefully skipped if absent).
+      - ABI_MEMORY_DECAY_ENABLED=${ABI_MEMORY_DECAY_ENABLED:-false}
+      - ABI_MEMORY_RERANK_ENABLED=${ABI_MEMORY_RERANK_ENABLED:-false}
+      - ABI_MEMORY_RERANK_TOPN=${ABI_MEMORY_RERANK_TOPN:-20}
     networks:
       - opteia-net
     depends_on:
