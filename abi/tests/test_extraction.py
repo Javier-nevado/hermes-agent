@@ -94,6 +94,21 @@ class TestClassify(unittest.TestCase):
         mtype, _ = _classify("We deployed the fix yesterday and it broke staging.")
         self.assertEqual(mtype, "event")
 
+    def test_intent_verb_decision(self):
+        # Request-style phrasing — "let's create a weekly report" — must classify
+        # as a decision (commitment to establish standing work), not a lowly fact.
+        mtype, imp = _classify("Let's create a weekly report for proxmox.")
+        self.assertEqual(mtype, "decision")
+        self.assertGreaterEqual(imp, 0.8)
+
+    def test_cadence_lifts_importance(self):
+        # "Friday evening" carries no decision/preference keyword; without the
+        # cadence signal it defaults to fact 0.5 (below floor). Cadence lifts it.
+        _, imp = _classify("Friday evening sounds be fine.")
+        self.assertGreaterEqual(imp, 0.8)
+        _, imp2 = _classify("Send it every Monday morning.")
+        self.assertGreaterEqual(imp2, 0.8)
+
 
 # --------------------------------------------------------------------------- #
 # process_turn pipeline (writer + embed mocked)
@@ -158,6 +173,25 @@ class TestProcessTurn(unittest.TestCase):
         self.assertGreaterEqual(stats["saved"], 1)
         self.assertTrue(any("PostgreSQL" in c or "postgresql" in c for c, _, _ in written))
         self.assertGreaterEqual(stats["skipped_trivia_floor"], 1)
+
+    def test_real_request_message_captures_all_points(self):
+        # Regression: Javier's actual proxmox-report request. Before the lexicon
+        # boost only the HTML preference survived (decision + cadence dropped at
+        # the 0.6 floor). All three durable points must now be saved.
+        written, writer = _fake_writer()
+        msg = ("Let's create a weekly report for proxmox, status, errors, "
+               "things to be aware of. Let's make it on html, send it on this "
+               "channel. Friday evening sounds be fine.")
+        stats = process_turn(
+            {"agent_name": "atlas", "user_content": msg, "assistant_content": ""},
+            conn=None, embed_fn=lambda s: None, writer=writer, min_importance=0.6,
+        )
+        self.assertGreaterEqual(stats["saved"], 3)
+        types = {t for _, t, _ in written}
+        self.assertIn("decision", types)      # "let's create a weekly report"
+        self.assertIn("preference", types)    # "make it on html"
+        blob = " ".join(c for c, _, _ in written).lower()
+        self.assertIn("friday", blob)         # cadence point survived
 
     def test_duplicate_skipped_via_cosine(self):
         written, writer = _fake_writer()

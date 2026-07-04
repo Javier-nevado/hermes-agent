@@ -49,6 +49,12 @@ _DECISION = (
     "decided", "let's go with", "going with", "we'll use", "we will use",
     "we'll go", "chose", "the plan is", "let's do", "agreed to", "from now on",
     "switching to", "migrate to", "rolling out", "we are moving to", "we're moving to",
+    # Intent verbs — committing to create/establish something (recurring work,
+    # deliverables, standing tasks). Catches request-style phrasing operators
+    # actually use ("let's create a weekly report") that the decision keywords
+    # above miss.
+    "let's create", "let's set up", "let's generate", "let's build", "let's start",
+    "let's put together", "create a", "set up a", "we need a", "we should have a",
 )
 _PREFERENCE = (
     "i prefer", "prefer ", "i want", "i'd like", "i like", "i don't like",
@@ -80,6 +86,15 @@ _VERSION = re.compile(r"\bv?\d+\.\d+(\.\d+)?\b")
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _IP = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _URL = re.compile(r"https?://", re.I)
+# Cadence / recurrence — a standing commitment ("weekly", "every Friday",
+# "Friday evening", "end of week") is durable and worth lifting.
+_CADENCE = re.compile(
+    r"\b(weekly|daily|monthly|quarterly|yearly|annually|recurring|"
+    r"every\s+\w+|"
+    r"(?:mon|tues|wednes|thurs|fri|sat|sun)days?|"
+    r"end of (?:week|month|day)|eow|eod|eom)\b",
+    re.I,
+)
 
 # Sentence splitter — keep it simple, good enough for chat utterances.
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+|; ")
@@ -150,7 +165,7 @@ def _classify(text: str) -> tuple[str, float]:
 
     has_signal = any(
         p.search(text)
-        for p in (_AMOUNT, _DATELIKE, _VERSION, _EMAIL, _IP, _URL)
+        for p in (_AMOUNT, _DATELIKE, _VERSION, _EMAIL, _IP, _URL, _CADENCE)
     )
     if has_signal:
         importance = max(importance, 0.8)
