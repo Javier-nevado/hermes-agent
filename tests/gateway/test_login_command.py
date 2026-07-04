@@ -307,6 +307,46 @@ class TestApiKeyLoginFlow:
         result = await runner._handle_login_command(event)
         assert "already in progress" in result
 
+    @pytest.mark.asyncio
+    async def test_capture_persists_resolved_base_url_with_v1(self):
+        """A bare-host login saves the /v1-resolved base_url, not the raw input.
+
+        Regression for the silent-empty failure: the runtime OpenAI client
+        posts to base_url + /chat/completions, so when /v1 was missing from
+        the persisted base_url, every request hit the host's HTML frontend
+        and the model returned empty. The capture must persist the resolved URL.
+        """
+        runner = _make_runner()
+        source = _make_event(text="/login custom").source
+        captured: dict = {}
+        notify_calls: list[str] = []
+
+        async def _fake_notify(text):
+            notify_calls.append(text)
+
+        runner._make_login_notifier = lambda _src: _fake_notify
+
+        def _fake_save(pk, k, base_url, *a, **kw):
+            captured["base_url"] = base_url
+            return (True, "")
+
+        with patch("tools.clarify_gateway.wait_for_response", return_value="sk-fake"), \
+             patch("tools.clarify_gateway.pop_resolved_message_id", return_value=None), \
+             patch.object(runner, "_validate_api_key",
+                          return_value=(True, "ok", ["opteia-local"], "https://gw.example/v1")), \
+             patch.object(runner, "_pick_default_model", return_value="opteia-local"), \
+             patch.object(runner, "_save_api_key_provider", side_effect=_fake_save):
+            await runner._run_api_key_capture(
+                source, "sk", "cid", "custom", "Gw",
+                "https://gw.example", "", True)
+
+        # Saved base_url is the /v1-resolved form, not the bare host typed.
+        assert captured["base_url"] == "https://gw.example/v1"
+        # The correction is surfaced to the user (across all notify calls).
+        combined = "\n".join(notify_calls)
+        assert "https://gw.example/v1" in combined
+        assert "Normalized" in combined
+
 
 # ---------------------------------------------------------------------------
 # /login — sync helpers (custom config write, validation)
@@ -366,12 +406,33 @@ class TestApiKeyHelpers:
 
     def test_validate_api_key_returns_discovered_models(self):
         runner = _make_runner()
-        with patch("hermes_cli.models.fetch_api_models",
-                   return_value=["gpt-4o", "gpt-4o-mini", "glm-5"]):
-            ok, detail, models = runner._validate_api_key("custom:x", "k", "https://x/v1")
+        with patch("hermes_cli.models.probe_api_models",
+                   return_value={"models": ["gpt-4o", "gpt-4o-mini", "glm-5"],
+                                 "resolved_base_url": "https://x/v1"}):
+            ok, detail, models, resolved = runner._validate_api_key(
+                "custom:x", "k", "https://x/v1")
         assert ok is True
         assert detail == "ok"
         assert models == ["gpt-4o", "gpt-4o-mini", "glm-5"]
+        assert resolved == "https://x/v1"
+
+    def test_validate_api_key_normalizes_bare_host_to_v1(self):
+        """A bare host (no /v1) that only answers on /v1 resolves to the /v1 base.
+
+        Regression: the runtime OpenAI client posts to base_url + /chat/completions,
+        so without /v1 baked into the persisted base_url, requests hit the host's
+        HTML frontend and come back empty. The probe must surface the working form.
+        """
+        runner = _make_runner()
+        with patch("hermes_cli.models.probe_api_models",
+                   return_value={"models": ["opteia-local"],
+                                 "resolved_base_url": "https://gw.example/v1"}):
+            ok, detail, models, resolved = runner._validate_api_key(
+                "custom:x", "k", "https://gw.example")
+        assert ok is True
+        assert models == ["opteia-local"]
+        # /v1 form returned, NOT the bare host the user typed
+        assert resolved == "https://gw.example/v1"
 
     def test_validate_api_key_chat_fallback_yields_no_models(self):
         """When /models is gated but chat/completions works, key is valid, models empty."""
@@ -381,19 +442,22 @@ class TestApiKeyHelpers:
         client.__enter__ = MagicMock(return_value=client)
         client.__exit__ = MagicMock(return_value=False)
         client.post = MagicMock(return_value=resp)
-        with patch("hermes_cli.models.fetch_api_models", return_value=None), \
+        with patch("hermes_cli.models.probe_api_models", return_value={"models": None}), \
              patch("httpx.Client", return_value=client):
-            ok, detail, models = runner._validate_api_key("custom:x", "k", "https://x/v1")
+            ok, detail, models, resolved = runner._validate_api_key(
+                "custom:x", "k", "https://x/v1")
         assert ok is True
         assert models == []
         assert "chat/completions" in detail
+        assert resolved == "https://x/v1"
 
     def test_validate_api_key_no_base_url_skipped(self):
         runner = _make_runner()
-        ok, detail, models = runner._validate_api_key("zai", "k", "")
+        ok, detail, models, resolved = runner._validate_api_key("zai", "k", "")
         assert ok is True
         assert "skipped" in detail
         assert models == []
+        assert resolved == ""
 
 
 class TestPickDefaultModel:
