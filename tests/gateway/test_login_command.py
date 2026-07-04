@@ -71,9 +71,11 @@ class TestHandleLoginCommand:
 
     @pytest.mark.asyncio
     async def test_unimplemented_provider_hints_cli(self):
-        """A known provider without an in-chat flow points to the CLI."""
+        """A known provider without an in-chat flow (Phase B) points to the CLI."""
         runner = _make_runner()
-        result = await runner._handle_login_command(_make_event(text="/login nous"))
+        result = await runner._handle_login_command(
+            _make_event(text="/login google-gemini-cli")
+        )
         assert "isn't available in-chat" in result
         assert "hermes auth add" in result
 
@@ -234,3 +236,138 @@ class TestRunCodexLoginPoller:
         exchange.assert_not_called()
         assert adapter.send.await_count >= 1
         assert "Codex login failed" in adapter.send.await_args.args[1]
+
+
+# ---------------------------------------------------------------------------
+# /login — API-key + custom OpenAI-compatible endpoint flows
+# ---------------------------------------------------------------------------
+
+
+class TestApiKeyLoginFlow:
+    """Tests for the /login API-key and custom-endpoint flows."""
+
+    def setup_method(self):
+        from tools import clarify_gateway as cm
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+            cm._resolved_message_ids.clear()
+
+    @pytest.mark.asyncio
+    async def test_help_lists_apikey_providers(self):
+        runner = _make_runner()
+        result = await runner._handle_login_command(_make_event(text="/login"))
+        for pid in ("zai", "openai-api", "openrouter", "gemini", "custom", "openai-codex"):
+            assert pid in result
+
+    @pytest.mark.asyncio
+    async def test_apikey_provider_starts_capture(self):
+        """`/login zai` registers a clarify + spawns the capture task + prompts."""
+        runner = _make_runner()
+        event = _make_event(text="/login zai")
+        with _capture_create_task():
+            result = await runner._handle_login_command(event)
+        assert "Paste your" in result
+        assert "delete your message" in result
+        session_key = runner._session_key_for_source(event.source)
+        assert session_key in runner._pending_logins
+        assert runner._pending_logins[session_key]["flow"] == "api_key"
+        from tools import clarify_gateway as cm
+        assert cm.has_pending(session_key)  # clarify registered to capture the key
+
+    @pytest.mark.asyncio
+    async def test_custom_missing_args_shows_usage(self):
+        runner = _make_runner()
+        result = await runner._handle_login_command(
+            _make_event(text="/login custom url=https://x/v1")
+        )
+        assert "custom OpenAI-compatible" in result
+        assert "/login custom name=" in result
+        # Nothing registered when usage is shown.
+        assert runner._pending_logins == {}
+
+    @pytest.mark.asyncio
+    async def test_custom_with_inline_args_starts(self):
+        runner = _make_runner()
+        event = _make_event(text="/login custom name=My-Gw url=https://x/v1 model=gpt-4o")
+        with _capture_create_task():
+            result = await runner._handle_login_command(event)
+        assert "My-Gw" in result
+        session_key = runner._session_key_for_source(event.source)
+        assert session_key in runner._pending_logins
+        from tools import clarify_gateway as cm
+        assert cm.has_pending(session_key)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_apikey_login_rejected(self):
+        runner = _make_runner()
+        event = _make_event(text="/login zai")
+        session_key = runner._session_key_for_source(event.source)
+        runner._pending_logins[session_key] = {"provider": "zai"}
+        result = await runner._handle_login_command(event)
+        assert "already in progress" in result
+
+
+# ---------------------------------------------------------------------------
+# /login — sync helpers (custom config write, validation)
+# ---------------------------------------------------------------------------
+
+
+class TestApiKeyHelpers:
+    """Unit tests for the sync save/validate/config helpers."""
+
+    def test_ensure_custom_config_entry_appends(self):
+        runner = _make_runner()
+        saved = {}
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("hermes_cli.config.load_config", return_value={}), \
+             patch("hermes_cli.config.save_config", side_effect=lambda c: saved.update({"c": c})):
+            note = runner._ensure_custom_provider_config_entry("My Gw", "https://x/v1", "gpt-4o")
+        assert note == ""
+        cps = saved["c"]["custom_providers"]
+        assert len(cps) == 1
+        assert cps[0]["name"] == "My Gw"
+        assert cps[0]["base_url"] == "https://x/v1"
+        assert cps[0]["api_key"] == ""   # secret lives in the pool, never in config
+        assert cps[0]["model"] == "gpt-4o"
+
+    def test_ensure_custom_config_entry_dedups_by_name(self):
+        runner = _make_runner()
+        existing = {"custom_providers": [
+            {"name": "My Gw", "base_url": "https://old/v1", "api_key": "x"}
+        ]}
+        saved = {}
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("hermes_cli.config.load_config", return_value=existing), \
+             patch("hermes_cli.config.save_config", side_effect=lambda c: saved.update({"c": c})):
+            runner._ensure_custom_provider_config_entry("My-Gw", "https://new/v1", "gpt-4o")
+        cps = saved["c"]["custom_providers"]
+        assert len(cps) == 1  # updated in place, not appended
+        assert cps[0]["base_url"] == "https://new/v1"
+        assert cps[0]["api_key"] == ""
+
+    def test_ensure_custom_config_entry_managed_returns_snippet(self):
+        runner = _make_runner()
+        with patch("hermes_cli.config.is_managed", return_value=True):
+            note = runner._ensure_custom_provider_config_entry("My Gw", "https://x/v1", "gpt-4o")
+        assert "managed" in note.lower()
+        assert "custom_providers" in note
+        assert "https://x/v1" in note
+
+    def test_validate_api_key_models_ok(self):
+        runner = _make_runner()
+        resp = MagicMock(status_code=200)
+        client = MagicMock()
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+        client.get = MagicMock(return_value=resp)
+        with patch("httpx.Client", return_value=client):
+            ok, detail = runner._validate_api_key("custom:x", "k", "https://x/v1")
+        assert ok is True
+        assert detail == "ok"
+
+    def test_validate_api_key_no_base_url_skipped(self):
+        runner = _make_runner()
+        ok, detail = runner._validate_api_key("zai", "k", "")
+        assert ok is True
+        assert "skipped" in detail
