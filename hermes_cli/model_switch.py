@@ -1603,6 +1603,40 @@ def list_authenticated_providers(
             if not raw_name or not api_url:
                 continue
             api_key = (entry.get("api_key") or "").strip()
+            if not api_key:
+                # The secret may live in the credential pool rather than inline
+                # in config — notably for endpoints added via in-chat
+                # ``/login custom``, which writes ``api_key: ""`` and stores the
+                # real key under ``custom:<name>``. Resolve it here so we can
+                # live-discover the model catalog on /model (matching how
+                # ``providers:`` entries with an inline key already behave);
+                # otherwise /model only ever shows the static ``models:``
+                # snapshot captured at login time, and models added on the
+                # gateway later never appear. Same resolution path the runtime
+                # uses to actually call these endpoints.
+                try:
+                    from agent.credential_pool import (
+                        get_custom_provider_pool_key,
+                        load_pool,
+                    )
+                    _pool_key = get_custom_provider_pool_key(
+                        api_url, provider_name=raw_name
+                    )
+                    if _pool_key:
+                        _pool = load_pool(_pool_key)
+                        _sel = (
+                            _pool.select()
+                            if _pool and _pool.has_credentials()
+                            else None
+                        )
+                        if _sel is not None:
+                            api_key = (
+                                getattr(_sel, "runtime_api_key", None)
+                                or getattr(_sel, "access_token", "")
+                                or ""
+                            )
+                except Exception:
+                    pass
 
             group_key = (api_url, api_key)
             if group_key not in groups:
@@ -1707,11 +1741,13 @@ def list_authenticated_providers(
             # auth.  The CLI's _model_flow_named_custom always probes, so
             # the Telegram/Discord picker should do the same for parity.
             # Live-discovery policy:
-            # - With an api_key, the user has explicitly opted into the
-            #   endpoint and live /models is the source of truth — replace
-            #   the (possibly partial) ``models:`` subset configured for
-            #   context-length overrides with the full live catalog.
-            #   This is the Bifrost / aggregator-gateway case.
+            # - With an api_key (inline in config OR resolved above from the
+            #   credential pool — e.g. an endpoint added via /login custom),
+            #   the user has explicitly opted into the endpoint and live
+            #   /models is the source of truth — replace the (possibly partial)
+            #   ``models:`` subset configured for context-length overrides with
+            #   the full live catalog. This is the Bifrost / aggregator-gateway
+            #   case, and keeps /model current as models are added/removed.
             # - Without an api_key but with an explicit ``models:`` list
             #   (or top-level ``model:``), the user is narrowing a public
             #   endpoint to a specific subset (e.g. ollama.com /v1/models
