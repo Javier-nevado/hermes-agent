@@ -52,6 +52,16 @@ services:
       - ABI_MEMORY_DECAY_ENABLED=${ABI_MEMORY_DECAY_ENABLED:-false}
       - ABI_MEMORY_RERANK_ENABLED=${ABI_MEMORY_RERANK_ENABLED:-false}
       - ABI_MEMORY_RERANK_TOPN=${ABI_MEMORY_RERANK_TOPN:-20}
+      # Auto-extraction feature flags (PR 3). Off by default — opt in per-deploy.
+      # auto_extract: background-mine each turn into abi_memories (source_type=
+      #   'auto_extraction'). Runs in this container; agents post turns to /turns/ingest.
+      # min_importance: 'low|medium|high' or a 0..1 float — candidates below this floor
+      #   are dropped (default medium=0.6).
+      # dedup_threshold: cross-encoder/cosine score above which a candidate is a dup.
+      - ABI_MEMORY_AUTO_EXTRACT_ENABLED=${ABI_MEMORY_AUTO_EXTRACT_ENABLED:-false}
+      - ABI_MEMORY_EXTRACT_MIN_IMPORTANCE=${ABI_MEMORY_EXTRACT_MIN_IMPORTANCE:-medium}
+      - ABI_MEMORY_EXTRACT_DEDUP_THRESHOLD=${ABI_MEMORY_EXTRACT_DEDUP_THRESHOLD:-0.85}
+      - ABI_EXTRACTION_DB_PATH=${ABI_EXTRACTION_DB_PATH:-}
     networks:
       - opteia-net
     depends_on:
