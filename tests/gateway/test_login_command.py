@@ -316,58 +316,111 @@ class TestApiKeyLoginFlow:
 class TestApiKeyHelpers:
     """Unit tests for the sync save/validate/config helpers."""
 
-    def test_ensure_custom_config_entry_appends(self):
+    def test_ensure_custom_config_entry_appends_with_models(self):
         runner = _make_runner()
         saved = {}
         with patch("hermes_cli.config.is_managed", return_value=False), \
              patch("hermes_cli.config.load_config", return_value={}), \
              patch("hermes_cli.config.save_config", side_effect=lambda c: saved.update({"c": c})):
-            note = runner._ensure_custom_provider_config_entry("My Gw", "https://x/v1", "gpt-4o")
+            note = runner._ensure_custom_provider_config_entry(
+                "My Gw", "https://x/v1", "gpt-4o", ["gpt-4o", "gpt-4o-mini"]
+            )
         assert note == ""
         cps = saved["c"]["custom_providers"]
         assert len(cps) == 1
         assert cps[0]["name"] == "My Gw"
         assert cps[0]["base_url"] == "https://x/v1"
         assert cps[0]["api_key"] == ""   # secret lives in the pool, never in config
-        assert cps[0]["model"] == "gpt-4o"
+        assert cps[0]["model"] == "gpt-4o"                       # chosen default
+        assert cps[0]["models"] == {"gpt-4o": {}, "gpt-4o-mini": {}}  # full catalog
 
-    def test_ensure_custom_config_entry_dedups_by_name(self):
+    def test_ensure_custom_config_entry_dedups_and_refreshes_models(self):
         runner = _make_runner()
         existing = {"custom_providers": [
-            {"name": "My Gw", "base_url": "https://old/v1", "api_key": "x"}
+            {"name": "My Gw", "base_url": "https://old/v1", "api_key": "x",
+             "models": {"old-model": {}}}
         ]}
         saved = {}
         with patch("hermes_cli.config.is_managed", return_value=False), \
              patch("hermes_cli.config.load_config", return_value=existing), \
              patch("hermes_cli.config.save_config", side_effect=lambda c: saved.update({"c": c})):
-            runner._ensure_custom_provider_config_entry("My-Gw", "https://new/v1", "gpt-4o")
+            runner._ensure_custom_provider_config_entry(
+                "My-Gw", "https://new/v1", "gpt-4o", ["gpt-4o", "glm-5"]
+            )
         cps = saved["c"]["custom_providers"]
         assert len(cps) == 1  # updated in place, not appended
         assert cps[0]["base_url"] == "https://new/v1"
         assert cps[0]["api_key"] == ""
+        assert cps[0]["models"] == {"gpt-4o": {}, "glm-5": {}}  # refreshed on re-login
 
     def test_ensure_custom_config_entry_managed_returns_snippet(self):
         runner = _make_runner()
         with patch("hermes_cli.config.is_managed", return_value=True):
-            note = runner._ensure_custom_provider_config_entry("My Gw", "https://x/v1", "gpt-4o")
+            note = runner._ensure_custom_provider_config_entry(
+                "My Gw", "https://x/v1", "gpt-4o", ["gpt-4o"]
+            )
         assert "managed" in note.lower()
         assert "custom_providers" in note
         assert "https://x/v1" in note
+        assert "models:" in note  # snippet lists the discovered models
 
-    def test_validate_api_key_models_ok(self):
+    def test_validate_api_key_returns_discovered_models(self):
+        runner = _make_runner()
+        with patch("hermes_cli.models.fetch_api_models",
+                   return_value=["gpt-4o", "gpt-4o-mini", "glm-5"]):
+            ok, detail, models = runner._validate_api_key("custom:x", "k", "https://x/v1")
+        assert ok is True
+        assert detail == "ok"
+        assert models == ["gpt-4o", "gpt-4o-mini", "glm-5"]
+
+    def test_validate_api_key_chat_fallback_yields_no_models(self):
+        """When /models is gated but chat/completions works, key is valid, models empty."""
         runner = _make_runner()
         resp = MagicMock(status_code=200)
         client = MagicMock()
         client.__enter__ = MagicMock(return_value=client)
         client.__exit__ = MagicMock(return_value=False)
-        client.get = MagicMock(return_value=resp)
-        with patch("httpx.Client", return_value=client):
-            ok, detail = runner._validate_api_key("custom:x", "k", "https://x/v1")
+        client.post = MagicMock(return_value=resp)
+        with patch("hermes_cli.models.fetch_api_models", return_value=None), \
+             patch("httpx.Client", return_value=client):
+            ok, detail, models = runner._validate_api_key("custom:x", "k", "https://x/v1")
         assert ok is True
-        assert detail == "ok"
+        assert models == []
+        assert "chat/completions" in detail
 
     def test_validate_api_key_no_base_url_skipped(self):
         runner = _make_runner()
-        ok, detail = runner._validate_api_key("zai", "k", "")
+        ok, detail, models = runner._validate_api_key("zai", "k", "")
         assert ok is True
         assert "skipped" in detail
+        assert models == []
+
+
+class TestPickDefaultModel:
+    """Tests for GatewayRunner._pick_default_model heuristic."""
+
+    def test_prefers_smart_model_over_weaker_variants(self):
+        runner = _make_runner()
+        # Shortest "gpt-4o" match wins over "gpt-4o-mini".
+        chosen = runner._pick_default_model(["gpt-3.5-turbo", "gpt-4o-mini", "gpt-4o"])
+        assert chosen == "gpt-4o"
+
+    def test_honours_explicit_preferred_when_present(self):
+        runner = _make_runner()
+        chosen = runner._pick_default_model(["gpt-4o", "gpt-4o-mini"], preferred="gpt-4o-mini")
+        assert chosen == "gpt-4o-mini"
+
+    def test_preferred_not_in_list_falls_back_to_heuristic(self):
+        runner = _make_runner()
+        chosen = runner._pick_default_model(["gpt-4o", "llama-3"], preferred="does-not-exist")
+        assert chosen == "gpt-4o"  # caller separately warns preferred isn't available
+
+    def test_alphabetical_fallback_when_no_pref_matches(self):
+        runner = _make_runner()
+        chosen = runner._pick_default_model(["zephyr-alpha", "alpha-model"])
+        assert chosen == "alpha-model"
+
+    def test_empty_list_returns_preferred_or_blank(self):
+        runner = _make_runner()
+        assert runner._pick_default_model([], preferred="") == ""
+        assert runner._pick_default_model([], preferred="x") == "x"

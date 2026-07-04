@@ -12084,8 +12084,11 @@ class GatewayRunner:
                 return (
                     "📌 *Add a custom OpenAI-compatible endpoint*\n\n"
                     "Usage:\n"
-                    "`/login custom name=My-Gateway url=https://host/v1 model=gpt-4o`\n\n"
-                    "Then paste the API key in your next message — I'll delete it.\n"
+                    "`/login custom name=My-Gateway url=https://host/v1`\n"
+                    "_(optional)_ `model=gpt-4o` _to override the auto-picked default._\n\n"
+                    "I'll read the available models from the endpoint, register them all, "
+                    "and you can switch between them with `/model`.\n"
+                    "Then paste the API key — I'll delete it after reading.\n"
                     "_Tip: avoid spaces in `name`; use hyphens._"
                 )
             label = name
@@ -12179,19 +12182,49 @@ class GatewayRunner:
             f"custom:{_normalize_custom_pool_name(label)}" if custom else provider_id
         )
 
-        # 4. Validate (best-effort) + persist, both off the loop.
-        ok, detail = await asyncio.to_thread(self._validate_api_key, pool_key, key, base_url)
+        # 4. Validate (best-effort — also discovers models) + persist, off-loop.
+        ok, detail, models = await asyncio.to_thread(
+            self._validate_api_key, pool_key, key, base_url
+        )
+        # Pick the default model: honour an explicit model= arg, else a
+        # heuristic over the discovered list. ``default_model`` is "" only
+        # when we couldn't enumerate AND the user gave none (flagged below).
+        warned_model = ""
+        if custom:
+            default_model = self._pick_default_model(models, preferred=model)
+            if model and models and model not in models:
+                warned_model = (
+                    f"_{model} isn't in the endpoint's model list; "
+                    f"defaulted to `{default_model}`._\n"
+                )
+        else:
+            default_model = model
         saved, save_note = await asyncio.to_thread(
-            self._save_api_key_provider, pool_key, key, base_url, model, custom, label
+            self._save_api_key_provider, pool_key, key, base_url,
+            default_model, custom, label, models,
         )
 
         try:
             if saved and ok:
-                pick = (
-                    "Use `/model` and pick the new endpoint to switch to it."
-                    if custom else
-                    f"Use `/model --provider {provider_id}` to switch to it."
-                )
+                if custom:
+                    if models:
+                        shown = ", ".join(f"`{m}`" for m in models[:8])
+                        more = f" …(+{len(models) - 8} more)" if len(models) > 8 else ""
+                        pick = (
+                            f"{warned_model}"
+                            f"Found *{len(models)}* models; default set to "
+                            f"`{default_model}`. Use `/model` to switch.\n"
+                            f"_Available: {shown}{more}_"
+                        )
+                    else:
+                        pick = (
+                            f"{warned_model}"
+                            "I couldn't read the model list from this endpoint. "
+                            "Set one with `/model`, or re-run "
+                            f"`/login custom name={label} url={base_url} model=<id>`."
+                        )
+                else:
+                    pick = f"Use `/model --provider {provider_id}` to switch to it."
                 await notify(f"✅ *{label}* connected. Credential saved.\n{pick}")
             elif saved and not ok:
                 await notify(
@@ -12217,13 +12250,15 @@ class GatewayRunner:
         model: str,
         custom: bool,
         name: str,
+        models: list[str] = None,
     ) -> tuple[bool, str]:
         """Persist an API-key credential (port of auth_commands.py API-key branch).
 
         For custom providers, also ensure a config.yaml ``custom_providers:``
-        entry exists so ``/model`` can list + select the endpoint. Returns
-        ``(ok, note)`` where ``note`` is "" on clean success or follow-up
-        instructions (e.g. managed-box manual edit).
+        entry exists — with the discovered ``models:`` dict populated — so
+        ``/model`` can list + select the endpoint. Returns ``(ok, note)``
+        where ``note`` is "" on clean success or follow-up instructions
+        (e.g. managed-box manual edit).
         """
         import uuid
         from agent.credential_pool import (
@@ -12254,14 +12289,19 @@ class GatewayRunner:
 
         note = ""
         if custom:
-            note = self._ensure_custom_provider_config_entry(name, base_url, model)
+            note = self._ensure_custom_provider_config_entry(name, base_url, model, models)
         return True, note
 
     def _ensure_custom_provider_config_entry(
-        self, name: str, base_url: str, model: str
+        self, name: str, base_url: str, model: str, models: list[str] = None
     ) -> str:
         """Append/update a ``custom_providers:`` config entry (dedup by name).
 
+        Writes the discovered ``models:`` dict (``{id: {}}``) so ``/model``
+        lists every model the endpoint exposes without needing to live-probe
+        (the secret lives in the pool, not in ``api_key``, so the picker can't
+        authenticate to ``/models`` — the static list is the source of truth).
+        Sets ``model:`` to the chosen default. Re-login refreshes the list.
         Returns "" on clean success, otherwise instructions the user must
         follow (managed box, or write failure) — the credential is already saved.
         """
@@ -12270,10 +12310,16 @@ class GatewayRunner:
 
         norm = _normalize_custom_pool_name(name)
         url = base_url.rstrip("/")
+        models_dict = {m: {} for m in models} if models else {}
 
         def _snippet() -> str:
             model_line = f'\n  model: "{model}"' if model else ""
-            return f'name: "{name}"\n  base_url: "{url}"\n  api_key: ""{model_line}'
+            models_line = ""
+            if models:
+                models_line = "\n  models:"
+                for m in models:
+                    models_line += f'\n    "{m}": {{}}'
+            return f'name: "{name}"\n  base_url: "{url}"\n  api_key: ""{model_line}{models_line}'
 
         if is_managed():
             return (
@@ -12294,12 +12340,16 @@ class GatewayRunner:
                 if _normalize_custom_pool_name(str(entry.get("name", ""))) == norm:
                     entry["base_url"] = url
                     entry["api_key"] = ""
+                    if models_dict:
+                        entry["models"] = models_dict
                     if model:
                         entry["model"] = model
                     updated = True
                     break
             if not updated:
                 new_entry: dict[str, Any] = {"name": name, "base_url": url, "api_key": ""}
+                if models_dict:
+                    new_entry["models"] = models_dict
                 if model:
                     new_entry["model"] = model
                 cps.append(new_entry)
@@ -12314,31 +12364,74 @@ class GatewayRunner:
                 "```yaml\n- " + _snippet() + "\n```"
             )
 
+    # Preference order for auto-picking a custom provider's default model when
+    # the user doesn't pass ``model=``. First substring match (case-insensitive)
+    # against the endpoint's discovered list wins; among matches the SHORTEST id
+    # is chosen (base model over variants, e.g. ``gpt-4o`` over ``gpt-4o-mini``).
+    # If nothing matches, the alphabetically-first model is used. Goal: a freshly
+    # connected endpoint works out-of-the-box; the user can ``/model`` to refine.
+    _DEFAULT_MODEL_PREFS = (
+        "gpt-5", "gpt-4.1", "gpt-4o", "gpt-4",
+        "claude-opus", "claude-sonnet", "claude-3",
+        "glm-5", "glm-4",
+        "gemini-2", "gemini-1.5",
+        "deepseek", "qwen3", "qwen", "llama-3", "llama",
+    )
+
+    def _pick_default_model(
+        self, models: list[str], preferred: str = ""
+    ) -> str:
+        """Choose the default model id from a discovered list.
+
+        Honours an explicit ``preferred`` id when it's present in the list.
+        Otherwise picks the first ``_DEFAULT_MODEL_PREFS`` substring match
+        (shortest id wins among matches), else the alphabetically-first id.
+        Returns "" only when the list is empty and no preferred id was given.
+        """
+        if preferred and preferred in models:
+            return preferred
+        if not models:
+            return preferred or ""
+        lowered = [m.lower() for m in models]
+        for pref in self._DEFAULT_MODEL_PREFS:
+            matches = [models[i] for i, ml in enumerate(lowered) if pref in ml]
+            if matches:
+                return min(matches, key=len)
+        return sorted(models)[0]
+
     def _validate_api_key(
         self, pool_key: str, key: str, base_url: str
-    ) -> tuple[bool, str]:
-        """Best-effort key validation: ``GET {base_url}/models`` with the key.
+    ) -> tuple[bool, str, list[str]]:
+        """Best-effort key validation + model discovery.
 
+        Probes ``GET {base_url}/models`` via ``fetch_api_models`` — the SAME
+        helper ``/model`` uses, so URL heuristics (with/without ``/v1``) and
+        ``data[].id`` parsing stay consistent — and returns the discovered
+        model IDs so the caller can register them under ``custom_providers``.
         Falls back to a 1-token ``chat/completions`` probe when ``/models`` is
-        gated. Returns ``(ok, detail)``. Never raises — validation failure is
+        gated (returns an empty model list in that case — key is valid but the
+        catalog can't be enumerated).
+
+        Returns ``(ok, detail, models)``. Never raises — validation failure is
         reported, not fatal (the credential is still saved).
         """
         if not base_url:
-            return True, "skipped (no base_url to probe)"
+            return True, "skipped (no base_url to probe)", []
 
+        from hermes_cli.models import fetch_api_models
+
+        try:
+            discovered = fetch_api_models(key, base_url, timeout=15.0)
+        except Exception:
+            discovered = None
+        if discovered:
+            return True, "ok", list(discovered)
+
+        # Fallback: a 1-token chat completion (some gateways gate /models).
         import httpx
 
         headers = {"Authorization": f"Bearer {key}"}
         root = base_url.rstrip("/")
-        try:
-            with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-                resp = client.get(root + "/models", headers=headers)
-            if 200 <= resp.status_code < 300:
-                return True, "ok"
-        except Exception as exc:
-            return False, f"models probe failed: {exc}"
-
-        # Fallback: a 1-token chat completion (some gateways gate /models).
         try:
             with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
                 cr = client.post(
@@ -12351,10 +12444,10 @@ class GatewayRunner:
                     },
                 )
             if 200 <= cr.status_code < 300:
-                return True, "ok (chat/completions)"
-            return False, f"HTTP {cr.status_code}"
+                return True, "ok (chat/completions)", []
+            return False, f"HTTP {cr.status_code}", []
         except Exception as exc:
-            return False, str(exc)
+            return False, str(exc), []
 
     async def _login_list(self) -> str:
         """List providers with saved credentials in the auth store."""
