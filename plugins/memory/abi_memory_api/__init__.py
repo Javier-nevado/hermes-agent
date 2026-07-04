@@ -21,6 +21,10 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
 # Identical tool schemas to ABIMemoryProvider — ensures seamless swap
 RECALL_SCHEMA = {
     "name": "abi_recall",
@@ -153,6 +157,42 @@ class ABIMemoryApiClient(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Post the completed turn for background auto-extraction (PR 3).
+
+        Non-blocking in the only way that matters: the server *enqueues* and
+        returns immediately — the heavy extraction runs off-path in the
+        abi-memory-api worker. The POST itself has a 2s safety cap and swallows
+        all errors so a memory-side hiccup can never break an agent turn. No-op
+        unless ``ABI_MEMORY_AUTO_EXTRACT_ENABLED`` is set on the agent side.
+        """
+        if not self._client:
+            return
+        if not _env_bool("ABI_MEMORY_AUTO_EXTRACT_ENABLED"):
+            return
+        try:
+            self._client.post(
+                "/turns/ingest",
+                json={
+                    "agent_name": self._agent_name,
+                    "user_content": user_content or "",
+                    "assistant_content": assistant_content or "",
+                    "session_id": session_id or self._session_id,
+                    "user_id": self._user_id,
+                    "clearance": self._clearance,
+                },
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.debug("turns/ingest post failed (non-fatal): %s", exc)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA]

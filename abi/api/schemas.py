@@ -17,6 +17,34 @@ class RememberRequest(BaseModel):
     agent_name: Optional[str] = None
     user_id: Optional[str] = None
     clearance: str = "internal"
+    # PR 3 — provenance + classification (auto-extraction / backfill). Optional;
+    # omitted = today's behaviour (source_type 'api', no type/importance set).
+    source_type: Optional[str] = Field(
+        None, pattern="^(api|agent_tool|auto_extraction|session_mined|migration|identity)$"
+    )
+    memory_type: Optional[str] = Field(
+        None, pattern="^(preference|decision|fact|event|identity|other)$"
+    )
+    importance: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+
+class TurnIngestRequest(BaseModel):
+    """A completed conversation turn, posted by the abi_memory_api client.
+
+    The server enqueues it for background extraction and returns immediately —
+    extraction never blocks the agent's turn (sync_turn is on the request path).
+    """
+    agent_name: str
+    user_content: str = ""
+    assistant_content: str = ""
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    clearance: str = "internal"
+
+
+class TurnIngestResponse(BaseModel):
+    status: str  # "queued" | "disabled"
+    queued: int
 
 
 class RememberResponse(BaseModel):

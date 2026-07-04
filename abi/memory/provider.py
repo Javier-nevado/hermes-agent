@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
+
+def _float_env(name: str, default: float) -> float:
+    """Resolve an importance-like env var ('low|medium|high' or a float)."""
+    raw = os.environ.get(name, "").strip().lower()
+    levels = {"low": 0.4, "medium": 0.6, "high": 0.75}
+    if raw in levels:
+        return levels[raw]
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return default
+
 # Tool schemas (OpenAI function calling format)
 RECALL_SCHEMA = {
     "name": "abi_recall",
@@ -115,6 +127,13 @@ class ABIMemoryProvider(MemoryProvider):
         self._embed_fn = None
         self._entity_extractor = EntityExtractor()
         self._turn_count: int = 0
+        # Auto-extraction (PR 3) — agent-side queue for direct-Postgres deployments.
+        # .19 uses the abi_memory_api HTTP path instead; this is parity for "abi_memory".
+        self._db_url: str = ""
+        self._extraction_queue = None
+        self._auto_extract_enabled: bool = False
+        self._extract_min_importance: float = 0.6
+        self._extract_dedup_threshold: float = 0.85
 
     @property
     def name(self) -> str:
@@ -146,6 +165,7 @@ class ABIMemoryProvider(MemoryProvider):
             "ABI_DATABASE_URL",
             "postgresql://abi_agent:abi_local_dev_2026@localhost:5432/abi_memory"
         )
+        self._db_url = db_url
 
         try:
             self._conn = psycopg2.connect(db_url)
@@ -187,6 +207,14 @@ class ABIMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("Reranker init failed, reranking disabled: %s", e)
                 self._reranker = None
+
+        # Auto-extraction (PR 3). Disabled by default — opt in via env. The worker
+        # opens its own connection per turn so it never contends with self._conn.
+        self._auto_extract_enabled = _env_bool("ABI_MEMORY_AUTO_EXTRACT_ENABLED")
+        self._extract_min_importance = _float_env("ABI_MEMORY_EXTRACT_MIN_IMPORTANCE", 0.6)
+        self._extract_dedup_threshold = _float_env("ABI_MEMORY_EXTRACT_DEDUP_THRESHOLD", 0.85)
+        if self._auto_extract_enabled and self._db_url:
+            self._start_extraction_queue(hermes_home)
 
     def _probe_column(self, column: str) -> bool:
         """True if ``column`` exists on abi_memories (no-op if DB unavailable)."""
@@ -381,6 +409,63 @@ class ABIMemoryProvider(MemoryProvider):
             logger.error("Recall failed: %s", e)
             return json.dumps({"error": f"Recall failed: {e}"})
 
+    def _persist_memory(self, conn, plaintext, *, agent_name, user_id, dlp_level,
+                        source_type="agent_tool", memory_type=None, importance=None):
+        """Single write path: INSERT + optional type/importance + entities + supersession.
+
+        Shared by ``abi_remember`` (interactive) and the auto-extraction worker.
+        ``conn`` is taken explicitly so the worker can pass a connection of its
+        own — the provider's ``self._conn`` must not be used off-thread (psycopg2
+        sync connections are not safe for concurrent cursor use). Returns
+        ``(memory_id, entity_count, edge_count, superseded_count)``.
+        """
+        embedding = None
+        if self._embed_fn:
+            embedding = self._embed_fn(plaintext)
+        memory_id = str(uuid.uuid4())
+
+        with conn.cursor() as cur:
+            if embedding:
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
+                    VALUES (%s, %s, %s::vector, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    [memory_id, plaintext, str(embedding), dlp_level, agent_name, user_id, source_type],
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    [memory_id, plaintext, dlp_level, agent_name, user_id, source_type],
+                )
+
+            # Optional importance/memory_type (005 migration) — one cheap UPDATE.
+            if getattr(self, "_has_importance", False) and (memory_type is not None or importance is not None):
+                sets, vals = [], []
+                if memory_type is not None:
+                    sets.append("memory_type = %s")
+                    vals.append(memory_type)
+                if importance is not None:
+                    sets.append("importance = %s")
+                    vals.append(float(importance))
+                vals.append(memory_id)
+                cur.execute(f"UPDATE abi_memories SET {', '.join(sets)} WHERE id = %s", vals)
+
+        entity_count = edge_count = superseded_count = 0
+        try:
+            entities = self._entity_extractor.extract(plaintext)
+            if entities:
+                entity_count, edge_count = self._store_entities(memory_id, entities, plaintext, conn=conn)
+                superseded_count = self._supersede_old_memories(memory_id, entities, agent_name=agent_name, conn=conn)
+        except Exception as e:
+            logger.warning("Entity extraction failed for memory %s: %s", memory_id, e)
+        return memory_id, entity_count, edge_count, superseded_count
+
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         """Store a memory with DLP classification."""
         if not self._conn:
@@ -395,45 +480,10 @@ class ABIMemoryProvider(MemoryProvider):
             dlp_level = "confidential" if has_pii else "internal"
 
         try:
-            embedding = None
-            if self._embed_fn:
-                embedding = self._embed_fn(content)
-
-            memory_id = str(uuid.uuid4())
-
-            with self._conn.cursor() as cur:
-                if embedding:
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
-                        VALUES (%s, %s, %s::vector, %s, %s, %s, 'agent_tool')
-                        RETURNING id
-                        """,
-                        [memory_id, content, str(embedding), dlp_level, self._agent_name, self._user_id],
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
-                        VALUES (%s, %s, %s, %s, %s, 'agent_tool')
-                        RETURNING id
-                        """,
-                        [memory_id, content, dlp_level, self._agent_name, self._user_id],
-                    )
-
-            # Extract and store entities
-            entity_count = 0
-            edge_count = 0
-            superseded_count = 0
-            try:
-                entities = self._entity_extractor.extract(content)
-                if entities:
-                    entity_count, edge_count = self._store_entities(memory_id, entities, content)
-                    # Temporal supersession: find older memories about same entities
-                    superseded_count = self._supersede_old_memories(memory_id, entities)
-            except Exception as e:
-                logger.warning("Entity extraction failed for memory %s: %s", memory_id, e)
-
+            memory_id, entity_count, edge_count, superseded_count = self._persist_memory(
+                self._conn, content,
+                agent_name=self._agent_name, user_id=self._user_id, dlp_level=dlp_level,
+            )
             return json.dumps({
                 "status": "remembered",
                 "memory_id": memory_id,
@@ -442,18 +492,18 @@ class ABIMemoryProvider(MemoryProvider):
                 "edges": edge_count,
                 "superseded": superseded_count,
             })
-
         except Exception as e:
             logger.error("Remember failed: %s", e)
             return json.dumps({"error": f"Remember failed: {e}"})
 
-    def _store_entities(self, memory_id: str, entities: list, content: str) -> tuple:
+    def _store_entities(self, memory_id: str, entities: list, content: str, *, conn=None) -> tuple:
         """Store extracted entities and their relations for a memory."""
-        if not self._conn:
+        c = conn or self._conn
+        if not c:
             return 0, 0
 
         entity_ids = {}
-        with self._conn.cursor() as cur:
+        with c.cursor() as cur:
             for entity in entities:
                 # Upsert entity (ON CONFLICT DO NOTHING on name+type)
                 cur.execute(
@@ -485,7 +535,7 @@ class ABIMemoryProvider(MemoryProvider):
 
         return len(entity_ids), len(edges)
 
-    def _supersede_old_memories(self, new_memory_id: str, entities: list) -> int:
+    def _supersede_old_memories(self, new_memory_id: str, entities: list, *, agent_name: str = None, conn=None) -> int:
         """Mark older memories about the same entities as superseded.
 
         Only supersedes if:
@@ -493,12 +543,14 @@ class ABIMemoryProvider(MemoryProvider):
         - Old memory is from the same agent
         - Old memory doesn't already have a superseded_by value
         """
-        if not self._conn or len(entities) < 2:
+        c = conn or self._conn
+        aname = agent_name or self._agent_name
+        if not c or len(entities) < 2:
             return 0
 
         entity_names = [e.name.lower() for e in entities]
         try:
-            with self._conn.cursor() as cur:
+            with c.cursor() as cur:
                 # Find entity IDs (as strings)
                 cur.execute(
                     "SELECT id::text FROM abi_entities WHERE lower(name) = ANY(%s)",
@@ -531,7 +583,7 @@ class ABIMemoryProvider(MemoryProvider):
                            WHERE m1.id::text = %s AND m2.id::text = %s
                            AND m1.agent_name = %s
                            AND m1.superseded_by IS NULL""",
-                        [str(old_id), new_memory_id, self._agent_name],
+                        [str(old_id), new_memory_id, aname],
                     )
                     sim_row = cur.fetchone()
                     if sim_row and sim_row[0] and float(sim_row[0]) > 0.75:
@@ -620,12 +672,84 @@ class ABIMemoryProvider(MemoryProvider):
         except Exception as e:
             return json.dumps({"error": f"Forget failed: {e}"})
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Auto-extract and store notable facts after each turn (background)."""
-        if not self._conn:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None) -> None:
+        """Auto-extract and store notable facts after each turn (PR 3, background).
+
+        Enqueues the turn into the durable extraction queue and returns immediately
+        — ``sync_turn`` is called synchronously on the turn path, so it must not
+        block. The worker (off-thread, own connection) runs the extraction pipeline.
+        No-op unless ``ABI_MEMORY_AUTO_EXTRACT_ENABLED`` is set.
+        """
+        if not self._extraction_queue:
             return
-        # TODO: Implement smart extraction — for now, turns are recalled via explicit remember
-        pass
+        try:
+            self._extraction_queue.enqueue({
+                "agent_name": self._agent_name,
+                "user_id": self._user_id,
+                "user_content": user_content or "",
+                "assistant_content": assistant_content or "",
+                "session_id": session_id or self._session_id,
+                "clearance": self._clearance,
+            })
+        except Exception as exc:
+            logger.debug("sync_turn enqueue failed (non-fatal): %s", exc)
+
+    def _start_extraction_queue(self, hermes_home: str) -> None:
+        """Build the durable queue + worker for agent-side auto-extraction."""
+        try:
+            from pathlib import Path
+            from .extraction_queue import ExtractionQueue
+            from .model_cache import get_cache_root
+
+            db_path = os.environ.get("ABI_EXTRACTION_DB_PATH")
+            if not db_path:
+                db_path = str(Path(get_cache_root(hermes_home)).parent / "abi_extraction.db")
+            self._extraction_queue = ExtractionQueue(db_path, self._build_extraction_processor())
+            logger.info("ABI memory auto-extraction queue started (db=%s)", db_path)
+        except Exception as exc:
+            logger.error("Auto-extraction queue start failed: %s", exc)
+            self._extraction_queue = None
+
+    def _build_extraction_processor(self):
+        """Return the ``(payload)->None`` closure the agent-side worker calls per turn.
+
+        Each turn opens a dedicated connection (used for dedup reads); each saved
+        candidate opens its own short-lived connection for the write — neither
+        touches ``self._conn``, so the worker never contends with live turns.
+        """
+        from .extractor import process_turn
+
+        db_url = self._db_url
+        reranker = self._reranker if self._rerank_enabled else None
+        embed_fn = self._embed_fn
+        min_importance = self._extract_min_importance
+        dedup_threshold = self._extract_dedup_threshold
+
+        def writer(content, agent_name, user_id, *, dlp_level=None, memory_type=None, importance=None):
+            conn = psycopg2.connect(db_url)
+            try:
+                conn.autocommit = True
+                dlp = dlp_level or ("confidential" if classify_pii(content) else "internal")
+                mem_id, _e, _ed, _s = self._persist_memory(
+                    conn, content, agent_name=agent_name, user_id=user_id, dlp_level=dlp,
+                    source_type="auto_extraction", memory_type=memory_type, importance=importance,
+                )
+                return mem_id
+            finally:
+                conn.close()
+
+        def processor(payload):
+            conn = psycopg2.connect(db_url)
+            try:
+                conn.autocommit = True
+                process_turn(
+                    payload, conn=conn, embed_fn=embed_fn, reranker=reranker, encryptor=None,
+                    writer=writer, dedup_threshold=dedup_threshold, min_importance=min_importance,
+                )
+            finally:
+                conn.close()
+
+        return processor
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Prefetch relevant memories for the upcoming turn.
@@ -675,7 +799,13 @@ class ABIMemoryProvider(MemoryProvider):
         return "\n\n".join(parts) if parts else ""
 
     def shutdown(self) -> None:
-        """Close PostgreSQL connection."""
+        """Stop the extraction worker, then close the PostgreSQL connection."""
+        if self._extraction_queue is not None:
+            try:
+                self._extraction_queue.shutdown()
+            except Exception:
+                pass
+            self._extraction_queue = None
         if self._conn:
             try:
                 self._conn.close()

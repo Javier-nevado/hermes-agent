@@ -7,22 +7,34 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from .deps import init_deps, init_license, get_license_manager, get_pool, init_encryptor
+from .deps import (
+    init_deps,
+    init_license,
+    get_license_manager,
+    get_pool,
+    init_encryptor,
+    init_extraction_queue,
+    shutdown_extraction_queue,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: initialize DB pool, embeddings, entity extractor, license."""
+    """Startup: initialize DB pool, embeddings, entity extractor, license, extraction queue."""
     init_deps()
     init_license()
     mgr = get_license_manager()
     await mgr.start_refresh()
     init_encryptor()
+    # Auto-extraction queue last — it depends on the pool/encryptor/reranker being up.
+    # No-op (and never fatal) when ABI_MEMORY_AUTO_EXTRACT_ENABLED is unset.
+    init_extraction_queue()
     logger.info("ABI Memory API server ready (license: %s)", mgr.get_status()["status"])
     yield
-    # Shutdown: cancel refresh, close DB pool
+    # Shutdown: drain extraction queue, cancel refresh, close DB pool
+    shutdown_extraction_queue()
     mgr.stop_refresh()
     try:
         pool = get_pool()

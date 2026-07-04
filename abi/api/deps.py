@@ -23,6 +23,7 @@ _start_time: Optional[float] = None
 _license_manager = None
 _encryptor = None
 _reranker_singleton = None
+_extraction_queue = None
 _has_importance_cache: Optional[bool] = None
 _has_access_cache: Optional[bool] = None
 
@@ -221,3 +222,111 @@ def has_access_tracking() -> bool:
     except Exception:
         _has_access_cache = False
     return _has_access_cache
+
+
+# ---------------------------------------------------------------------------
+# Auto-extraction queue (PR 3)
+# ---------------------------------------------------------------------------
+
+_IMPORTANCE_LEVELS = {"low": 0.4, "medium": 0.6, "high": 0.75}
+
+
+def _get_embed_fn():
+    """Return abi.memory.embeddings.get_embedding, or None if unavailable."""
+    try:
+        from abi.memory.embeddings import get_embedding
+        return get_embedding
+    except Exception:
+        return None
+
+
+def _min_importance_float() -> float:
+    """Resolve ABI_MEMORY_EXTRACT_MIN_IMPORTANCE ('low|medium|high' or a float)."""
+    raw = os.environ.get("ABI_MEMORY_EXTRACT_MIN_IMPORTANCE", "medium").strip().lower()
+    if raw in _IMPORTANCE_LEVELS:
+        return _IMPORTANCE_LEVELS[raw]
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        return _IMPORTANCE_LEVELS["medium"]
+
+
+def _build_extraction_processor():
+    """Build the (payload)->None closure the queue worker calls per turn.
+
+    Deferred imports for routes.memory (make_extraction_writer) avoid the
+    deps↔routes module-load cycle.
+    """
+    from abi.memory.extractor import process_turn
+    from .routes.memory import make_extraction_writer
+
+    pool = get_pool()
+    encryptor = get_encryptor()
+    writer = make_extraction_writer(pool, encryptor)
+    embed_fn = _get_embed_fn()
+    reranker = get_reranker()  # None unless ABI_MEMORY_RERANK_ENABLED
+    dedup_threshold = float(os.environ.get("ABI_MEMORY_EXTRACT_DEDUP_THRESHOLD", "0.85"))
+    min_importance = _min_importance_float()
+
+    def processor(payload: dict) -> None:
+        conn = pool.getconn()
+        try:
+            conn.autocommit = True
+            process_turn(
+                payload, conn=conn, embed_fn=embed_fn, reranker=reranker,
+                encryptor=encryptor, writer=writer,
+                dedup_threshold=dedup_threshold, min_importance=min_importance,
+            )
+        finally:
+            pool.putconn(conn)
+
+    return processor
+
+
+def init_extraction_queue() -> None:
+    """Start the durable extraction queue + worker (gated, idempotent).
+
+    Disabled unless ``ABI_MEMORY_AUTO_EXTRACT_ENABLED`` is set. The SQLite queue
+    file lives next to the model cache (``ABI_EXTRACTION_DB_PATH`` overrides).
+    Safe to call on every startup — replays pending rows from a prior crash.
+    """
+    global _extraction_queue
+    if _extraction_queue is not None:
+        return
+    if not _env_bool("ABI_MEMORY_AUTO_EXTRACT_ENABLED"):
+        logger.info("Auto-extraction disabled (ABI_MEMORY_AUTO_EXTRACT_ENABLED not set)")
+        return
+    try:
+        from abi.memory.extraction_queue import ExtractionQueue
+        from abi.memory.model_cache import get_cache_root
+
+        db_path = os.environ.get("ABI_EXTRACTION_DB_PATH")
+        if not db_path:
+            db_path = str(Path(get_cache_root()).parent / "abi_extraction.db")
+        processor = _build_extraction_processor()
+        _extraction_queue = ExtractionQueue(Path(db_path), processor)
+        logger.info(
+            "Extraction queue started (db=%s, min_importance=%s, dedup=%s)",
+            db_path, _min_importance_float(),
+            os.environ.get("ABI_MEMORY_EXTRACT_DEDUP_THRESHOLD", "0.85"),
+        )
+    except Exception as exc:
+        # Never block API startup over the queue — recall still works without it.
+        logger.error("Extraction queue init failed (auto-extraction off): %s", exc)
+        _extraction_queue = None
+
+
+def get_extraction_queue():
+    """Return the ExtractionQueue singleton, or None if auto-extraction is off."""
+    return _extraction_queue
+
+
+def shutdown_extraction_queue() -> None:
+    """Drain + stop the worker on app shutdown (called from lifespan)."""
+    global _extraction_queue
+    if _extraction_queue is not None:
+        try:
+            _extraction_queue.shutdown()
+        except Exception as exc:
+            logger.warning("Extraction queue shutdown error: %s", exc)
+        _extraction_queue = None
