@@ -1,0 +1,54 @@
+#!/bin/bash
+# abi-dreamer-densify-all — run Phase 5 (densification) for every active agent,
+# ON THE HOST, each under its own user + HERMES_HOME so the LLM resolves to that
+# agent's configured model (auxiliary.dreamer, else the main model).
+#
+# Why per-agent on the host: the abi-memory-api container has no per-agent
+# hermes config / LLM creds, and the DB port isn't published to the host, so
+# densification is API-only (localhost:8010) + uses each agent's own LLM.
+#
+# Config (env, per-box — set in the systemd service or shell):
+#   ABI_DENSIFY_AGENTS  space-separated agent usernames
+#                       (default: discovered via the abi-memory-api DB)
+#   HERMES_PYTHON       host python with openai + hermes source tree
+#                       (default /opt/hermes-agent/.venv/bin/python3)
+#   HERMES_PACKAGE_ROOT hermes repo root (default /opt/hermes-agent)
+#
+# Manual run:  sudo ABI_DENSIFY_AGENTS="atlas iris" scripts/abi-dreamer-densify-all
+set -uo pipefail
+
+HERMES_PYTHON="${HERMES_PYTHON:-/opt/hermes-agent/.venv/bin/python3}"
+export HERMES_PACKAGE_ROOT="${HERMES_PACKAGE_ROOT:-/opt/hermes-agent}"
+
+AGENTS="${ABI_DENSIFY_AGENTS:-}"
+if [ -z "$AGENTS" ]; then
+  AGENTS="$(docker exec abi-memory-api "$HERMES_PYTHON" -c "
+import os, psycopg2
+c = psycopg2.connect(os.environ.get('ABI_DATABASE_URL', ''))
+cur = c.cursor()
+cur.execute(\"SELECT username FROM abi_agents WHERE status='active' ORDER BY username\")
+print(' '.join(r[0] for r in cur.fetchall()))
+" 2>/dev/null || true)"
+fi
+
+if [ -z "${AGENTS:-}" ]; then
+  echo "[abi-dreamer-densify-all] no agents to process."
+  echo "  Set ABI_DENSIFY_AGENTS='atlas iris ...' or ensure the container DB query works."
+  exit 0
+fi
+
+echo "[abi-dreamer-densify-all] HERMES_PACKAGE_ROOT=$HERMES_PACKAGE_ROOT agents: $AGENTS"
+for agent in $AGENTS; do
+  home="/home/$agent/.hermes"
+  if [ ! -d "$home" ]; then
+    echo "[abi-dreamer-densify-all] skip $agent (no HERMES_HOME at $home)"
+    continue
+  fi
+  echo "[abi-dreamer-densify-all] densify $agent (own LLM via $home)..."
+  # Runs as the agent user so HERMES_HOME + any agent-local creds resolve.
+  sudo -u "$agent" \
+    HERMES_HOME="$home" \
+    HERMES_PACKAGE_ROOT="$HERMES_PACKAGE_ROOT" \
+    "$HERMES_PYTHON" -m abi.dreamer --phase densify --agent "$agent" --write
+done
+echo "[abi-dreamer-densify-all] done."

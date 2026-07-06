@@ -1,0 +1,24 @@
+[Unit]
+Description=ABI Dreamer — nightly memory intelligence (dedup + densify)
+Documentation=https://github.com/Javier-nevado/hermes-agent
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/abi-dreamer-nightly.sh
+User=root
+
+# --- Per-box config (uncomment + edit before enabling) ---------------------
+# Space-separated agents to densify on the host (each uses its own LLM).
+# If unset, the wrapper discovers active agents from the abi-memory-api DB.
+# Environment="ABI_DENSIFY_AGENTS=atlas iris sol ailean vera caspian jen"
+#
+# Host python with openai + the hermes source tree (default below; some
+# customer VMs use /opt/hermes-gateway/.venv/bin/python3).
+# Environment="HERMES_PYTHON=/opt/hermes-agent/.venv/bin/python3"
+# Environment="HERMES_PACKAGE_ROOT=/opt/hermes-agent"
+
+# journald; the dreamer also prints a per-agent summary to stdout.
+StandardOutput=journal
+StandardError=journal

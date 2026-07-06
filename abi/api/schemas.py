@@ -19,8 +19,12 @@ class RememberRequest(BaseModel):
     clearance: str = "internal"
     # PR 3 — provenance + classification (auto-extraction / backfill). Optional;
     # omitted = today's behaviour (source_type 'api', no type/importance set).
+    # `dreamer`/`contradiction_alert` added so the Dreamer pipeline can route its
+    # heuristic writes (consolidation insights, contradiction/stale alerts) through
+    # /remember-batch and get encryption + embedding for free.
     source_type: Optional[str] = Field(
-        None, pattern="^(api|agent_tool|auto_extraction|session_mined|migration|identity)$"
+        None,
+        pattern="^(api|agent_tool|auto_extraction|session_mined|migration|identity|dreamer|contradiction_alert)$",
     )
     memory_type: Optional[str] = Field(
         None, pattern="^(preference|decision|fact|event|identity|other)$"
@@ -100,6 +104,56 @@ class RememberBatchRequest(BaseModel):
 class RememberBatchResponse(BaseModel):
     results: List[RememberResponse]
     count: int
+
+
+# ---------------------------------------------------------------------------
+# Dreamer — densification (nightly memory-quality pipeline)
+#
+# The Dreamer's Phase 5 (densification) rewrites verbose memories into dense
+# form via an LLM, running per-agent on the host (API-only — the DB port is not
+# published to the host). These endpoints feed that loop: list un-densified
+# memories (decrypted) and apply the dense rewrites in place.
+# ---------------------------------------------------------------------------
+
+class DreamerCandidateItem(BaseModel):
+    id: str
+    content: str  # DECRYPTED plaintext
+    memory_type: Optional[str] = None
+    importance: Optional[float] = None
+    source_type: Optional[str] = None
+
+
+class DreamerCandidatesRequest(BaseModel):
+    agent_name: str
+    # Default (omitted): the verbose set — auto_extraction, agent_tool, api,
+    # migration. Excludes session_mined (already dense), dreamer,
+    # contradiction_alert, identity (ranking-protected).
+    source_types: Optional[List[str]] = None
+    limit: int = Field(200, ge=1, le=2000)
+    offset: int = Field(0, ge=0)
+
+
+class DreamerCandidatesResponse(BaseModel):
+    agent_name: str
+    items: List[DreamerCandidateItem]
+    count: int
+
+
+class DreamerDensifyItem(BaseModel):
+    memory_id: str
+    content: str = Field(..., min_length=1, max_length=10000)
+
+
+class DreamerDensifyRequest(BaseModel):
+    agent_name: str
+    items: List[DreamerDensifyItem] = Field(..., min_length=1, max_length=50)
+
+
+class DreamerDensifyResponse(BaseModel):
+    agent_name: str
+    updated: int
+    skipped: int
+    errors: int
 
 
 # ---------------------------------------------------------------------------

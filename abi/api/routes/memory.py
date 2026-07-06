@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import List
 
 import psycopg2.extras
@@ -43,6 +44,11 @@ from ..schemas import (
     RememberBatchResponse,
     TurnIngestRequest,
     TurnIngestResponse,
+    DreamerCandidateItem,
+    DreamerCandidatesRequest,
+    DreamerCandidatesResponse,
+    DreamerDensifyRequest,
+    DreamerDensifyResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -520,6 +526,200 @@ def remember_batch(req: RememberBatchRequest):
                 superseded_count=0,
             ))
     return RememberBatchResponse(results=results, count=len(results))
+
+
+# ---------------------------------------------------------------------------
+# POST /dreamer/candidates + POST /dreamer/densify — Phase 5 densification
+#
+# The Dreamer's LLM densifier runs per-agent on the HOST (it needs that agent's
+# hermes config + LLM creds, which the container cannot see) and the DB port is
+# not published to the host, so densification is API-only: these endpoints feed
+# the loop. /candidates returns decrypted content; /densify rewrites in place
+# (re-encrypt + re-embed + re-extract entities), preserving id/source_type.
+# ---------------------------------------------------------------------------
+
+# Verbose source_types worth densifying by default. Excludes session_mined
+# (backfill output is already dense) and dreamer/contradiction_alert/identity
+# (already terse or ranking-protected).
+_DREAMER_DENSIFY_DEFAULT_SOURCES = ("auto_extraction", "agent_tool", "api", "migration")
+
+
+@router.post("/dreamer/candidates", response_model=DreamerCandidatesResponse,
+             dependencies=[Depends(require_license)])
+def dreamer_candidates(req: DreamerCandidatesRequest):
+    """List un-densified memories for an agent (decrypted) for the densifier.
+
+    Filters to the verbose source set by default, excludes superseded rows, and
+    gates on ``metadata->>'densified' IS NULL`` so re-runs are idempotent.
+    Content is decrypted exactly as ``/recall`` does.
+    """
+    pool = get_pool()
+    source_types = list(req.source_types) if req.source_types else list(_DREAMER_DENSIFY_DEFAULT_SOURCES)
+    imp_sel = ", importance, memory_type" if has_importance_column() else ""
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT id::text AS id, content, source_type{imp_sel}
+                FROM abi_memories
+                WHERE agent_name = %s
+                  AND superseded_by IS NULL
+                  AND source_type = ANY(%s)
+                  AND (metadata->>'densified') IS NULL
+                ORDER BY created_at ASC
+                LIMIT %s OFFSET %s
+                """,
+                [req.agent_name, source_types, req.limit, req.offset],
+            )
+            rows = cur.fetchall()
+
+        encryptor = get_encryptor()
+        from ..crypto import EncryptionService
+        items = []
+        for row in rows:
+            ct = row.get("content")
+            plain = ct
+            if ct and EncryptionService.is_encrypted(ct):
+                plain = encryptor.decrypt(ct) if encryptor else "[encrypted — decryption key unavailable]"
+            items.append(DreamerCandidateItem(
+                id=row["id"],
+                content=plain or "",
+                memory_type=row.get("memory_type"),
+                importance=(float(row["importance"]) if row.get("importance") is not None else None),
+                source_type=row.get("source_type"),
+            ))
+        return DreamerCandidatesResponse(agent_name=req.agent_name, items=items, count=len(items))
+    except Exception as e:
+        logger.error("dreamer/candidates failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        pool.putconn(conn)
+
+
+@router.post("/dreamer/densify", response_model=DreamerDensifyResponse,
+             dependencies=[Depends(require_license)])
+def dreamer_densify(req: DreamerDensifyRequest):
+    """Apply dense rewrites to memories in place.
+
+    Per item: re-embed + re-encrypt the new content, refresh entities (delete old
+    links/edges then re-extract), UPDATE in place preserving id/source_type/
+    created_at. Stamps ``metadata.densified=1`` + ``densified_at`` and, on first
+    densify only, stashes ``metadata.original_content`` as an audit trail.
+    Refuses to proceed if encryption is disabled — densifying into plaintext
+    would leak the decrypted content ``/candidates`` just returned.
+    """
+    pool = get_pool()
+    encryptor = get_encryptor()
+    if encryptor is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Encryption is disabled (no DEK) — densify refused to avoid storing plaintext rewrites.",
+        )
+    extractor = get_extractor()
+
+    updated = skipped = errors = 0
+    conn = pool.getconn()
+    try:
+        conn.autocommit = False
+        for item in req.items:
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT content, metadata FROM abi_memories "
+                        "WHERE id = %s::uuid AND agent_name = %s AND superseded_by IS NULL",
+                        [item.memory_id, req.agent_name],
+                    )
+                    row = cur.fetchone()
+
+                if row is None:
+                    errors += 1
+                    logger.warning("densify: memory %s not found / not owned by %s",
+                                   item.memory_id, req.agent_name)
+                    conn.rollback()
+                    continue
+
+                from ..crypto import EncryptionService
+                old_ct = row["content"]
+                old_plain = (encryptor.decrypt(old_ct)
+                             if EncryptionService.is_encrypted(old_ct) else old_ct) or ""
+                new_plain = item.content.strip()
+
+                # Metadata patch: always set densified + densified_at; stash
+                # original_content only on first densify (never overwrite the
+                # audit trail on re-runs).
+                meta = dict(row["metadata"] or {})
+                if "original_content" not in meta:
+                    meta["original_content"] = old_plain
+                meta["densified"] = 1
+                meta["densified_at"] = datetime.now(timezone.utc).isoformat()
+
+                # Already maximally dense (LLM returned it unchanged): just stamp
+                # so it isn't re-candidate'd; no content/embedding/entity change.
+                if new_plain == (old_plain or "").strip():
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE abi_memories SET metadata = %s::jsonb "
+                            "WHERE id = %s::uuid AND agent_name = %s",
+                            [psycopg2.extras.Json(meta), item.memory_id, req.agent_name],
+                        )
+                    conn.commit()
+                    skipped += 1
+                    continue
+
+                embedding = _get_embedding(new_plain)
+                content_enc = encryptor.encrypt(new_plain)
+
+                # Drop stale entity links/edges for this memory, then re-extract
+                # from the dense content (_store_entities only appends).
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM abi_memory_entities WHERE memory_id = %s::uuid",
+                                [item.memory_id])
+                    cur.execute("DELETE FROM abi_edges WHERE memory_id = %s::uuid",
+                                [item.memory_id])
+                    cur.execute(
+                        """UPDATE abi_memories
+                           SET content = %s,
+                               embedding = %s::vector,
+                               fts = to_tsvector('english', %s),
+                               metadata = %s::jsonb
+                           WHERE id = %s::uuid AND agent_name = %s""",
+                        [content_enc,
+                         (str(embedding) if embedding else None),
+                         new_plain, psycopg2.extras.Json(meta),
+                         item.memory_id, req.agent_name],
+                    )
+
+                entities = extractor.extract(new_plain)
+                if entities:
+                    _store_entities(conn, item.memory_id, entities, new_plain)
+
+                conn.commit()
+                updated += 1
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                errors += 1
+                logger.warning("densify: item %s failed: %s", item.memory_id, e)
+        return DreamerDensifyResponse(
+            agent_name=req.agent_name, updated=updated, skipped=skipped, errors=errors,
+        )
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.error("dreamer/densify failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            conn.autocommit = True
+        except Exception:
+            pass
+        pool.putconn(conn)
 
 
 # ---------------------------------------------------------------------------
