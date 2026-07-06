@@ -19,6 +19,9 @@ set -uo pipefail
 
 HERMES_PYTHON="${HERMES_PYTHON:-/opt/hermes-agent/.venv/bin/python3}"
 export HERMES_PACKAGE_ROOT="${HERMES_PACKAGE_ROOT:-/opt/hermes-agent}"
+# `python -m abi.dreamer` needs the abi package importable at startup, BEFORE the
+# module's own sys.path manipulation runs — so put the repo root on PYTHONPATH.
+export PYTHONPATH="$HERMES_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 AGENTS="${ABI_DENSIFY_AGENTS:-}"
 if [ -z "$AGENTS" ]; then
@@ -54,9 +57,12 @@ for agent in $AGENTS; do
   fi
   echo "[abi-dreamer-densify-all] densify $agent (own LLM via $home)..."
   # Runs as the agent user so HERMES_HOME + any agent-local creds resolve.
+  # PYTHONPATH passed inline: sudo strips the exported env, but honors VAR=value
+  # leading args. `python -m abi.dreamer` needs abi on the path at startup.
   sudo -u "$agent" \
     HERMES_HOME="$home" \
     HERMES_PACKAGE_ROOT="$HERMES_PACKAGE_ROOT" \
+    PYTHONPATH="$HERMES_PACKAGE_ROOT" \
     "$HERMES_PYTHON" -m abi.dreamer --phase densify --agent "$agent" --write "${MODEL_ARG[@]}"
 done
 echo "[abi-dreamer-densify-all] done."
