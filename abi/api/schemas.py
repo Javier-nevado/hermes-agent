@@ -69,6 +69,12 @@ class MemoryItem(BaseModel):
     dlp_level: str
     created_at: Optional[str] = None
     score: Optional[float] = None
+    # Ranking metadata (005 migration). Populated by recall when the columns
+    # exist; absent on legacy rows / pre-migration boxes. Additive — clients
+    # that only read content/score are unaffected.
+    memory_type: Optional[str] = None
+    importance: Optional[float] = None
+    source_type: Optional[str] = None
 
 
 class RecallResponse(BaseModel):

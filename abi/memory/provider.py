@@ -317,11 +317,15 @@ class ABIMemoryProvider(MemoryProvider):
                     imp_cte = "importance, " if self._has_importance else ""
                     imp_final = ("COALESCE(v.importance, b.importance) AS importance, "
                                  if self._has_importance else "")
+                    # memory_type is a sibling of importance in the 005 migration.
+                    mtype_cte = "memory_type, " if self._has_importance else ""
+                    mtype_final = ("COALESCE(v.memory_type, b.memory_type) AS memory_type, "
+                                   if self._has_importance else "")
 
                     sql = f"""
                         WITH vector_results AS (
                             SELECT id, content, dlp_level, agent_name, user_id,
-                                   source_type, created_at, metadata, {imp_cte}
+                                   source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                    ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
                             FROM abi_memories
                             WHERE {where_clause}
@@ -330,7 +334,7 @@ class ABIMemoryProvider(MemoryProvider):
                         ),
                         bm25_results AS (
                             SELECT id, content, dlp_level, agent_name, user_id,
-                                   source_type, created_at, metadata, {imp_cte}
+                                   source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
                             FROM abi_memories
                             WHERE {bm25_where}
@@ -343,7 +347,7 @@ class ABIMemoryProvider(MemoryProvider):
                                COALESCE(v.source_type, b.source_type) AS source_type,
                                COALESCE(v.created_at, b.created_at) AS created_at,
                                COALESCE(v.metadata, b.metadata) AS metadata,
-                               {imp_final}
+                               {imp_final} {mtype_final}
                                COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
                                COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
                         FROM vector_results v
@@ -363,9 +367,10 @@ class ABIMemoryProvider(MemoryProvider):
                 else:
                     # Fallback: BM25-only when embeddings unavailable
                     imp_sel = "importance, " if self._has_importance else ""
+                    mtype_sel = "memory_type, " if self._has_importance else ""
                     _sql = (
                         "SELECT id, content, dlp_level, agent_name, user_id, "
-                        "source_type, created_at, metadata, " + imp_sel +
+                        "source_type, created_at, metadata, " + imp_sel + mtype_sel +
                         "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                         "FROM abi_memories "
                         "WHERE " + where_clause + " "
@@ -400,6 +405,9 @@ class ABIMemoryProvider(MemoryProvider):
                     "dlp_level": row["dlp_level"],
                     "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
                     "score": round(float(row.get("score", 0.0)), 4),
+                    "memory_type": row.get("memory_type"),
+                    "importance": round(float(row["importance"]), 2) if row.get("importance") is not None else None,
+                    "source_type": row.get("source_type"),
                 }
                 memories.append(mem)
 

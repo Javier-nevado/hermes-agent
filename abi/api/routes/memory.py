@@ -329,11 +329,17 @@ def recall(req: RecallRequest):
                 imp_cte = "importance, " if has_importance_column() else ""
                 imp_final = ("COALESCE(v.importance, b.importance) AS importance, "
                              if has_importance_column() else "")
+                # memory_type is a sibling of importance in the 005 migration —
+                # same column probe gates it. Surfaced in the recall response so
+                # agents can see the type/importance the ranker computed.
+                mtype_cte = "memory_type, " if has_importance_column() else ""
+                mtype_final = ("COALESCE(v.memory_type, b.memory_type) AS memory_type, "
+                               if has_importance_column() else "")
 
                 sql = f"""
                     WITH vector_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata, {imp_cte}
+                               source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
                         FROM abi_memories
                         WHERE {where_clause}
@@ -342,7 +348,7 @@ def recall(req: RecallRequest):
                     ),
                     bm25_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata, {imp_cte}
+                               source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
                         FROM abi_memories
                         WHERE {bm25_where}
@@ -355,7 +361,7 @@ def recall(req: RecallRequest):
                            COALESCE(v.source_type, b.source_type) AS source_type,
                            COALESCE(v.created_at, b.created_at) AS created_at,
                            COALESCE(v.metadata, b.metadata) AS metadata,
-                           {imp_final}
+                           {imp_final} {mtype_final}
                            COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
                            COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
                     FROM vector_results v
@@ -370,9 +376,10 @@ def recall(req: RecallRequest):
             else:
                 # BM25-only fallback
                 imp_sel = "importance, " if has_importance_column() else ""
+                mtype_sel = "memory_type, " if has_importance_column() else ""
                 _sql = (
                     "SELECT id, content, dlp_level, agent_name, user_id, "
-                    "source_type, created_at, metadata, " + imp_sel +
+                    "source_type, created_at, metadata, " + imp_sel + mtype_sel +
                     "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                     "FROM abi_memories "
                     "WHERE " + where_clause + " "
@@ -430,6 +437,9 @@ def recall(req: RecallRequest):
                 dlp_level=row["dlp_level"],
                 created_at=row["created_at"].isoformat() if row.get("created_at") else None,
                 score=round(float(row.get("score", 0.0)), 4),
+                memory_type=row.get("memory_type"),
+                importance=round(float(row["importance"]), 2) if row.get("importance") is not None else None,
+                source_type=row.get("source_type"),
             )
             memories.append(mem)
 
