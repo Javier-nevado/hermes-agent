@@ -7,7 +7,10 @@ DLP levels:
 
 Clearance levels:
 - admin: sees own confidential + all internal/public
-- internal: sees all internal/public
+- confidential: sees own confidential + all internal/public (DLP-equivalent to
+  admin — a confidential-cleared agent is trusted with confidential-tier data;
+  no cross-agent confidential visibility is granted)
+- internal: sees all internal/public (no confidential)
 - external: sees only public
 """
 
@@ -20,7 +23,11 @@ def dlp_where(clearance: str, agent_name: str) -> Tuple[str, List[str]]:
     Returns:
         Tuple of (where_clause, params) where params are for %s placeholders.
     """
-    if clearance == "admin":
+    if clearance in ("admin", "confidential"):
+        # A confidential-cleared agent sees its own confidential memories plus
+        # the shared internal/public pool — same DLP view as admin. Previously
+        # 'confidential' fell through to the external branch (public-only),
+        # silently blinding it to internal+own-confidential memories.
         return (
             "((dlp_level = 'confidential' AND agent_name = %s) OR dlp_level IN ('internal', 'public'))",
             [agent_name],

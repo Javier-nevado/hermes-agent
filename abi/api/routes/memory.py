@@ -20,7 +20,16 @@ from abi.memory.dlp import dlp_where
 from abi.memory.pii import classify_pii
 from abi.memory.ranking import finalize_recall_ordering
 
-from ..deps import get_pool, get_extractor, get_encryptor, get_reranker, has_importance_column, has_access_tracking
+from ..deps import (
+    get_pool,
+    get_extractor,
+    get_encryptor,
+    get_reranker,
+    get_extraction_queue,
+    get_extraction_stats,
+    has_importance_column,
+    has_access_tracking,
+)
 from ..license import require_license
 from ..schemas import (
     RememberRequest,
@@ -32,6 +41,8 @@ from ..schemas import (
     ForgetResponse,
     RememberBatchRequest,
     RememberBatchResponse,
+    TurnIngestRequest,
+    TurnIngestResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,92 +104,157 @@ def _get_embedding(text: str):
 # POST /remember
 # ---------------------------------------------------------------------------
 
+def _persist_memory(
+    conn,
+    plaintext: str,
+    *,
+    agent_name: str,
+    user_id,
+    dlp_level: str,
+    source_type: str = "api",
+    memory_type: str = None,
+    importance: float = None,
+    extractor=None,
+    encryptor=None,
+):
+    """Single memory write path: INSERT + optional type/importance + entities + supersession.
+
+    Shared by ``/remember``, ``/remember-batch``, and the auto-extraction worker
+    so all writes go through one code path (the encrypted/plaintext × embedding
+    branches live here once). ``importance``/``memory_type`` land via a cheap
+    post-INSERT UPDATE on 005+ DBs; legacy DBs ignore them. Caller controls the
+    transaction (``conn.autocommit`` set by the caller). Returns
+    ``(memory_id, entity_count, edge_count, superseded_count)``.
+    """
+    if extractor is None:
+        extractor = get_extractor()
+
+    embedding = _get_embedding(plaintext)
+    memory_id = str(uuid.uuid4())
+    content = encryptor.encrypt(plaintext) if encryptor else plaintext
+
+    with conn.cursor() as cur:
+        if embedding:
+            if encryptor:
+                # Encrypted path: pass fts explicitly from plaintext
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type, fts)
+                    VALUES (%s, %s, %s::vector, %s, %s, %s, %s, to_tsvector('english', %s))
+                    RETURNING id
+                    """,
+                    [memory_id, content, str(embedding), dlp_level, agent_name, user_id, source_type, plaintext],
+                )
+            else:
+                # Plaintext path: trigger generates fts automatically
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
+                    VALUES (%s, %s, %s::vector, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    [memory_id, content, str(embedding), dlp_level, agent_name, user_id, source_type],
+                )
+        else:
+            if encryptor:
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type, fts)
+                    VALUES (%s, %s, %s, %s, %s, %s, to_tsvector('english', %s))
+                    RETURNING id
+                    """,
+                    [memory_id, content, dlp_level, agent_name, user_id, source_type, plaintext],
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    [memory_id, content, dlp_level, agent_name, user_id, source_type],
+                )
+
+        # Optional importance/memory_type (005 migration). One cheap UPDATE; no-op
+        # on legacy DBs and when neither is provided.
+        if has_importance_column() and (memory_type is not None or importance is not None):
+            sets, vals = [], []
+            if memory_type is not None:
+                sets.append("memory_type = %s")
+                vals.append(memory_type)
+            if importance is not None:
+                sets.append("importance = %s")
+                vals.append(float(importance))
+            vals.append(memory_id)
+            cur.execute(
+                f"UPDATE abi_memories SET {', '.join(sets)} WHERE id = %s", vals
+            )
+
+    entity_count = 0
+    edge_count = 0
+    superseded_count = 0
+    try:
+        entities = extractor.extract(plaintext)
+        if entities:
+            entity_count, edge_count = _store_entities(conn, memory_id, entities, plaintext)
+            superseded_count = _supersede_old_memories(conn, memory_id, entities, agent_name)
+    except Exception as e:
+        logger.warning("Entity extraction failed for memory %s: %s", memory_id, e)
+
+    return memory_id, entity_count, edge_count, superseded_count
+
+
+def make_extraction_writer(pool, encryptor):
+    """Build the writer callable used by the auto-extraction worker.
+
+    ``writer(content, agent_name, user_id, *, dlp_level, memory_type, importance)``
+    checks out its own connection, writes one memory with
+    ``source_type='auto_extraction'``, and returns the memory_id (or None). Each
+    call is independent — the worker processes turns sequentially.
+    """
+
+    def writer(content, agent_name, user_id, *, dlp_level=None, memory_type=None, importance=None):
+        dlp = dlp_level or ("confidential" if classify_pii(content) else "internal")
+        conn = pool.getconn()
+        try:
+            conn.autocommit = True
+            mem_id, _ec, _edc, _sc = _persist_memory(
+                conn, content,
+                agent_name=agent_name, user_id=user_id, dlp_level=dlp,
+                source_type="auto_extraction",
+                memory_type=memory_type, importance=importance,
+                encryptor=encryptor,
+            )
+            return mem_id
+        finally:
+            pool.putconn(conn)
+
+    return writer
+
+
 @router.post("/remember", response_model=RememberResponse, dependencies=[Depends(require_license)])
 def remember(req: RememberRequest):
     """Store a memory with DLP classification, entity extraction, and temporal supersession."""
     pool = get_pool()
-    extractor = get_extractor()
 
     content = req.content
-    dlp_level = req.dlp_level
     agent_name = req.agent_name or "api"
     user_id = req.user_id
 
-    # Auto-classify DLP if not specified
+    dlp_level = req.dlp_level
     if not dlp_level:
-        has_pii = classify_pii(content)
-        dlp_level = "confidential" if has_pii else "internal"
-
-    embedding = _get_embedding(content)
-    memory_id = str(uuid.uuid4())
-
-    # Save plaintext for entity extraction and FTS before encrypting
-    plaintext = content
-    encryptor = get_encryptor()
-    if encryptor:
-        content = encryptor.encrypt(plaintext)
+        dlp_level = "confidential" if classify_pii(content) else "internal"
 
     conn = pool.getconn()
     try:
         conn.autocommit = True
-        with conn.cursor() as cur:
-            if embedding:
-                if encryptor:
-                    # Encrypted path: pass fts explicitly from plaintext
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type, fts)
-                        VALUES (%s, %s, %s::vector, %s, %s, %s, 'api', to_tsvector('english', %s))
-                        RETURNING id
-                        """,
-                        [memory_id, content, str(embedding), dlp_level, agent_name, user_id, plaintext],
-                    )
-                else:
-                    # Plaintext path: trigger generates fts automatically
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, embedding, dlp_level, agent_name, user_id, source_type)
-                        VALUES (%s, %s, %s::vector, %s, %s, %s, 'api')
-                        RETURNING id
-                        """,
-                        [memory_id, content, str(embedding), dlp_level, agent_name, user_id],
-                    )
-            else:
-                if encryptor:
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type, fts)
-                        VALUES (%s, %s, %s, %s, %s, 'api', to_tsvector('english', %s))
-                        RETURNING id
-                        """,
-                        [memory_id, content, dlp_level, agent_name, user_id, plaintext],
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO abi_memories (id, content, dlp_level, agent_name, user_id, source_type)
-                        VALUES (%s, %s, %s, %s, %s, 'api')
-                        RETURNING id
-                        """,
-                        [memory_id, content, dlp_level, agent_name, user_id],
-                    )
-
-        # Entity extraction + storage (always from plaintext)
-        entity_count = 0
-        edge_count = 0
-        superseded_count = 0
-        try:
-            entities = extractor.extract(plaintext)
-            if entities:
-                entity_count, edge_count = _store_entities(
-                    conn, memory_id, entities, plaintext
-                )
-                superseded_count = _supersede_old_memories(
-                    conn, memory_id, entities, agent_name
-                )
-        except Exception as e:
-            logger.warning("Entity extraction failed for memory %s: %s", memory_id, e)
-
+        memory_id, entity_count, edge_count, superseded_count = _persist_memory(
+            conn, content,
+            agent_name=agent_name, user_id=user_id, dlp_level=dlp_level,
+            source_type=req.source_type or "api",
+            memory_type=req.memory_type, importance=req.importance,
+            encryptor=get_encryptor(),
+        )
         return RememberResponse(
             status="remembered",
             memory_id=memory_id,
@@ -192,6 +268,50 @@ def remember(req: RememberRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         pool.putconn(conn)
+
+
+# ---------------------------------------------------------------------------
+# POST /turns/ingest — auto-extraction entry point (PR 3)
+# ---------------------------------------------------------------------------
+
+@router.post("/turns/ingest", response_model=TurnIngestResponse)
+def turns_ingest(req: TurnIngestRequest):
+    """Accept a completed turn from an abi_memory_api client and queue it for extraction.
+
+    Non-blocking by design: the worker drains ``abi_extraction.db`` off the
+    request path. Returns 202-equivalent (``queued``) immediately. If
+    auto-extraction is disabled the endpoint still answers (``disabled``) so the
+    client's fire-and-forget POST never errors.
+    """
+    queue = get_extraction_queue()
+    if queue is None:
+        return TurnIngestResponse(status="disabled", queued=0)
+    queue.enqueue({
+        "agent_name": req.agent_name,
+        "user_id": req.user_id,
+        "user_content": req.user_content,
+        "assistant_content": req.assistant_content,
+        "session_id": req.session_id,
+        "clearance": req.clearance,
+    })
+    return TurnIngestResponse(status="queued", queued=1)
+
+
+# ---------------------------------------------------------------------------
+# GET /extraction/stats — auto-extraction ops visibility (PR 3)
+# ---------------------------------------------------------------------------
+
+@router.get("/extraction/stats")
+def extraction_stats():
+    """Cumulative auto-extraction counters + queue backlog + enabled flag.
+
+    Read-only ops endpoint: lets Ground Control watch the extractor save/drop
+    ratios (``abi.*`` loggers default to WARNING, which hid the per-turn INFO
+    line). Counters reset on container restart; ``pending`` is the durable
+    queue backlog awaiting the worker. No license gate — ops-only, no memory
+    content is exposed.
+    """
+    return get_extraction_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +347,17 @@ def recall(req: RecallRequest):
                 imp_cte = "importance, " if has_importance_column() else ""
                 imp_final = ("COALESCE(v.importance, b.importance) AS importance, "
                              if has_importance_column() else "")
+                # memory_type is a sibling of importance in the 005 migration —
+                # same column probe gates it. Surfaced in the recall response so
+                # agents can see the type/importance the ranker computed.
+                mtype_cte = "memory_type, " if has_importance_column() else ""
+                mtype_final = ("COALESCE(v.memory_type, b.memory_type) AS memory_type, "
+                               if has_importance_column() else "")
 
                 sql = f"""
                     WITH vector_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata, {imp_cte}
+                               source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS vector_rank
                         FROM abi_memories
                         WHERE {where_clause}
@@ -240,7 +366,7 @@ def recall(req: RecallRequest):
                     ),
                     bm25_results AS (
                         SELECT id, content, dlp_level, agent_name, user_id,
-                               source_type, created_at, metadata, {imp_cte}
+                               source_type, created_at, metadata, {imp_cte} {mtype_cte}
                                ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) AS bm25_rank
                         FROM abi_memories
                         WHERE {bm25_where}
@@ -253,7 +379,7 @@ def recall(req: RecallRequest):
                            COALESCE(v.source_type, b.source_type) AS source_type,
                            COALESCE(v.created_at, b.created_at) AS created_at,
                            COALESCE(v.metadata, b.metadata) AS metadata,
-                           {imp_final}
+                           {imp_final} {mtype_final}
                            COALESCE(1.0 / ({rrf_k} + v.vector_rank), 0) +
                            COALESCE(1.0 / ({rrf_k} + b.bm25_rank), 0) AS rrf_score
                     FROM vector_results v
@@ -268,9 +394,10 @@ def recall(req: RecallRequest):
             else:
                 # BM25-only fallback
                 imp_sel = "importance, " if has_importance_column() else ""
+                mtype_sel = "memory_type, " if has_importance_column() else ""
                 _sql = (
                     "SELECT id, content, dlp_level, agent_name, user_id, "
-                    "source_type, created_at, metadata, " + imp_sel +
+                    "source_type, created_at, metadata, " + imp_sel + mtype_sel +
                     "ts_rank_cd(fts, websearch_to_tsquery('english', %s)) AS rank "
                     "FROM abi_memories "
                     "WHERE " + where_clause + " "
@@ -328,6 +455,9 @@ def recall(req: RecallRequest):
                 dlp_level=row["dlp_level"],
                 created_at=row["created_at"].isoformat() if row.get("created_at") else None,
                 score=round(float(row.get("score", 0.0)), 4),
+                memory_type=row.get("memory_type"),
+                importance=round(float(row["importance"]), 2) if row.get("importance") is not None else None,
+                source_type=row.get("source_type"),
             )
             memories.append(mem)
 
