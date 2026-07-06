@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,20 @@ _reranker_singleton = None
 _extraction_queue = None
 _has_importance_cache: Optional[bool] = None
 _has_access_cache: Optional[bool] = None
+
+# Cumulative auto-extraction counters since process start (PR 3 ops visibility).
+# Accumulated from each process_turn() return inside the worker closure, under a
+# lock (the daemon worker is the only writer; the /extraction/stats route reads).
+_extraction_stats: dict = {
+    "turns_processed": 0,
+    "candidates": 0,
+    "saved": 0,
+    "skipped_dup": 0,
+    "skipped_echo": 0,
+    "skipped_trivia_floor": 0,
+    "errors": 0,
+}
+_extraction_stats_lock = threading.Lock()
 
 
 def _env_bool(name: str) -> bool:
@@ -272,11 +287,23 @@ def _build_extraction_processor():
         conn = pool.getconn()
         try:
             conn.autocommit = True
-            process_turn(
+            stats = process_turn(
                 payload, conn=conn, embed_fn=embed_fn, reranker=reranker,
                 encryptor=encryptor, writer=writer,
                 dedup_threshold=dedup_threshold, min_importance=min_importance,
             )
+        except Exception:
+            # Queue-level retry handles transient DB/embed failures; this only
+            # counts genuinely-uncategorized worker errors (not per-candidate
+            # writer errors, which process_turn already logs + continues).
+            with _extraction_stats_lock:
+                _extraction_stats["errors"] += 1
+            raise
+        else:
+            with _extraction_stats_lock:
+                _extraction_stats["turns_processed"] += 1
+                for k in ("candidates", "saved", "skipped_dup", "skipped_echo", "skipped_trivia_floor"):
+                    _extraction_stats[k] += int(stats.get(k, 0))
         finally:
             pool.putconn(conn)
 
@@ -319,6 +346,21 @@ def init_extraction_queue() -> None:
 def get_extraction_queue():
     """Return the ExtractionQueue singleton, or None if auto-extraction is off."""
     return _extraction_queue
+
+
+def get_extraction_stats() -> dict:
+    """Snapshot of cumulative auto-extraction counters + queue depth + enabled flag.
+
+    Read by the ``GET /extraction/stats`` ops endpoint. Counters are cumulative
+    since process start (reset on container restart); ``pending`` is the durable
+    queue backlog (rows awaiting the worker).
+    """
+    with _extraction_stats_lock:
+        counters = dict(_extraction_stats)
+    queue = _extraction_queue
+    counters["enabled"] = queue is not None
+    counters["pending"] = queue.pending_count if queue is not None else 0
+    return counters
 
 
 def shutdown_extraction_queue() -> None:

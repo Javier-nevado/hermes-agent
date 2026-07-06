@@ -26,6 +26,7 @@ from ..deps import (
     get_encryptor,
     get_reranker,
     get_extraction_queue,
+    get_extraction_stats,
     has_importance_column,
     has_access_tracking,
 )
@@ -294,6 +295,23 @@ def turns_ingest(req: TurnIngestRequest):
         "clearance": req.clearance,
     })
     return TurnIngestResponse(status="queued", queued=1)
+
+
+# ---------------------------------------------------------------------------
+# GET /extraction/stats — auto-extraction ops visibility (PR 3)
+# ---------------------------------------------------------------------------
+
+@router.get("/extraction/stats")
+def extraction_stats():
+    """Cumulative auto-extraction counters + queue backlog + enabled flag.
+
+    Read-only ops endpoint: lets Ground Control watch the extractor save/drop
+    ratios (``abi.*`` loggers default to WARNING, which hid the per-turn INFO
+    line). Counters reset on container restart; ``pending`` is the durable
+    queue backlog awaiting the worker. No license gate — ops-only, no memory
+    content is exposed.
+    """
+    return get_extraction_stats()
 
 
 # ---------------------------------------------------------------------------
