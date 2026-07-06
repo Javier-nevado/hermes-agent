@@ -71,7 +71,9 @@ except ImportError:  # host venv has no psycopg2 — fine for --phase densify
 
 MAX_CONTENT_CHARS = 10000          # API /remember content limit
 DENSIFY_BATCH_SIZE = 10            # memories per LLM call
-DENSIFY_MAX_TOKENS = 2000          # ~10 memories × ~100-200 tokens out
+DENSIFY_MAX_TOKENS = 4000          # reasoning models emit CoT in reasoning_content
+                                  # before the JSON; 4k leaves room for both so the
+                                  # JSON lands in `content` (not truncated)
 DENSIFY_DEFAULT_LIMIT = None       # None = densify everything (first run)
 DEFAULT_SLEEP = 0.5                # polite pacing between LLM calls (seconds)
 
@@ -154,13 +156,33 @@ def parse_json_lenient(content: str):
     try:
         return json.loads(s)
     except (json.JSONDecodeError, TypeError):
-        start, end = s.find("{"), s.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(s[start:end + 1])
-        raise
+        pass
+    # Fallback 1: anchor on the real key {"results" and brace-match outward.
+    # Models that ignore response_format often prefix CoT prose containing a
+    # spurious "{id, content}" — the generic first-brace span grabs that garbage.
+    # Anchoring on {"results" skips the prose reliably.
+    anchor = s.find('{"results"')
+    if anchor == -1:
+        anchor = s.find("{")  # last resort: first brace
+    if anchor != -1:
+        depth = 0
+        for i in range(anchor, len(s)):
+            if s[i] == "{":
+                depth += 1
+            elif s[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(s[anchor:i + 1])
+                    except (json.JSONDecodeError, TypeError):
+                        break
+    raise json.JSONDecodeError("no JSON object found", s, 0)
 
 
 DENSIFY_SYSTEM_PROMPT = (
+    "Respond with ONLY a JSON object — your VERY FIRST character must be '{' and "
+    "there must be NOTHING before or after the JSON: no reasoning, no analysis, "
+    "no \"let me\", no markdown. The provider does not enforce JSON, so you must.\n\n"
     "You are a memory densification engine. You receive JSON: an array of "
     "{id, content} objects, each a verbose or loosely-worded memory. Rewrite "
     "each into the densest possible telegraphic form WITHOUT losing any "
@@ -665,9 +687,11 @@ def phase_densify(agent_name: str, api: MemoryAPIClient, client, model: str,
                   dry_run: bool, batch_size: int = DENSIFY_BATCH_SIZE,
                   limit: Optional[int] = DENSIFY_DEFAULT_LIMIT,
                   source_types: Optional[List[str]] = None,
-                  sleep_s: float = DEFAULT_SLEEP) -> Dict:
+                  sleep_s: float = DEFAULT_SLEEP,
+                  skip_markdown_docs: bool = True) -> Dict:
     """Rewrite verbose memories into dense form via the LLM, in place."""
-    stats = {"candidates": 0, "densified": 0, "skipped_unchanged": 0, "errors": 0, "tokens": 0}
+    stats = {"candidates": 0, "densified": 0, "skipped_unchanged": 0,
+             "skipped_docs": 0, "errors": 0, "tokens": 0}
 
     try:
         snapshot = _fetch_candidate_snapshot(api, agent_name, limit, source_types)
@@ -679,6 +703,23 @@ def phase_densify(agent_name: str, api: MemoryAPIClient, client, model: str,
     stats["candidates"] = len(snapshot)
     if not snapshot:
         return stats
+
+    # Skip markdown reference docs (content starting with a '#'' header). These
+    # are reference material, not facts — summarizing them loses their value, and
+    # their length truncates the JSON output (parse errors + retries). They're
+    # left untouched (still recallable verbatim). Override with --no-skip-docs.
+    if skip_markdown_docs:
+        facts, docs = [], []
+        for it in snapshot:
+            c = (it.get("content") or "").lstrip()
+            (docs if c.startswith("#") else facts).append(it)
+        if docs:
+            stats["skipped_docs"] = len(docs)
+            print(f"  [densify] skipping {len(docs)} markdown reference docs "
+                  f"(start with '#'); densifying {len(facts)} prose candidates.")
+        snapshot = facts
+        if not snapshot:
+            return stats
 
     consec_errors = 0
     for i in range(0, len(snapshot), batch_size):
@@ -823,9 +864,12 @@ def run_densify(args, api: MemoryAPIClient) -> Dict:
             name, api, client, model, dry_run=args.dry_run,
             batch_size=args.batch_size, limit=args.limit,
             source_types=source_types, sleep_s=args.sleep,
+            skip_markdown_docs=not getattr(args, "no_skip_docs", False),
         )
         print(f"  candidates={s['candidates']} densified={s['densified']} "
-              f"skipped_unchanged={s['skipped_unchanged']} errors={s['errors']} tokens={s['tokens']}")
+              f"skipped_unchanged={s['skipped_unchanged']} "
+              f"skipped_docs={s.get('skipped_docs', 0)} "
+              f"errors={s['errors']} tokens={s['tokens']}")
         summary["agents_processed"] += 1
         summary["phases"][name] = s
     return summary
@@ -843,6 +887,9 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=DENSIFY_BATCH_SIZE, help="memories per LLM call (densify)")
     ap.add_argument("--source-types", nargs="*", default=None,
                     help="densify only these source_types (default: auto_extraction agent_tool api migration)")
+    ap.add_argument("--no-skip-docs", action="store_true",
+                    help="also densify markdown reference docs (content starting with '#'); "
+                         "by default these are left untouched (they're reference material, not facts)")
     ap.add_argument("--sleep", type=float, default=DEFAULT_SLEEP, help="seconds between LLM calls")
     ap.add_argument("--llm-timeout", type=float, default=DEFAULT_LLM_TIMEOUT)
     ap.add_argument("--llm-retries", type=int, default=DEFAULT_LLM_MAX_RETRIES)
