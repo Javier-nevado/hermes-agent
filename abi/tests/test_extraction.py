@@ -109,6 +109,45 @@ class TestClassify(unittest.TestCase):
         _, imp2 = _classify("Send it every Monday morning.")
         self.assertGreaterEqual(imp2, 0.8)
 
+    # --- Regressions from real .19 traffic (2026-07-05/06) -------------------- #
+    # Each pins a confirmed heuristic bug found by validating the deployed
+    # extractor against actual auto_extraction rows.
+
+    def test_never_inside_whenever_is_not_preference(self):
+        # Root cause of the "Read it whenever you wake up." false-positive: the
+        # keyword "never" matched the substring "ne**ver**" in "whene**ver**".
+        # Word-boundary matching must reject it (→ fact 0.5, below the 0.6 floor).
+        mtype, imp = _classify("Read it whenever you wake up.")
+        self.assertNotEqual(mtype, "preference")
+        self.assertLess(imp, 0.6)
+
+    def test_chose_inside_chosen_is_not_decision(self):
+        # Same substring class: "chose" must not match "ch**ose**n".
+        mtype, _ = _classify("The chosen approach was already documented.")
+        self.assertNotEqual(mtype, "decision")
+
+    def test_every_post_is_not_cadence(self):
+        # _CADENCE's "every X" arm matched "every post targets …" and falsely
+        # lifted importance to 0.8. Restricted to time units now.
+        _, imp = _classify("Every post targets a specific keyword gap.")
+        self.assertLess(imp, 0.8)
+
+    def test_every_week_still_cadence(self):
+        # The restriction must not break the real cadence case.
+        _, imp = _classify("Send the report every week.")
+        self.assertGreaterEqual(imp, 0.8)
+
+    def test_apostrophe_free_dont_like_is_preference(self):
+        # Casual typing omits the apostrophe; "i dont like" must still match.
+        mtype, imp = _classify("I dont like the new LinkedIn layout.")
+        self.assertEqual(mtype, "preference")
+        self.assertGreaterEqual(imp, 0.75)
+
+    def test_curly_apostrophe_normalized(self):
+        # Smart quotes (iOS/Telegram) use U+2019; normalize to straight.
+        mtype, _ = _classify("I’d rather send it as a PDF.")
+        self.assertEqual(mtype, "preference")
+
 
 # --------------------------------------------------------------------------- #
 # process_turn pipeline (writer + embed mocked)
@@ -192,6 +231,19 @@ class TestProcessTurn(unittest.TestCase):
         self.assertIn("preference", types)    # "make it on html"
         blob = " ".join(c for c, _, _ in written).lower()
         self.assertIn("friday", blob)         # cadence point survived
+
+    def test_whenever_turn_saves_nothing(self):
+        # Regression: "Read it whenever you wake up." was saved as a preference
+        # (imp 0.75) on .19 because "never" matched "whene**ver**". After the
+        # word-boundary fix it's fact 0.5, dropped at the 0.6 floor.
+        written, writer = _fake_writer()
+        stats = process_turn(
+            {"agent_name": "sol", "user_content": "Read it whenever you wake up.",
+             "assistant_content": ""},
+            conn=None, embed_fn=lambda s: None, writer=writer, min_importance=0.6,
+        )
+        self.assertEqual(stats["saved"], 0)
+        self.assertEqual(written, [])
 
     def test_duplicate_skipped_via_cosine(self):
         written, writer = _fake_writer()

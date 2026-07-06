@@ -60,6 +60,10 @@ _PREFERENCE = (
     "i prefer", "prefer ", "i want", "i'd like", "i like", "i don't like",
     "always", "never", "make sure", "make it", "should be", "needs to be",
     "has to be", "i'd rather", "keep it", "don't ", "do not ",
+    # Apostrophe-free variants — casual typing ("i dont like") misses the
+    # "i don't like" keyword above. Curly apostrophes are normalized at match
+    # time, but a fully omitted apostrophe is not, so cover it explicitly.
+    "i dont like", "dont like", "i dont want", "dont want",
 )
 _RULE = (
     "rule:", "policy:", "must", "mandatory", "required to", "never do",
@@ -76,6 +80,29 @@ _EVENT = (
     "went down", "ran the", "sent the", "created the",
 )
 
+# --- Word-boundary compiled lexicon ---------------------------------------- #
+# Keyword phrases are matched as whole tokens, NOT substrings. A bare
+# ``k in text`` test let "never" match "whene**ver**" and "chose" match
+# "ch**ose**n", saving chatter like "Read it whenever you wake up." as a
+# preference. The lookarounds treat only [A-Za-z0-9_] as token chars, so an
+# apostrophe correctly counts as a boundary (and "don't" is its own token).
+# Trailing-space keywords (prefix intent, e.g. "don't ") are stripped — the
+# trailing lookaround anchors the token instead. Curly/smart apostrophes are
+# normalized to straight first.
+_APOS = str.maketrans({"’": "'", "‘": "'", "`": "'"})
+
+
+def _compile_lexicon(keywords) -> "re.Pattern":
+    parts = [re.escape(k.strip().translate(_APOS)) for k in keywords if k.strip()]
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + r")(?!\w)", re.I)
+
+
+_DECISION_RE = _compile_lexicon(_DECISION)
+_PREFERENCE_RE = _compile_lexicon(_PREFERENCE)
+_RULE_RE = _compile_lexicon(_RULE)
+_IDENTITY_RE = _compile_lexicon(_IDENTITY)
+_EVENT_RE = _compile_lexicon(_EVENT)
+
 # Patterns that lift importance — concrete signals are more durable than prose.
 _AMOUNT = re.compile(r"[\$€£]\s?\d|\d+\s?(k|eur|usd|gbp|/mo|/month|per month|/yr|/year)", re.I)
 _DATELIKE = re.compile(
@@ -87,10 +114,12 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _IP = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _URL = re.compile(r"https?://", re.I)
 # Cadence / recurrence — a standing commitment ("weekly", "every Friday",
-# "Friday evening", "end of week") is durable and worth lifting.
+# "Friday evening", "end of week") is durable and worth lifting. NOTE: the
+# ``every`` arm is restricted to time units; a bare ``every\s+\w+`` matched
+# "every post targets …" (not a cadence) and falsely lifted importance.
 _CADENCE = re.compile(
     r"\b(weekly|daily|monthly|quarterly|yearly|annually|recurring|"
-    r"every\s+\w+|"
+    r"every\s+(?:other\s+)?(?:week|day|month|quarter|year|hour|minute)s?|"
     r"(?:mon|tues|wednes|thurs|fri|sat|sun)days?|"
     r"end of (?:week|month|day)|eow|eod|eom)\b",
     re.I,
@@ -140,18 +169,18 @@ def _is_trivia(text: str) -> bool:
 
 def _classify(text: str) -> tuple[str, float]:
     """Return (memory_type, importance) using heuristic indicators."""
-    low = text.lower()
+    low = text.lower().translate(_APOS)
 
     mtype = "fact"
-    if any(k in low for k in _DECISION):
+    if _DECISION_RE.search(low):
         mtype = "decision"
-    elif any(k in low for k in _PREFERENCE):
+    elif _PREFERENCE_RE.search(low):
         mtype = "preference"
-    elif any(k in low for k in _RULE):
+    elif _RULE_RE.search(low):
         mtype = "fact"  # rules recorded as facts until a dedicated type is needed
-    elif any(k in low for k in _IDENTITY):
+    elif _IDENTITY_RE.search(low):
         mtype = "identity"
-    elif any(k in low for k in _EVENT):
+    elif _EVENT_RE.search(low):
         mtype = "event"
 
     # Importance: concrete signals bump it; decisions/rules/identity are high by default.
