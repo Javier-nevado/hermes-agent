@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -18,6 +19,28 @@ from .deps import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_abi_logging() -> None:
+    """Attach a stderr handler to the ``abi`` logger so app INFO lines surface.
+
+    uvicorn's default ``LOGGING_CONFIG`` leaves the root logger with **no
+    handler** (``root = {}``). Its own ``uvicorn``/``uvicorn.access`` loggers
+    carry dedicated handlers with ``propagate=False``, so they emit fine — but
+    every logger that propagates to root (everything under ``abi.*``: the
+    auto-extraction per-turn stats, "DB pool initialized", "Extraction queue
+    started", migration lines) is silently dropped. Configuring the ``abi``
+    logger directly is the contained fix — it doesn't touch global logging, and
+    ``propagate=False`` prevents any future root handler from double-emitting.
+    """
+    abi = logging.getLogger("abi")
+    if abi.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    abi.addHandler(handler)
+    abi.setLevel(logging.INFO)
+    abi.propagate = False
 
 
 @asynccontextmanager
@@ -67,4 +90,5 @@ def create_app() -> FastAPI:
     return app
 
 
+_configure_abi_logging()
 app = create_app()
