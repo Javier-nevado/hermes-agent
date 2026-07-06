@@ -369,6 +369,11 @@ def resolve_dreamer_llm(args) -> Tuple[Optional[Any], Optional[str]]:
         print("[fatal] could not resolve an LLM via hermes config. Set auxiliary.dreamer.{provider,"
               "model} in config.yaml, or use --llm-base-url.")
         return None, None
+    # --model-override swaps the model but keeps the hermes-resolved client
+    # (provider/key/base_url). Use a cheap non-reasoning model (e.g. glm-4.5-air)
+    # for the big overnight run without touching each agent's config.
+    if getattr(args, "model_override", None):
+        model = args.model_override
     # Best-effort: disable the client's internal retry so SIGALRM isn't defeated.
     try:
         client.max_retries = 0  # type: ignore[attr-defined]
@@ -433,7 +438,13 @@ def densify_batch(client, model: str, items: List[dict],
                 time.sleep(min(LLM_BACKOFF_BASE * (2 ** (attempt - 1)), 30.0))
     if resp is None:
         return {}, last_err or "LLM error (no response after retries)", 0
-    content = (resp.choices[0].message.content or "") if resp.choices else ""
+    msg = resp.choices[0].message if resp.choices else None
+    content = (getattr(msg, "content", None) or "") if msg else ""
+    # Reasoning models (glm-4.x-flash, glm-5.x) can spend the token budget on
+    # chain-of-thought and emit the answer ONLY in reasoning_content; fall back
+    # to it and let parse_json_lenient pull the JSON out of any surrounding prose.
+    if not content.strip():
+        content = (getattr(msg, "reasoning_content", None) or "") if msg else ""
     usage = getattr(resp, "usage", None)
     tokens = 0
     if usage:
@@ -838,6 +849,9 @@ def main() -> int:
     ap.add_argument("--llm-base-url", default=None,
                     help="bypass hermes; call this OpenAI-compatible endpoint directly (container densify-all)")
     ap.add_argument("--llm-model", default=None, help="with --llm-base-url: model name (default opteia-fast)")
+    ap.add_argument("--model-override", default=None,
+                    help="keep the hermes-resolved client (provider/key) but use THIS model "
+                         "(e.g. glm-4.5-air for a faster non-reasoning densify run)")
     ap.add_argument("--llm-api-key-env", default="LLM_API_KEY",
                     help="env var holding the API key for --llm-base-url (default LLM_API_KEY)")
     ap.add_argument("--api-url", default=None, help="abi-memory-api base URL (default $ABI_MEMORY_API_URL or http://localhost:8010)")

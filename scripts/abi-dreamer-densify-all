@@ -38,6 +38,14 @@ if [ -z "${AGENTS:-}" ]; then
 fi
 
 echo "[abi-dreamer-densify-all] HERMES_PACKAGE_ROOT=$HERMES_PACKAGE_ROOT agents: $AGENTS"
+# Optional: override the model (keeps each agent's hermes client/provider+key)
+# to a cheaper non-reasoning model for the big run. Default = each agent's own
+# configured model (auxiliary.dreamer, else main).
+MODEL_ARG=()
+if [ -n "${ABI_DENSIFY_MODEL:-}" ]; then
+  MODEL_ARG=(--model-override "$ABI_DENSIFY_MODEL")
+  echo "[abi-dreamer-densify-all] model override: $ABI_DENSIFY_MODEL"
+fi
 for agent in $AGENTS; do
   home="/home/$agent/.hermes"
   if [ ! -d "$home" ]; then
@@ -49,6 +57,6 @@ for agent in $AGENTS; do
   sudo -u "$agent" \
     HERMES_HOME="$home" \
     HERMES_PACKAGE_ROOT="$HERMES_PACKAGE_ROOT" \
-    "$HERMES_PYTHON" -m abi.dreamer --phase densify --agent "$agent" --write
+    "$HERMES_PYTHON" -m abi.dreamer --phase densify --agent "$agent" --write "${MODEL_ARG[@]}"
 done
 echo "[abi-dreamer-densify-all] done."
