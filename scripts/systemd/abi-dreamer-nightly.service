@@ -14,6 +14,16 @@ User=root
 # If unset, the wrapper discovers active agents from the abi-memory-api DB.
 # Environment="ABI_DENSIFY_AGENTS=atlas iris sol ailean vera caspian jen"
 #
+# Override the densify model (keeps each agent's hermes client/provider+key).
+# Validated on .19: glm-4.7-flash (fast REASONING model -- reasoning models
+# isolate chain-of-thought into reasoning_content, leaving `content` as clean
+# JSON; non-reasoning models like glm-4.5-air dump CoT into content and flake).
+# Environment="ABI_DENSIFY_MODEL=glm-4.7-flash"
+#
+# Batch size (memories per LLM call). 5 keeps reasoning-CoT + JSON within the
+# 4k token budget (low parse-error rate on long memories).
+# Environment="ABI_DENSIFY_BATCH=5"
+#
 # Host python with openai + the hermes source tree (default below; some
 # customer VMs use /opt/hermes-gateway/.venv/bin/python3).
 # Environment="HERMES_PYTHON=/opt/hermes-agent/.venv/bin/python3"
