@@ -285,6 +285,65 @@ class TestProcessTurn(unittest.TestCase):
         )
         self.assertEqual(stats["saved"], 0)
 
+    # --- Assistant-echo turn-local suppression (2026-07-06) -------------------- #
+
+    def test_assistant_echo_of_user_decision_dropped(self):
+        # Regression: when the assistant restates the user's decision ("Great, we
+        # decided to use PostgreSQL") both used to save — cross-turn dedup needs a
+        # DB neighbor at 0.85, and a same-turn restatement isn't one yet. Turn-local
+        # echo suppression drops the assistant restatement; the user's wording is
+        # canonical. Identical embeds → cosine 1.0 ≥ 0.70 threshold.
+        written, writer = _fake_writer()
+        fake_conn = _FakeConn([])  # no existing rows → no cross-turn dedup
+        stats = process_turn(
+            {"agent_name": "atlas",
+             "user_content": "We decided to use PostgreSQL for storage.",
+             "assistant_content": "Great, we decided to use PostgreSQL for storage."},
+            conn=fake_conn, embed_fn=lambda s: [1.0] * 8, writer=writer,
+            dedup_threshold=0.85, min_importance=0.6,
+        )
+        self.assertEqual(stats["saved"], 1)
+        self.assertEqual(stats["skipped_echo"], 1)
+        self.assertEqual(len(written), 1)
+        # The survivor is the user's utterance, not the assistant's "Great, " echo.
+        self.assertNotIn("Great", written[0][0])
+
+    def test_assistant_new_info_not_dropped(self):
+        # Echo suppression must not eat genuinely new assistant content. The
+        # assistant adds a separate decision (weekly reviews) unrelated to the
+        # user's (PostgreSQL) → orthogonal embeds → cosine 0 < 0.70 → both kept.
+        written, writer = _fake_writer()
+        fake_conn = _FakeConn([])
+
+        def embed(text):
+            return [0.0, 1.0, 0.0, 0.0] if "reviews" in text.lower() else [1.0, 0.0, 0.0, 0.0]
+
+        stats = process_turn(
+            {"agent_name": "atlas",
+             "user_content": "We decided to use PostgreSQL for storage.",
+             "assistant_content": "Noted. I've also decided to schedule weekly reviews for the team."},
+            conn=fake_conn, embed_fn=embed, writer=writer,
+            dedup_threshold=0.85, min_importance=0.6,
+        )
+        self.assertEqual(stats["saved"], 2)
+        self.assertEqual(stats["skipped_echo"], 0)
+        blob = " ".join(c for c, _, _ in written).lower()
+        self.assertIn("postgresql", blob)
+        self.assertIn("reviews", blob)
+
+    def test_echo_dedup_noop_without_embed_fn(self):
+        # No embedder (model load failed / disabled) → echo suppression is a no-op;
+        # both candidates survive and flow to normal dedup/write. Never blocks writes.
+        written, writer = _fake_writer()
+        stats = process_turn(
+            {"agent_name": "atlas",
+             "user_content": "We decided to use PostgreSQL for storage.",
+             "assistant_content": "Great, we decided to use PostgreSQL for storage."},
+            conn=_FakeConn([]), embed_fn=None, writer=writer, min_importance=0.6,
+        )
+        self.assertEqual(stats["skipped_echo"], 0)
+        self.assertGreaterEqual(stats["saved"], 1)
+
 
 class TestIsDuplicate(unittest.TestCase):
     def test_no_embed_fn_means_no_dup(self):

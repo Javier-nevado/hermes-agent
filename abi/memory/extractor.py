@@ -28,6 +28,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+# The extractor emits one INFO stats line per turn that saves ("auto-extract
+# agent=X: N saved …"). ``abi.*`` defaults to WARNING in the API container,
+# which hid it; surface it explicitly. The ``/extraction/stats`` endpoint is
+# the queryable counterpart for ops.
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.INFO)
 
 # --------------------------------------------------------------------------- #
 # Heuristic lexicon (PR-3a). Keep conservative — false negatives are cheap
@@ -137,16 +143,39 @@ _NOISE_LINE = re.compile(
 MIN_CANDIDATE_LEN = 16
 MAX_CANDIDATE_LEN = 500
 
+# Turn-local assistant-echo suppression: an assistant candidate that cosine-matches
+# a user candidate from the SAME turn this closely is a restatement, not a new
+# memory — the user's own words are canonical. Lower than the cross-turn dedup
+# threshold (0.85) because within-turn paraphrases are near-duplicates by design.
+ASSISTANT_ECHO_THRESHOLD = 0.70
+
 
 @dataclass
 class Candidate:
     text: str
     memory_type: str  # preference|decision|fact|event|identity|other
     importance: float  # [0,1]
+    origin: str = "user"  # "user" | "assistant" — user utterances are canonical
 
 
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _cosine(a: "list[float]", b: "list[float]") -> float:
+    """Cosine similarity of two equal-length dense vectors. Returns 0.0 on any
+    shape mismatch or zero vector (never raises — used in dedup hot path)."""
+    try:
+        import math
+
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+    except Exception:
+        return 0.0
 
 
 def _is_trivia(text: str) -> bool:
@@ -212,7 +241,7 @@ def select_candidates(user_content: str, assistant_content: str) -> list[Candida
     out: list[Candidate] = []
     seen_norm: set[str] = set()
 
-    def add_sentences(block: str, *, require_signal: bool) -> None:
+    def add_sentences(block: str, *, require_signal: bool, origin: str) -> None:
         for raw in _SENT_SPLIT.split(block or ""):
             text = _clean(raw)
             if not text or len(text) < MIN_CANDIDATE_LEN or len(text) > MAX_CANDIDATE_LEN:
@@ -229,10 +258,10 @@ def select_candidates(user_content: str, assistant_content: str) -> list[Candida
             if not norm or norm in seen_norm:
                 continue
             seen_norm.add(norm)
-            out.append(Candidate(text=text, memory_type=mtype, importance=importance))
+            out.append(Candidate(text=text, memory_type=mtype, importance=importance, origin=origin))
 
-    add_sentences(user_content, require_signal=False)
-    add_sentences(assistant_content, require_signal=True)
+    add_sentences(user_content, require_signal=False, origin="user")
+    add_sentences(assistant_content, require_signal=True, origin="assistant")
     return out
 
 
@@ -307,6 +336,47 @@ def is_duplicate(
     return False
 
 
+def _drop_assistant_echoes(
+    candidates: list[Candidate],
+    embed_fn: Optional[Callable[[str], Optional[list[float]]]],
+    stats: dict,
+) -> list[Candidate]:
+    """Remove assistant candidates that cosine-match a user candidate from the
+    same turn — restatements, not new memories (the user's words are canonical).
+
+    No-op without ``embed_fn`` or any user candidate. Mutates
+    ``stats['skipped_echo']``. Embeds each user candidate once; never raises on
+    an embed error (degrades to keeping the candidate).
+    """
+    if not embed_fn:
+        return candidates
+    user_cands = [c for c in candidates if c.origin == "user"]
+    if not user_cands:
+        return candidates
+    user_embs: list[list[float]] = []
+    for uc in user_cands:
+        try:
+            e = embed_fn(uc.text)
+        except Exception:
+            e = None
+        if e:
+            user_embs.append(e)
+    if not user_embs:
+        return candidates
+    kept: list[Candidate] = []
+    for c in candidates:
+        if c.origin == "assistant":
+            try:
+                ce = embed_fn(c.text)
+            except Exception:
+                ce = None
+            if ce and any(_cosine(ce, ue) >= ASSISTANT_ECHO_THRESHOLD for ue in user_embs):
+                stats["skipped_echo"] += 1
+                continue
+        kept.append(c)
+    return kept
+
+
 def process_turn(
     payload: dict,
     *,
@@ -332,7 +402,12 @@ def process_turn(
 
     candidates = select_candidates(user_content, assistant_content)
 
-    stats = {"candidates": len(candidates), "saved": 0, "skipped_trivia_floor": 0, "skipped_dup": 0}
+    stats = {"candidates": len(candidates), "saved": 0, "skipped_trivia_floor": 0, "skipped_dup": 0, "skipped_echo": 0}
+
+    # Turn-local echo suppression: drop assistant candidates that restate a user
+    # candidate from this same turn (the user's words are canonical).
+    candidates = _drop_assistant_echoes(candidates, embed_fn, stats)
+
     for cand in candidates:
         if cand.importance < min_importance:
             stats["skipped_trivia_floor"] += 1
@@ -361,8 +436,8 @@ def process_turn(
 
     if stats["saved"]:
         logger.info(
-            "auto-extract agent=%s: %d saved (%d dup, %d below floor, %d candidates)",
-            agent_name, stats["saved"], stats["skipped_dup"],
+            "auto-extract agent=%s: %d saved (%d dup, %d echo, %d below floor, %d candidates)",
+            agent_name, stats["saved"], stats["skipped_dup"], stats["skipped_echo"],
             stats["skipped_trivia_floor"], stats["candidates"],
         )
     return stats
