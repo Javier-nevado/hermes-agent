@@ -46,9 +46,14 @@ echo "[abi-dreamer-densify-all] HERMES_PACKAGE_ROOT=$HERMES_PACKAGE_ROOT agents:
 # configured model (auxiliary.dreamer, else main).
 MODEL_ARG=()
 if [ -n "${ABI_DENSIFY_MODEL:-}" ]; then
-  MODEL_ARG=(--model-override "$ABI_DENSIFY_MODEL")
+  MODEL_ARG+=(--model-override "$ABI_DENSIFY_MODEL")
   echo "[abi-dreamer-densify-all] model override: $ABI_DENSIFY_MODEL"
 fi
+# Batch 5 (not the code default 10): reasoning-model CoT + JSON both fit in the
+# 4k token budget per call, keeping the parse-error rate low on long memories.
+BATCH="${ABI_DENSIFY_BATCH:-5}"
+MODEL_ARG+=(--batch-size "$BATCH")
+echo "[abi-dreamer-densify-all] batch-size: $BATCH"
 for agent in $AGENTS; do
   home="/home/$agent/.hermes"
   if [ ! -d "$home" ]; then
