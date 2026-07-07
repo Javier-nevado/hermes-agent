@@ -1,10 +1,16 @@
 #!/opt/hermes-agent/.venv/bin/python3
-"""ABI Dreamer wrapper — ensures correct Python path and venv.
+"""ABI Dreamer wrapper — ensures correct Python path and venv (host-side entry).
 
-Usage:
-    sudo scripts/abi-dreamer              # All agents
-    sudo scripts/abi-dreamer --dry-run     # Preview
-    sudo scripts/abi-dreamer --agent atlas  # Single agent
+Thin shim over ``abi.dreamer.__main__:main``. The dreamer is dual-mode:
+heuristic phases run in the abi-memory-api container (need psycopg2); Phase 5
+densification runs on the host per-agent (needs the agent's hermes config + LLM).
+This wrapper is for host-side densify runs:
+
+    sudo -u atlas HERMES_HOME=/home/atlas/.hermes scripts/abi-dreamer --phase densify --agent atlas
+    sudo scripts/abi-dreamer --phase densify --agent atlas --dry-run
+
+For the heuristic phases, run inside the container instead:
+    docker exec abi-memory-api python3 -m abi.dreamer --phase heuristic
 """
 
 import sys

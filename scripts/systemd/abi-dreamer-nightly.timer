@@ -1,0 +1,14 @@
+[Unit]
+Description=Run ABI Dreamer nightly (dedup + densify) at ~03:17 local
+Documentation=https://github.com/Javier-nevado/hermes-agent
+
+[Timer]
+# 03:17 — off the :00/:30 marks. Persistent=true catches up a missed run after
+# downtime/sleep (so the first overnight densify-all happens even if the box
+# was off at the scheduled instant). RandomizedDelaySec spreads fleet load.
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

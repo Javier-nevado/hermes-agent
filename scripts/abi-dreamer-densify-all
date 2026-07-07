@@ -1,0 +1,76 @@
+#!/bin/bash
+# abi-dreamer-densify-all — run Phase 5 (densification) for every active agent,
+# ON THE HOST, each under its own user + HERMES_HOME so the LLM resolves to that
+# agent's configured model (auxiliary.dreamer, else the main model).
+#
+# Why per-agent on the host: the abi-memory-api container has no per-agent
+# hermes config / LLM creds, and the DB port isn't published to the host, so
+# densification is API-only (localhost:8010) + uses each agent's own LLM.
+#
+# Config (env, per-box — set in the systemd service or shell):
+#   ABI_DENSIFY_AGENTS  space-separated agent usernames
+#                       (default: discovered via the abi-memory-api DB)
+#   HERMES_PYTHON       host python with openai + hermes source tree
+#                       (default /opt/hermes-agent/.venv/bin/python3)
+#   HERMES_PACKAGE_ROOT hermes repo root (default /opt/hermes-agent)
+#
+# Manual run:  sudo ABI_DENSIFY_AGENTS="atlas iris" scripts/abi-dreamer-densify-all
+set -uo pipefail
+
+HERMES_PYTHON="${HERMES_PYTHON:-/opt/hermes-agent/.venv/bin/python3}"
+export HERMES_PACKAGE_ROOT="${HERMES_PACKAGE_ROOT:-/opt/hermes-agent}"
+# `python -m abi.dreamer` needs the abi package importable at startup, BEFORE the
+# module's own sys.path manipulation runs — so put the repo root on PYTHONPATH.
+export PYTHONPATH="$HERMES_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+AGENTS="${ABI_DENSIFY_AGENTS:-}"
+if [ -z "$AGENTS" ]; then
+  # Use the CONTAINER's python3, NOT $HERMES_PYTHON (a host path that doesn't
+  # exist inside abi-memory-api — passing it made discovery silently fail and the
+  # wrapper exit with "no agents to process").
+  AGENTS="$(docker exec abi-memory-api python3 -c "
+import os, psycopg2
+c = psycopg2.connect(os.environ.get('ABI_DATABASE_URL', ''))
+cur = c.cursor()
+cur.execute(\"SELECT username FROM abi_agents WHERE status='active' ORDER BY username\")
+print(' '.join(r[0] for r in cur.fetchall()))
+" 2>/dev/null || true)"
+fi
+
+if [ -z "${AGENTS:-}" ]; then
+  echo "[abi-dreamer-densify-all] no agents to process."
+  echo "  Set ABI_DENSIFY_AGENTS='atlas iris ...' or ensure the container DB query works."
+  exit 0
+fi
+
+echo "[abi-dreamer-densify-all] HERMES_PACKAGE_ROOT=$HERMES_PACKAGE_ROOT agents: $AGENTS"
+# Optional: override the model (keeps each agent's hermes client/provider+key)
+# to a cheaper non-reasoning model for the big run. Default = each agent's own
+# configured model (auxiliary.dreamer, else main).
+MODEL_ARG=()
+if [ -n "${ABI_DENSIFY_MODEL:-}" ]; then
+  MODEL_ARG+=(--model-override "$ABI_DENSIFY_MODEL")
+  echo "[abi-dreamer-densify-all] model override: $ABI_DENSIFY_MODEL"
+fi
+# Batch 5 (not the code default 10): reasoning-model CoT + JSON both fit in the
+# 4k token budget per call, keeping the parse-error rate low on long memories.
+BATCH="${ABI_DENSIFY_BATCH:-5}"
+MODEL_ARG+=(--batch-size "$BATCH")
+echo "[abi-dreamer-densify-all] batch-size: $BATCH"
+for agent in $AGENTS; do
+  home="/home/$agent/.hermes"
+  if [ ! -d "$home" ]; then
+    echo "[abi-dreamer-densify-all] skip $agent (no HERMES_HOME at $home)"
+    continue
+  fi
+  echo "[abi-dreamer-densify-all] densify $agent (own LLM via $home)..."
+  # Runs as the agent user so HERMES_HOME + any agent-local creds resolve.
+  # PYTHONPATH passed inline: sudo strips the exported env, but honors VAR=value
+  # leading args. `python -m abi.dreamer` needs abi on the path at startup.
+  sudo -u "$agent" \
+    HERMES_HOME="$home" \
+    HERMES_PACKAGE_ROOT="$HERMES_PACKAGE_ROOT" \
+    PYTHONPATH="$HERMES_PACKAGE_ROOT" \
+    "$HERMES_PYTHON" -m abi.dreamer --phase densify --agent "$agent" --write "${MODEL_ARG[@]}"
+done
+echo "[abi-dreamer-densify-all] done."
