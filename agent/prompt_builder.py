@@ -1297,7 +1297,21 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
 
 
 def load_soul_md() -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+    """Load the agent soul from HERMES_HOME and return its content, or None.
+
+    Composed of two optional files (concatenated in this order):
+      * ``SOUL.md``         — agent-owned identity/role/personal context. The
+                              agent MAY edit this (evolve its own identity).
+      * ``SOUL.service.md`` — root-owned platform policy, tamper-proof (the agent
+                              has no sudo, so it cannot modify it). Carries
+                              non-negotiable service rules such as the mandatory
+                              abi-memory storage policy.
+
+    This split lets the service enforce platform policy (root-owned fragment)
+    without freezing the agent's own identity (editable SOUL.md). The real
+    enforcement of e.g. "no local memory tool" is the config gate in
+    agent_init.py (memory_enabled=false -> tool never registered); the service
+    fragment is the behavioral statement of it.
 
     Used as the agent identity (slot #1 in the system prompt).  When this
     returns content, ``build_context_files_prompt`` should be called with
@@ -1309,19 +1323,23 @@ def load_soul_md() -> Optional[str]:
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
+    home = get_hermes_home()
+    parts = []
+    for name in ("SOUL.md", "SOUL.service.md"):
+        path = home / name
+        try:
+            if not path.exists():
+                continue
+            chunk = path.read_text(encoding="utf-8").strip()
+            if chunk:
+                parts.append(_scan_context_content(chunk, name))
+        except Exception as e:
+            logger.debug("Could not read %s from %s: %s", name, path, e)
+    if not parts:
         return None
-    try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
-        return content
-    except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+    content = "\n\n".join(parts)
+    content = _truncate_content(content, "SOUL.md")
+    return content
 
 
 def _load_hermes_md(cwd_path: Path) -> str:
