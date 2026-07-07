@@ -74,6 +74,15 @@ if [ -d opteia-skills/standard ]; then
   echo "  standard skills -> per-agent ~/.hermes/skills/opteia/standard"
 fi
 
+# 4b. Enforce ABI memory policy on agent homes (disable local file-based memory
+# tool; root-own the SOUL policy section). Idempotent; safe on fresh + existing.
+echo "Enforcing ABI memory policy..."
+if [ -x scripts/abi-enforce-memory-policy.sh ]; then
+  sudo bash scripts/abi-enforce-memory-policy.sh || echo "  (memory-policy enforcement reported warnings — continuing)"
+else
+  echo "  scripts/abi-enforce-memory-policy.sh not found in tarball — skip"
+fi
+
 # 5. Health check
 echo "Waiting for abi-api health..."
 for i in $(seq 1 30); do

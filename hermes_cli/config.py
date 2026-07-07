@@ -1368,10 +1368,16 @@ DEFAULT_CONFIG = {
         "engine": "compressor",
     },
 
-    # Persistent memory -- bounded curated memory injected into system prompt
+    # Persistent memory -- bounded curated memory injected into system prompt.
+    # ABI fork policy: the local file-based `memory` tool (MEMORY.md, ~2200-char
+    # cap) is DISABLED by default. Agents use the abi_memory provider instead
+    # (PostgreSQL + pgvector: unlimited, encrypted, semantic search). Setting
+    # these False here means a config.yaml without an EXPLICIT override loads no
+    # MemoryStore (agent_init.py), so the local `memory` tool is never registered.
+    # See scripts/abi-enforce-memory-policy.sh + abi/provision.
     "memory": {
-        "memory_enabled": True,
-        "user_profile_enabled": True,
+        "memory_enabled": False,
+        "user_profile_enabled": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).

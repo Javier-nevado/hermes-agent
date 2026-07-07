@@ -618,6 +618,10 @@ def generate_config(username: str, mcps: List[str], clearance: str,
         "",
         "memory:",
         "  provider: abi_memory",
+        "  # ABI policy: local file-based memory tool DISABLED -- use the abi_memory",
+        "  # tools (abi_remember/abi_recall/abi_forget). See abi-enforce-memory-policy.sh.",
+        "  memory_enabled: false",
+        "  user_profile_enabled: false",
         "",
         "# Auto-approve tool execution (prevents agents from getting stuck)",
         "approvals:",
@@ -876,6 +880,16 @@ def provision(
 
     step(7, total_steps, "Writing SOUL.md")
     write_soul(name, display_name, role, soul)
+
+    # Apply the ABI memory policy: writes the root-owned SOUL.service.md platform
+    # fragment (tamper-proof) + confirms the config flags. The enforcement script
+    # is the single source of truth for the policy text + the composed-SOUL layout.
+    # Runs after write_soul because abi-provision runs AFTER abi-bootstrap (whose
+    # own enforcement hook would otherwise miss the freshly-created agent home).
+    enforce = Path(__file__).resolve().parents[2] / "scripts" / "abi-enforce-memory-policy.sh"
+    if enforce.exists():
+        run(["bash", str(enforce), name], check=False)
+        print("  ABI memory policy applied (SOUL.service.md written, config flags confirmed)")
 
     if not skip_db:
         step(8, total_steps, "Creating PostgreSQL role")
