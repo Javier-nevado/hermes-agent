@@ -25,7 +25,10 @@ export PYTHONPATH="$HERMES_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 AGENTS="${ABI_DENSIFY_AGENTS:-}"
 if [ -z "$AGENTS" ]; then
-  AGENTS="$(docker exec abi-memory-api "$HERMES_PYTHON" -c "
+  # Use the CONTAINER's python3, NOT $HERMES_PYTHON (a host path that doesn't
+  # exist inside abi-memory-api — passing it made discovery silently fail and the
+  # wrapper exit with "no agents to process").
+  AGENTS="$(docker exec abi-memory-api python3 -c "
 import os, psycopg2
 c = psycopg2.connect(os.environ.get('ABI_DATABASE_URL', ''))
 cur = c.cursor()

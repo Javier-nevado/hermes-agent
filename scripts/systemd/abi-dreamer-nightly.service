@@ -1,5 +1,5 @@
 [Unit]
-Description=ABI Dreamer — nightly memory intelligence (dedup + densify)
+Description=ABI Dreamer — nightly memory intelligence (densify; dedup opt-in)
 Documentation=https://github.com/Javier-nevado/hermes-agent
 After=docker.service
 Wants=docker.service
@@ -10,6 +10,13 @@ ExecStart=/usr/local/sbin/abi-dreamer-nightly.sh
 User=root
 
 # --- Per-box config (uncomment + edit before enabling) ---------------------
+# Nightly default is DENSIFY ONLY (safe: in-place rewrite + audit trail).
+# Dedup is OFF — phase_dedup's >0.90 cosine threshold is uncalibrated for
+# All-MiniLM-L6-v2 (atlas showed 10,646 pairs >0.90, mostly distinct-but-related
+# facts, not true dups). It hard-deletes with no audit trail. Enable ONLY after
+# calibrating the threshold against decrypted pairs.
+# Environment="ABI_DREAMER_DEDUP=1"
+#
 # Space-separated agents to densify on the host (each uses its own LLM).
 # If unset, the wrapper discovers active agents from the abi-memory-api DB.
 # Environment="ABI_DENSIFY_AGENTS=atlas iris sol ailean vera caspian jen"
