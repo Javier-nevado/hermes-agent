@@ -302,6 +302,14 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
     "kimi-coding",
     "kimi-coding-cn",
+    # ABI: the zai *coding* subscription has no glm-5v-turbo, so the auto
+    # vision path (provider: auto) 429s and marks the shared text credential
+    # exhausted — breaking text inference fleet-wide. Skip zai in the auto
+    # path so vision falls through to the aggregator chain (graceful "can't
+    # see image" when none is configured). Vision stays opt-in: an explicit
+    # auxiliary.vision backend (e.g. a configured New-API vision model) still
+    # works, since this set only gates the auto path.
+    "zai",
 })
 
 # OpenRouter app attribution headers (base — always sent).
