@@ -135,3 +135,54 @@ def configure_agent_bot(token: str, display_name: str) -> Dict:
         "bot_username": username,
         "bot_name": display_name,
     }
+
+
+def create_forum_topic(admin_token: str, group_id: str, name: str,
+                       icon_color: Optional[int] = None) -> Optional[int]:
+    """Create a forum topic in a supergroup.
+
+    The admin bot must be a group admin with can_manage_topics.
+
+    Args:
+        admin_token: Token of a bot that is a group admin with can_manage_topics.
+        group_id: Target supergroup (e.g. "-1003773226005").
+        name: Topic title.
+        icon_color: Optional Telegram topic icon color.
+
+    Returns:
+        The message_thread_id of the new topic, or None on failure.
+    """
+    try:
+        payload = {"name": name}
+        if icon_color is not None:
+            payload["icon_color"] = icon_color
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{TG_API}/bot{admin_token}/createForumTopic",
+            data=data,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("ok"):
+                return result.get("result", {}).get("message_thread_id")
+    except Exception:
+        return None
+    return None
+
+
+def close_forum_topic(admin_token: str, group_id: str, topic_id: int) -> bool:
+    """Close a forum topic (retains history, blocks new messages)."""
+    try:
+        data = json.dumps({"chat_id": group_id, "message_thread_id": topic_id}).encode()
+        req = urllib.request.Request(
+            f"{TG_API}/bot{admin_token}/closeForumTopic",
+            data=data,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()).get("ok", False)
+    except Exception:
+        return False

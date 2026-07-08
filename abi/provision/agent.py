@@ -54,10 +54,15 @@ DB_HOST = "localhost"
 DB_PORT = "5432"
 DB_NAME = "abi_memory"
 DB_ADMIN_USER = "abi_agent"
-DB_ADMIN_PASS = "abi_local_dev_2026"
+DB_ADMIN_PASS = os.environ.get("ABI_DB_ADMIN_PASS", "abi_local_dev_2026")
 
-# Role definitions for Step 2
-ROLE_OPTIONS = ["CEO", "CTO", "Marketing", "Sales", "Ops", "Finance"]
+# Shared inter-agent resources (match the 7 production agents on .19).
+TG_TEAM_GROUP = "-1003773226005"  # forum group; each agent owns a topic
+SHARED_ENV_SOURCE = "/home/ailean/.hermes/.env"  # copy shared infra vars from here
+
+# Role definitions for Step 2 (covers all 7 production agents + extras)
+ROLE_OPTIONS = ["CEO", "CTO", "Marketing", "Sales", "Ops", "Finance",
+                "Research", "Communications", "Sysadmin", "Workshops"]
 
 # Clearance descriptions for Step 3
 CLEARANCE_OPTIONS = [
@@ -68,7 +73,7 @@ CLEARANCE_OPTIONS = [
 
 # Provider-specific default models
 PROVIDER_DEFAULT_MODELS = {
-    "zai": "glm-5.1",
+    "zai": "glm-5.2",
     "anthropic": "claude-sonnet-4-6",
     "openrouter": "anthropic/claude-sonnet-4-6",
     "deepseek": "deepseek-chat",
@@ -521,13 +526,16 @@ def run(cmd: List[str], check: bool = True, **kwargs) -> subprocess.CompletedPro
 
 
 def create_linux_user(username: str) -> None:
-    """Step 1: Create Linux user for the agent."""
+    """Step 1: Create Linux user for the agent (member of shared abi-agents group)."""
     result = run(["id", username], check=False)
     if result.returncode == 0:
         print(f"  User {username} already exists, skipping creation.")
+        # Ensure group membership even on re-provision.
+        run(["sudo", "usermod", "-aG", "abi-agents", username], check=False)
         return
-    run(["sudo", "useradd", "-m", "-s", "/bin/bash", username], check=True)
-    print(f"  Created user: {username}")
+    run(["sudo", "groupadd", "-f", "abi-agents"], check=False)
+    run(["sudo", "useradd", "-m", "-s", "/bin/bash", "-G", "abi-agents", username], check=True)
+    print(f"  Created user: {username} (groups: {username}, abi-agents)")
 
 
 def set_home_permissions(username: str) -> None:
@@ -580,33 +588,137 @@ def generate_age_keypair(username: str) -> Dict[str, str]:
     return {"public_key": public_key, "private_key": "stored_in_key_file"}
 
 
+# ─── Shared-env + port allocation helpers ─────────────────────────────
+
+# Vars copied verbatim from an existing agent's .env (non-agent-specific infra).
+SHARED_ENV_VARS = [
+    "GLM_API_KEY", "GLM_BASE_URL",
+    "KANBOARD_URL", "KANBOARD_USER", "KANBOARD_TOKEN", "KANBOARD_PROJECT_ID",
+    "CAMOFOX_URL",
+    "HERMES_MEDIA_ALLOW_DIRS", "HERMES_MEDIA_TRUST_RECENT_SECONDS",
+]
+
+
+def _read_shared_env(source_path: str = SHARED_ENV_SOURCE) -> Dict[str, str]:
+    """Read shared (non-agent-specific) env vars from an existing agent's .env.
+
+    Runs as root under sudo (mode-600 source). Falls back to `sudo -n cat`;
+    raises a clear error if neither works (non-root without sudo).
+    """
+    shared: Dict[str, str] = {}
+    src = Path(source_path)
+    try:
+        if not src.exists():
+            return shared
+        text = src.read_text()
+    except PermissionError:
+        res = run(["sudo", "-n", "cat", str(src)], check=False)
+        text = res.stdout if res.returncode == 0 else ""
+        if not text:
+            raise ProvisioningError(
+                f"Cannot read {source_path} — abi-provision must run as root (sudo)."
+            )
+    for line in text.splitlines():
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            if k in SHARED_ENV_VARS:
+                shared[k] = v.strip()
+    return shared
+
+
+def _resolve_api_key() -> str:
+    """Resolve the shared inter-agent API_SERVER_KEY.
+
+    Discovers it from an existing agent's systemd unit (so every agent on the
+    box shares one key), falling back to $ABI_API_SERVER_KEY, then to a fresh
+    random key (first agent on a fresh box). The key is never hardcoded here.
+    """
+    try:
+        homes = sorted(os.listdir("/home"))
+    except PermissionError:
+        homes = []
+    for user in homes:
+        unit = Path("/home") / user / ".config" / "systemd" / "user" / "abi-agent.service"
+        try:
+            text = unit.read_text()
+        except (PermissionError, OSError):
+            res = run(["sudo", "-n", "cat", str(unit)], check=False)
+            text = res.stdout if res.returncode == 0 else ""
+        for line in text.splitlines():
+            if line.startswith("Environment=API_SERVER_KEY="):
+                k = line.split("=", 2)[2].strip()
+                if k:
+                    return k
+    return os.environ.get("ABI_API_SERVER_KEY", "") or _random_password(32)
+
+
+def allocate_api_port(preferred: Optional[int] = None) -> int:
+    """Find the lowest free inter-agent API port >= 8400.
+
+    Lists /home directly (world-listable) and reads each agent's user-level
+    systemd unit for API_SERVER_PORT=. Reads directly as root, falling back to
+    `sudo -n cat` for non-root runs — glob would silently skip unreadable home
+    dirs and collide on 8400. Pass `preferred` to force a specific port.
+    """
+    used: Set[int] = set()
+    try:
+        homes = sorted(os.listdir("/home"))
+    except PermissionError:
+        homes = []
+    for user in homes:
+        unit = Path("/home") / user / ".config" / "systemd" / "user" / "abi-agent.service"
+        try:
+            text = unit.read_text()
+        except (PermissionError, OSError):
+            res = run(["sudo", "-n", "cat", str(unit)], check=False)
+            text = res.stdout if res.returncode == 0 else ""
+        for line in text.splitlines():
+            if line.startswith("Environment=API_SERVER_PORT="):
+                try:
+                    used.add(int(line.split("=", 2)[2]))
+                except ValueError:
+                    continue
+    if preferred:
+        if preferred in used:
+            raise ProvisioningError(f"API port {preferred} already in use by an existing agent")
+        return preferred
+    port = 8400
+    while port in used:
+        port += 1
+    return port
+
+
 def generate_config(username: str, mcps: List[str], clearance: str,
-                    provider_slug: str = "zai", model: str = "") -> None:
-    """Step 5: Generate Hermes config.yaml."""
+                    provider_slug: str = "zai", model: str = "",
+                    reasoning_effort: str = "medium",
+                    allowed_topics: str = "", allowed_chats: str = "",
+                    opteia_gateway_key: str = "") -> None:
+    """Step 5: Generate Hermes config.yaml (production-parity)."""
     agent_home = Path(f"/home/{username}")
 
     if not model:
-        model = PROVIDER_DEFAULT_MODELS.get(provider_slug, "glm-5.1")
+        model = PROVIDER_DEFAULT_MODELS.get(provider_slug, "glm-5.2")
 
-    # Build config dynamically
     config_lines = [
         "model:",
         f'  default: "{model}"',
         f'  provider: "{provider_slug}"',
     ]
 
-    # Add provider-specific config
     if provider_slug == "zai":
-        config_lines.append("providers:")
-        config_lines.append("  zai:")
-        config_lines.append("    request_timeout_seconds: 300")
+        config_lines += [
+            "providers:",
+            "  zai:",
+            "    request_timeout_seconds: 300",
+        ]
 
-    config_lines.extend([
+    config_lines += [
         "",
         "agent:",
         "  max_turns: 60",
         "  verbose: false",
-        "  reasoning_effort: medium",
+        f"  reasoning_effort: {reasoning_effort}",
         "",
         "session_reset:",
         "  mode: both",
@@ -616,70 +728,120 @@ def generate_config(username: str, mcps: List[str], clearance: str,
         "streaming:",
         "  enabled: false",
         "",
+        "# ABI policy: local file-based memory DISABLED -- use the abi_memory_api",
+        "# HTTP tools (abi_remember/abi_recall/abi_forget) at localhost:8010 (~100ms).",
+        "# The direct-DB provider 'abi_memory' is ~10s and must NOT be used.",
+        "# See abi-enforce-memory-policy.sh.",
         "memory:",
-        "  provider: abi_memory",
-        "  # ABI policy: local file-based memory tool DISABLED -- use the abi_memory",
-        "  # tools (abi_remember/abi_recall/abi_forget). See abi-enforce-memory-policy.sh.",
+        "  provider: abi_memory_api",
         "  memory_enabled: false",
         "  user_profile_enabled: false",
         "",
+        "# Shared skill library (all agents). Per-agent /home/<u>/skills overrides.",
+        "skills:",
+        "  external_dirs:",
+        "    - /opt/abi-tools/skills",
+        "",
         "# Auto-approve tool execution (prevents agents from getting stuck)",
         "approvals:",
-        "  mode: \"off\"",
-    ])
+        '  mode: "off"',
+        "",
+        "# Kanban dispatch (shared /opt/abi-tools/kanban, root:abi-agents setgid).",
+        "kanban:",
+        "  dispatch_in_gateway: true",
+        "  dispatch_interval_seconds: 60",
+        "  failure_limit: 2",
+    ]
 
-    # Add MCP servers
+    # Telegram routing (response filter). TELEGRAM_ALLOWED_USERS in .env is the
+    # real auth gate; allowed_topics restricts which forum topics the bot answers in.
+    if allowed_topics or allowed_chats:
+        config_lines += [
+            "telegram:",
+            f"  allowed_chats: {allowed_chats}",
+            f"  allowed_topics: {allowed_topics}",
+        ]
+
+    # Opteia AI gateway (New-API) — enables /model switching to opteia-* aliases.
+    if opteia_gateway_key:
+        config_lines += [
+            "custom_providers:",
+            "  - name: New-API",
+            "    base_url: https://ai.javiernevado.net/v1",
+            f"    api_key: '{opteia_gateway_key}'",
+            "    model: opteia-fast",
+            "    models:",
+            "      opteia-fast: {}",
+            "      opteia-standard: {}",
+            "      opteia-premium: {}",
+            "      opteia-vision: {}",
+        ]
+
     if mcps:
         config_lines.append("mcp_servers:")
         for mcp in mcps:
-            config_lines.extend([
+            config_lines += [
                 f"  {mcp}:",
-                f"    command: /opt/hermes-agent/.venv/bin/python3",
-                f"    args:",
+                "    command: /opt/hermes-agent/.venv/bin/python3",
+                "    args:",
                 f"      - /opt/hermes-agent/abi/mcps/servers/mcp_{mcp}/server.py",
-                f"    transport: stdio",
-                f"    env:",
-                f"      PYTHONPATH: /opt/hermes-agent",
-            ])
+                "    transport: stdio",
+                "    env:",
+                "      PYTHONPATH: /opt/hermes-agent",
+            ]
 
     config = "\n".join(config_lines) + "\n"
     config_file = agent_home / ".hermes" / "config.yaml"
     config_file.write_text(config)
     run(["sudo", "chown", f"{username}:{username}", str(config_file)], check=True)
-    print(f"  Written config.yaml ({provider_slug}/{model}, {len(mcps)} MCP server(s))")
+    print(f"  Written config.yaml ({provider_slug}/{model}, effort={reasoning_effort}, {len(mcps)} MCP)")
 
 
 def write_env(username: str, api_key: str, telegram_token: str,
               allowed_users: str = "", provider_slug: str = "zai",
-              base_url: str = "") -> None:
-    """Step 6: Write .env file with secrets."""
+              base_url: str = "",
+              shared_env_source: str = SHARED_ENV_SOURCE,
+              opteia_gateway_key: str = "") -> None:
+    """Step 6: Write .env (agent secrets + shared infra vars copied from source)."""
     agent_home = Path(f"/home/{username}")
-
-    # Build env vars dynamically based on provider
+    shared = _read_shared_env(shared_env_source)
     env_lines = []
 
-    # API key
     key_env = PROVIDER_KEY_ENV.get(provider_slug, "")
-    if key_env and api_key:
+    # Explicit api_key wins; else reuse the source agent's value.
+    if api_key:
         env_lines.append(f"{key_env}={api_key}")
+    elif key_env and shared.get(key_env):
+        env_lines.append(f"{key_env}={shared[key_env]}")
 
-    # Base URL
     if base_url:
-        # Determine the base URL env var name
         base_env = "GLM_BASE_URL" if provider_slug == "zai" else f"{provider_slug.upper()}_BASE_URL"
         env_lines.append(f"{base_env}={base_url}")
+    elif provider_slug == "zai" and shared.get("GLM_BASE_URL"):
+        env_lines.append(f"GLM_BASE_URL={shared['GLM_BASE_URL']}")
 
-    # Telegram
+    # Telegram (agent-specific)
     env_lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
     if allowed_users:
         env_lines.append(f"TELEGRAM_ALLOWED_USERS={allowed_users}")
+
+    # Shared infra vars (kanban, camofox, media) copied from source agent.
+    for k in SHARED_ENV_VARS:
+        if k in ("GLM_API_KEY", "GLM_BASE_URL"):
+            continue  # handled above
+        if k in shared:
+            env_lines.append(f"{k}={shared[k]}")
+
+    # Opteia AI gateway key (consumer-only; for /model switching).
+    if opteia_gateway_key:
+        env_lines.append(f"OPTEIA_API_KEY={opteia_gateway_key}")
 
     env = "\n".join(env_lines) + "\n"
     env_file = agent_home / ".hermes" / ".env"
     env_file.write_text(env)
     run(["sudo", "chown", f"{username}:{username}", str(env_file)], check=True)
     os.chmod(env_file, 0o600)
-    print(f"  Written .env (mode 600)")
+    print(f"  Written .env (mode 600, {len(env_lines)} vars)")
 
 
 def write_soul(username: str, display_name: str, role: str, soul_path: Optional[str] = None) -> None:
@@ -706,57 +868,66 @@ def write_soul(username: str, display_name: str, role: str, soul_path: Optional[
     print(f"  Written SOUL.md ({len(soul_content)} bytes)")
 
 
-def create_db_role(username: str) -> None:
-    """Step 8: Create PostgreSQL role for the agent (optional)."""
+def _psql(sql: str) -> subprocess.CompletedProcess:
+    """Run SQL against the abi_memory DB.
+
+    Prefers the Docker container `abi-memory-db` (container-local trust auth —
+    host port 5432 is NOT published on .19 / customer bare-metal, so a direct
+    `psql localhost:5432` fails). Falls back to host postgres if 5432 is up.
+    """
+    res = run(["docker", "exec", "-i", "abi-memory-db", "psql", "-U", DB_ADMIN_USER, "-d", DB_NAME],
+              input=sql, check=False)
+    if res.returncode == 0:
+        return res
     dsn = f"postgresql://{DB_ADMIN_USER}:{DB_ADMIN_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    result = run(
-        ["psql", dsn, "-c", f"SELECT 1 FROM pg_roles WHERE rolname = '{username}'"],
-        check=False,
-    )
-    if "1 row" in result.stdout:
+    return run(["psql", dsn, "-c", sql], check=False)
+
+
+def create_db_role(username: str) -> None:
+    """Step 8: Create PostgreSQL role for the agent (optional, best-effort)."""
+    res = _psql(f"SELECT 1 FROM pg_roles WHERE rolname = '{username}';")
+    if "1 row" in (res.stdout or ""):
         print(f"  DB role {username} already exists, skipping.")
         return
-    result = run(
-        ["psql", dsn, "-c", f"CREATE ROLE {username} WITH LOGIN PASSWORD '{_random_password()}'"],
-        check=False,
-    )
-    if result.returncode == 0:
+    res = _psql(f"CREATE ROLE {username} WITH LOGIN PASSWORD '{_random_password()}';")
+    if res.returncode == 0:
         print(f"  Created DB role: {username}")
     else:
-        print(f"  DB role creation skipped: {result.stderr.strip()}")
+        print(f"  DB role creation skipped: {(res.stderr or '').strip()[:200]}")
 
 
 def insert_agent_record(username: str, display_name: str, role: str,
                         clearance: str, bot_username: str = "") -> None:
-    """Step 9: Insert agent record in database."""
-    dsn = f"postgresql://{DB_ADMIN_USER}:{DB_ADMIN_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-    run([
-        "psql", dsn, "-c",
-        """CREATE TABLE IF NOT EXISTS abi_agents (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            username TEXT UNIQUE NOT NULL,
-            display_name TEXT NOT NULL,
-            role TEXT NOT NULL,
-            clearance TEXT NOT NULL DEFAULT 'external',
-            telegram_bot TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMPTZ DEFAULT NOW()
-        )"""
-    ], check=False)
-
-    run([
-        "psql", dsn, "-c",
+    """Step 9: Insert agent record in database (checks return code)."""
+    sql = (
+        "CREATE TABLE IF NOT EXISTS abi_agents (\n"
+        "    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n"
+        "    username TEXT UNIQUE NOT NULL,\n"
+        "    display_name TEXT NOT NULL,\n"
+        "    role TEXT NOT NULL,\n"
+        "    clearance TEXT NOT NULL DEFAULT 'external',\n"
+        "    telegram_bot TEXT,\n"
+        "    status TEXT DEFAULT 'active',\n"
+        "    created_at TIMESTAMPTZ DEFAULT NOW()\n"
+        ");\n"
         f"INSERT INTO abi_agents (username, display_name, role, clearance, telegram_bot) "
         f"VALUES ('{username}', '{display_name}', '{role}', '{clearance}', '{bot_username}') "
-        f"ON CONFLICT (username) DO UPDATE SET display_name='{display_name}', role='{role}', clearance='{clearance}'"
-    ], check=False)
-    print(f"  Agent record in database: {display_name} ({clearance})")
+        f"ON CONFLICT (username) DO UPDATE SET display_name='{display_name}', role='{role}', clearance='{clearance}';"
+    )
+    res = _psql(sql)
+    if res.returncode == 0:
+        print(f"  Agent record in database: {display_name} ({clearance})")
+    else:
+        print(f"  Agent record insert FAILED: {(res.stderr or '').strip()[:200]}")
 
 
-def setup_systemd(username: str, display_name: str, memory_limit: str = "768M") -> None:
+def setup_systemd(username: str, display_name: str, memory_limit: str = "768M",
+                  api_port: str = "8400", api_key: str = "", api_host: str = "127.0.0.1") -> None:
     """Step 10: Generate and install systemd service."""
-    service_content = generate_service(username, display_name, memory_limit)
+    service_content = generate_service(
+        username, display_name, memory_limit,
+        api_port=api_port, api_key=api_key, api_host=api_host,
+    )
     msg = install_service(username, service_content)
     print(f"  {msg}")
 
@@ -806,6 +977,15 @@ def provision(
     model: str = "",
     base_url: str = "",
     is_reprovision: bool = False,
+    api_port: Optional[int] = None,
+    api_host: str = "127.0.0.1",
+    api_key: str = "",
+    reasoning_effort: str = "medium",
+    telegram_topic: Optional[str] = None,
+    admin_bot_token: Optional[str] = None,
+    no_start: bool = False,
+    inherit_codex_oauth: bool = False,
+    opteia_gateway_key: str = "",
 ) -> Dict:
     """Full agent provisioning (12 steps).
 
@@ -832,16 +1012,22 @@ def provision(
     total_steps = 12
     mcps = mcps or []
 
-    # Resolve API key from existing env if not provided
+    # Resolve API key: explicit flag → operator's ~/.hermes/.env → shared env
+    # source (an existing agent's .env, readable when provision runs as root
+    # under sudo, where Path.home() is /root and has no .hermes/.env).
     if not glm_key:
         key_env = PROVIDER_KEY_ENV.get(provider_slug, "GLM_API_KEY")
         glm_key = read_existing_env(key_env) or ""
+    if not glm_key:
+        shared = _read_shared_env()
+        glm_key = shared.get(key_env) or shared.get("GLM_API_KEY") or ""
     if not glm_key and provider_slug != "custom":
-        # Try GLM_API_KEY as last resort
+        # Try GLM_API_KEY in operator's env as last resort
         glm_key = read_existing_env("GLM_API_KEY") or ""
     if not glm_key:
         raise ProvisioningError(
-            f"API key required. Set --glm-key or have {PROVIDER_KEY_ENV.get(provider_slug, 'API_KEY')} in ~/.hermes/.env"
+            f"API key required. Set --glm-key or have {PROVIDER_KEY_ENV.get(provider_slug, 'API_KEY')} "
+            f"in ~/.hermes/.env or in {SHARED_ENV_SOURCE}"
         )
 
     if not telegram_token:
@@ -860,6 +1046,28 @@ def provision(
     print(f"  Role: {role} | Clearance: {clearance} | Provider: {provider_slug} | MCPs: {', '.join(mcps) or 'none'}")
     print()
 
+    # Resolve inter-agent API port (auto-allocate if not pinned).
+    api_port = allocate_api_port(api_port)
+    print(f"  API port: {api_port} (host {api_host})")
+
+    # Resolve the shared API_SERVER_KEY (discover from an existing agent, else
+    # env/random) so all agents share one key without hardcoding it in the repo.
+    api_key = api_key or _resolve_api_key()
+
+    # Resolve Telegram forum topic (auto-create via an admin bot if not given).
+    allowed_topics = telegram_topic or ""
+    if not allowed_topics and admin_bot_token:
+        try:
+            from abi.provision.telegram import create_forum_topic
+            topic_id = create_forum_topic(admin_bot_token, TG_TEAM_GROUP, display_name)
+            if topic_id:
+                allowed_topics = str(topic_id)
+                print(f"  Created TG topic {topic_id} in group {TG_TEAM_GROUP}")
+        except Exception as e:
+            print(f"  Warning: could not auto-create TG topic: {e}")
+    if allowed_topics:
+        print(f"  TG allowed_topics: {allowed_topics}")
+
     step(1, total_steps, "Creating Linux user")
     create_linux_user(name)
 
@@ -873,10 +1081,14 @@ def provision(
     age_keys = generate_age_keypair(name)
 
     step(5, total_steps, "Generating config.yaml")
-    generate_config(name, mcps, clearance, provider_slug, model)
+    generate_config(name, mcps, clearance, provider_slug, model,
+                    reasoning_effort=reasoning_effort,
+                    allowed_topics=allowed_topics,
+                    opteia_gateway_key=opteia_gateway_key)
 
     step(6, total_steps, "Writing .env")
-    write_env(name, glm_key, telegram_token, allowed_users or "", provider_slug, base_url)
+    write_env(name, glm_key, telegram_token, allowed_users or "", provider_slug, base_url,
+              opteia_gateway_key=opteia_gateway_key)
 
     step(7, total_steps, "Writing SOUL.md")
     write_soul(name, display_name, role, soul)
@@ -891,6 +1103,19 @@ def provision(
         run(["bash", str(enforce), name], check=False)
         print("  ABI memory policy applied (SOUL.service.md written, config flags confirmed)")
 
+    # Optionally inherit codex OAuth (jen's auth.json credential_pool) so the
+    # agent can use openai-codex via /model. Single-session OAuth — see Rule 52.
+    if inherit_codex_oauth:
+        src_auth = Path("/home/jen/.hermes/auth")
+        dst_auth = Path(f"/home/{name}/.hermes/auth")
+        if src_auth.exists():
+            run(["sudo", "mkdir", "-p", str(dst_auth)], check=False)
+            run(["sudo", "cp", "-a", str(src_auth) + "/.", str(dst_auth) + "/"], check=False)
+            run(["sudo", "chown", "-R", f"{name}:{name}", str(dst_auth)], check=False)
+            print(f"  Copied codex OAuth (jen's auth) to {dst_auth}")
+        else:
+            print(f"  --inherit-codex-oauth: jen auth not found at {src_auth}, skipping")
+
     if not skip_db:
         step(8, total_steps, "Creating PostgreSQL role")
         create_db_role(name)
@@ -901,27 +1126,32 @@ def provision(
         print("[8-9/12] Skipping database setup (--skip-db)")
 
     step(10, total_steps, "Installing systemd service")
-    setup_systemd(name, display_name, memory_limit)
+    setup_systemd(name, display_name, memory_limit,
+                  api_port=str(api_port), api_key=api_key, api_host=api_host)
 
-    step(11, total_steps, "Starting service")
-    if is_reprovision:
-        # For re-provision: clear pycache and restart to pick up new config
-        print("  Re-provision detected: clearing caches and restarting...")
-        run(["find", "/opt/hermes-agent/abi", "-name", "__pycache__", "-type", "d", "-exec", "rm", "-rf", "{}", "+"], check=False)
-        # Get UID for the user
-        uid_result = run(["id", "-u", name], check=True)
-        uid = uid_result.stdout.strip()
-        run([
-            "sudo", "-u", name,
-            f"XDG_RUNTIME_DIR=/run/user/{uid}",
-            "systemctl", "--user", "restart", "abi-agent.service",
-        ], check=False)
-        print("  Service restarted.")
+    if no_start:
+        print("[11-12/12] Skipping start + verify (--no-start)")
+        ok = True
     else:
-        enable_and_start(name)
+        step(11, total_steps, "Starting service")
+        if is_reprovision:
+            # For re-provision: clear pycache and restart to pick up new config
+            print("  Re-provision detected: clearing caches and restarting...")
+            run(["find", "/opt/hermes-agent/abi", "-name", "__pycache__", "-type", "d", "-exec", "rm", "-rf", "{}", "+"], check=False)
+            # Get UID for the user
+            uid_result = run(["id", "-u", name], check=True)
+            uid = uid_result.stdout.strip()
+            run([
+                "sudo", "-u", name,
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                "systemctl", "--user", "restart", "abi-agent.service",
+            ], check=False)
+            print("  Service restarted.")
+        else:
+            enable_and_start(name)
 
-    step(12, total_steps, "Verifying")
-    ok = verify_agent(name, telegram_token)
+        step(12, total_steps, "Verifying")
+        ok = verify_agent(name, telegram_token)
 
     print()
     if ok:
@@ -959,6 +1189,24 @@ def main():
     parser.add_argument("--base-url", default="", help="API base URL override")
     parser.add_argument("--memory-limit", default="768M", help="systemd memory limit")
     parser.add_argument("--skip-db", action="store_true", help="Skip PostgreSQL setup")
+    parser.add_argument("--api-port", type=int, default=None,
+                        help="Inter-agent API port (default: auto-allocate next free >=8400)")
+    parser.add_argument("--api-host", default="127.0.0.1",
+                        help="API bind host (0.0.0.0 for hub, 127.0.0.1 for workers)")
+    parser.add_argument("--api-key", default="",
+                        help="Shared API_SERVER_KEY (default: reuse production shared key)")
+    parser.add_argument("--reasoning-effort", default="medium",
+                        help="Reasoning effort: low/medium/high")
+    parser.add_argument("--telegram-topic", default=None,
+                        help="Telegram forum topic ID (default: auto-create via --admin-bot-token)")
+    parser.add_argument("--admin-bot-token", default=None,
+                        help="Admin bot token to auto-create the TG topic (e.g. ailean's)")
+    parser.add_argument("--no-start", action="store_true",
+                        help="Create user/config/unit but do not start the service (for testing)")
+    parser.add_argument("--inherit-codex-oauth", action="store_true",
+                        help="Copy jen's codex OAuth (auth.json) so the agent can use openai-codex via /model")
+    parser.add_argument("--opteia-gateway-key", default="",
+                        help="Opteia AI gateway (New-API) consumer key — adds opteia-* /model aliases")
     parser.add_argument("--interactive", action="store_true", help="Force interactive mode")
     args = parser.parse_args()
 
@@ -988,6 +1236,15 @@ def main():
         provider_slug=args.provider,
         model=args.model,
         base_url=args.base_url,
+        api_port=args.api_port,
+        api_host=args.api_host,
+        api_key=args.api_key,
+        reasoning_effort=args.reasoning_effort,
+        telegram_topic=args.telegram_topic,
+        admin_bot_token=args.admin_bot_token,
+        no_start=args.no_start,
+        inherit_codex_oauth=args.inherit_codex_oauth,
+        opteia_gateway_key=args.opteia_gateway_key,
     )
 
     sys.exit(0 if result["status"] == "running" else 1)

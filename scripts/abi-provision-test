@@ -1,0 +1,89 @@
+#!/opt/hermes-agent/.venv/bin/python3
+"""ABI provision + deprovision test harness.
+
+Provisions a throwaway `qa` agent (--no-start, dummy token so the service is
+not started and TG doesn't crash-loop), asserts the generated config + systemd
+unit reach production parity, then deprovisions and asserts full cleanup
+(user, home, DB role, abi_agents row). Run as root:
+
+    sudo python3 scripts/abi-provision-test
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from abi.provision.agent import provision, _psql
+from abi.provision.deprovision import deprovision
+
+NAME = "qa"
+_PASS = 0
+_FAIL = 0
+
+
+def check(label, cond):
+    global _PASS, _FAIL
+    if cond:
+        print(f"  PASS  {label}")
+        _PASS += 1
+    else:
+        print(f"  FAIL  {label}")
+        _FAIL += 1
+
+
+def read(path):
+    p = Path(path)
+    return p.read_text() if p.exists() else ""
+
+
+def main():
+    print(f"=== TEST: provision throwaway '{NAME}' agent (--no-start) ===")
+    provision(
+        name=NAME, display_name="QA Test", role="Ops", clearance="internal",
+        telegram_token="dummy:dummy", allowed_users="0",
+        provider_slug="zai", model="glm-5.2", reasoning_effort="low",
+        no_start=True,
+    )
+
+    print("\n=== ASSERT: config.yaml parity ===")
+    cfg = read(f"/home/{NAME}/.hermes/config.yaml")
+    check("model glm-5.2", 'default: "glm-5.2"' in cfg)
+    check("memory provider abi_memory_api", "provider: abi_memory_api" in cfg)
+    check("skills.external_dirs -> /opt/abi-tools/skills",
+          "external_dirs:" in cfg and "/opt/abi-tools/skills" in cfg)
+    check("kanban.dispatch_in_gateway", "dispatch_in_gateway: true" in cfg)
+    check("approvals off", 'mode: "off"' in cfg)
+    check("reasoning_effort low", "reasoning_effort: low" in cfg)
+
+    print("\n=== ASSERT: systemd unit parity ===")
+    unit = read(f"/home/{NAME}/.config/systemd/user/abi-agent.service")
+    check("API_SERVER_PORT", "Environment=API_SERVER_PORT=" in unit)
+    check("API_SERVER_KEY", "Environment=API_SERVER_KEY=" in unit)
+    check("HERMES_KANBAN_HOME", "Environment=HERMES_KANBAN_HOME=" in unit)
+    check("ABI_MEMORY_API_URL", "Environment=ABI_MEMORY_API_URL=" in unit)
+    check("TimeoutStopSec=240s", "TimeoutStopSec=240s" in unit)
+
+    print("\n=== ASSERT: user + group + DB registry ===")
+    idres = subprocess.run(["id", NAME], capture_output=True, text=True)
+    check(f"user {NAME} exists", idres.returncode == 0)
+    check("member of abi-agents", "abi-agents" in idres.stdout)
+    dbres = _psql(f"SELECT username FROM abi_agents WHERE username='{NAME}';")
+    check(f"{NAME} in abi_agents registry", NAME in (dbres.stdout or ""))
+
+    print(f"\n=== DEPROVISION {NAME} ===")
+    deprovision(NAME)
+
+    print("\n=== ASSERT: cleanup ===")
+    idres2 = subprocess.run(["id", NAME], capture_output=True, text=True)
+    check(f"user {NAME} gone", idres2.returncode != 0)
+    check(f"home /home/{NAME} gone", not Path(f"/home/{NAME}").exists())
+    dbres2 = _psql(f"SELECT username FROM abi_agents WHERE username='{NAME}';")
+    check(f"{NAME} removed from abi_agents", NAME not in (dbres2.stdout or ""))
+
+    print(f"\n=== RESULT: {_PASS} passed, {_FAIL} failed ===")
+    sys.exit(0 if _FAIL == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

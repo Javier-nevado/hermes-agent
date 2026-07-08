@@ -1,0 +1,16 @@
+#!/opt/hermes-agent/.venv/bin/python3
+"""ABI Agent Deprovisioning CLI.
+
+Usage:
+    sudo python3 scripts/abi-deprovision --name mga
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from abi.provision.deprovision import main
+
+if __name__ == "__main__":
+    main()

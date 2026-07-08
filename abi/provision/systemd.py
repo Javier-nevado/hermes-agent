@@ -2,6 +2,8 @@
 """
 
 import os
+import secrets
+import string
 import subprocess
 import time
 from pathlib import Path
@@ -17,13 +19,22 @@ Wants=network-online.target
 Type=simple
 Environment=HERMES_HOME=/home/{username}/.hermes
 Environment=PYTHONPATH=/opt/hermes-agent
-WorkingDirectory=/opt/hermes-agent
 Environment=HERMES_MEDIA_ALLOW_DIRS=/tmp:/home/{username}/workspace:/home/{username}/.hermes/media
 Environment=HERMES_MEDIA_TRUST_RECENT_SECONDS=3600
+Environment=ABI_MEMORY_API_URL={memory_api_url}
+Environment=ABI_MEMORY_AUTO_EXTRACT_ENABLED=true
+Environment=HERMES_KANBAN_HOME={kanban_home}
+Environment=API_SERVER_ENABLED=true
+Environment=API_SERVER_KEY={api_key}
+Environment=API_SERVER_PORT={api_port}
+Environment=API_SERVER_HOST={api_host}
+WorkingDirectory=/opt/hermes-agent
 ExecStart=/opt/hermes-agent/.venv/bin/hermes gateway
 Restart=on-failure
 RestartSec=10
 MemoryMax={memory_limit}
+
+TimeoutStopSec=240s
 
 [Install]
 WantedBy=default.target
@@ -50,8 +61,36 @@ def _run_as_user(username: str, cmd: list, check: bool = True) -> subprocess.Com
     return subprocess.run(full_cmd, capture_output=True, text=True, check=check)
 
 
-def generate_service(username: str, display_name: str, memory_limit: str = "768M") -> str:
-    return SERVICE_TEMPLATE.format(username=username, display_name=display_name, memory_limit=memory_limit)
+def generate_service(
+    username: str,
+    display_name: str,
+    memory_limit: str = "768M",
+    api_port: str = "8400",
+    api_key: str = "",
+    api_host: str = "127.0.0.1",
+    kanban_home: str = "/opt/abi-tools/kanban",
+    memory_api_url: str = "http://localhost:8010",
+) -> str:
+    """Render the user-level systemd unit.
+
+    Workers (every agent except the hub ailean) bind their inter-agent API to
+    127.0.0.1; ailean binds 0.0.0.0 because it is the delegation hub. Pass
+    api_host="0.0.0.0" only for the hub.
+    """
+    if not api_key:
+        # Defensive: provision() resolves a shared key from existing agents.
+        # If empty, generate a random one so the unit is still valid.
+        api_key = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+    return SERVICE_TEMPLATE.format(
+        username=username,
+        display_name=display_name,
+        memory_limit=memory_limit,
+        api_port=api_port,
+        api_key=api_key,
+        api_host=api_host,
+        kanban_home=kanban_home,
+        memory_api_url=memory_api_url,
+    )
 
 
 def install_service(username: str, service_content: str) -> str:
