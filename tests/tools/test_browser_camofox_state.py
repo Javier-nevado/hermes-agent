@@ -57,7 +57,7 @@ class TestCamofoxConfigDefaults:
         from hermes_cli.config import DEFAULT_CONFIG
 
         browser_cfg = DEFAULT_CONFIG["browser"]
-        assert browser_cfg["camofox"]["managed_persistence"] is False
+        assert browser_cfg["camofox"]["managed_persistence"] is True
         assert browser_cfg["camofox"]["user_id"] == ""
         assert browser_cfg["camofox"]["session_key"] == ""
         assert browser_cfg["camofox"]["adopt_existing_tab"] is False
