@@ -216,5 +216,4 @@ networks:
 volumes:
   abi-db-data:
   camofox_persistence:
-    external: true
-    name: camofox_persistence
+    name: camofox_persistence   # pinned name (no project prefix): reused if it already exists (preserves cookies/sessions across deploys), auto-created on fresh installs. Mounts /root/.camofox where the camofox persistence plugin writes per-user storage-state.json (cookies + localStorage).
