@@ -37,6 +37,81 @@ if [ ! -f "$ENVFILE" ]; then
   exit 1
 fi
 
+# 1b. Create the shared HOST venv ($HERMES_DIR/.venv).
+#
+# The abi-memory-api CONTAINER builds its own venv (Dockerfile.abi-api). This is the
+# HOST venv that user-level systemd gateways run against (/opt/hermes-agent/.venv/bin/
+# hermes), that abi-provision's shebang points at, and that stdio MCP servers exec.
+# Without it, a fresh install brings up a healthy memory stack but NO agent can ever
+# run — abi-provision can't even start (bad shebang) and the gateway ExecStart 404s.
+# Mirrors the .19 / Castor canonical shape. Idempotent: skipped if .venv/bin/hermes
+# exists (so re-running bootstrap, and the update path, are no-ops).
+create_host_venv() {
+  local venv="$HERMES_DIR/.venv"
+  if [ -x "$venv/bin/hermes" ]; then
+    echo "Host venv present ($venv) — skipping creation."
+    return 0
+  fi
+  if [ ! -f "$HERMES_DIR/pyproject.toml" ] || [ ! -f "$HERMES_DIR/uv.lock" ]; then
+    echo "WARN: pyproject.toml/uv.lock missing in $HERMES_DIR — cannot create host venv." >&2
+    echo "      abi-provision and the gateway will NOT run until a venv exists." >&2
+    return 0
+  fi
+
+  echo "Creating host venv ($venv) — resolving + downloading deps (a few minutes, one-time)..."
+  # Ensure uv is available (the tarball does not ship it; abi-deploy.sh requires only
+  # docker + python3 + curl). Mirrors scripts/install.sh's uv bootstrap.
+  local uv_bin
+  uv_bin="$(command -v uv 2>/dev/null || true)"
+  if [ -z "$uv_bin" ]; then
+    if [ -x /usr/local/bin/uv ]; then uv_bin=/usr/local/bin/uv
+    elif [ -x "$HOME/.local/bin/uv" ]; then uv_bin="$HOME/.local/bin/uv"
+    else
+      echo "  uv not found — installing from astral.sh ..."
+      if ! curl -fsSL https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then
+        echo "WARN: uv install failed — host venv NOT created." >&2
+        return 0
+      fi
+      uv_bin="$HOME/.local/bin/uv"
+    fi
+  fi
+
+  # uv-managed Python must live under a world-traversable path so non-root agent users
+  # can exec the venv interpreter (default uv paths land under the creating user's
+  # $HOME/.local/share/uv, which agent users can't traverse). See install.sh #21457.
+  export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-/usr/local/share/uv/python}"
+  export UV_PYTHON_BIN_DIR="${UV_PYTHON_BIN_DIR:-/usr/local/share/uv/bin}"
+  export UV_PROJECT_ENVIRONMENT="$venv"
+  export UV_NO_CONFIG=1   # don't inherit a random user's uv.toml/pyproject under sudo
+
+  # Frozen = exact uv.lock (hash-verified transitives, no re-resolve). Fall back to
+  # --locked, then a plain resolve, so a stale-but-present lockfile never hard-blocks
+  # bring-up. Extras mirror .19: [all] (feature tools) + [abi] (psycopg2/onnxruntime/
+  # tokenizers) + [messaging] (telegram) + [edge-tts] (voice). No torch/CUDA/playwright
+  # (those left [all] post-2026-05-12 lazy-install migration).
+  local _log
+  _log="$(mktemp)"
+  if "$uv_bin" sync --frozen --extra all --extra abi --extra messaging --extra edge-tts >"$_log" 2>&1 \
+     || "$uv_bin" sync --locked --extra all --extra abi --extra messaging --extra edge-tts >"$_log" 2>&1 \
+     || "$uv_bin" sync --extra all --extra abi --extra messaging --extra edge-tts >"$_log" 2>&1; then
+    tail -3 "$_log"
+  else
+    echo "WARN: uv sync failed — host venv incomplete. Last 20 lines:" >&2
+    tail -20 "$_log" >&2
+    rm -f "$_log"
+    return 0
+  fi
+  rm -f "$_log"
+
+  # Root-own the venv (tamper-proof: agents read/exec but can't mutate the runtime).
+  # The gateway needs only read+exec; on-demand lazy-dep install is intentionally off
+  # (every extra the agents use is pre-installed above).
+  chown -R root:root "$venv" 2>/dev/null || true
+  chmod -R a+rX "$venv" 2>/dev/null || true
+  echo "  host venv ready: $venv/bin/hermes"
+}
+create_host_venv
+
 # 2. Compose profiles (opt-in services) from docker.env
 PROFILE_FLAGS=""
 if grep -qE '^COMPOSE_PROFILES=' "$ENVFILE" 2>/dev/null; then

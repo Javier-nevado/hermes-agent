@@ -85,6 +85,17 @@ def apply_pending_migrations() -> None:
                     )
                 logger.info("Applied migration %s", name)
             except Exception as exc:
+                # Reset the connection so one failed migration can't cascade-abort the
+                # rest. Each file wraps its own BEGIN/COMMIT, but with autocommit=True a
+                # failure inside an explicit transaction leaves the connection in
+                # "current transaction is aborted" state — the next file's BEGIN is then
+                # ignored and every statement dies with "...commands ignored until end of
+                # transaction block". ROLLBACK clears that. (This is what makes the
+                # docstring's "per-file isolated" claim actually true.)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 logger.error("Migration %s failed (skipping): %s", name, exc)
     finally:
         pool.putconn(conn)

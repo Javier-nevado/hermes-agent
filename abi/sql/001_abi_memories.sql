@@ -7,8 +7,20 @@
 -- means every DB, fresh or existing, gets the base table idempotently on startup.
 -- CREATE IF NOT EXISTS makes this a safe no-op on boxes where abi-setup already
 -- created it.
+--
+-- The pgvector `vector` extension MUST be enabled before the `embedding vector(384)`
+-- column + ivfflat index, else CREATE TABLE aborts with "type vector does not exist".
+-- scripts/abi-setup does this (lines 81-92) but is never run on fresh installs, so the
+-- fresh container DB lacks the extension → this migration fails → deps.py's per-file
+-- isolation (rollback on failure) keeps the rest from cascading, but the table still
+-- never gets created. CREATE EXTENSION here is the self-contained fix: the abi_agent
+-- role owns the abi_memory DB and `vector` is a TRUSTED extension, so this works under
+-- the migration runner's connection without superuser. IF NOT EXISTS = no-op where the
+-- extension already exists (.19, Castor, Snowbytes, Jumbo).
 
 BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS abi_memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
