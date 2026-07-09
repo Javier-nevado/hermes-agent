@@ -826,12 +826,20 @@ DEFAULT_CONFIG = {
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
         "camofox": {
-            # When true, Hermes sends a stable profile-scoped userId to Camofox
-            # so the server maps it to a persistent Firefox profile automatically.
-            # When false (default), each session gets a random userId (ephemeral).
-            "managed_persistence": False,
+            # When true (default), Hermes sends a stable profile-scoped userId to
+            # Camofox so the server maps it to a persistent storage-state profile
+            # (cookies + localStorage survive camofox container recreates / reboots,
+            # so agents stay logged in and keep preferences). Requires the
+            # `camofox_persistence` volume on the server side — see
+            # docker-compose.abi-api.yml. The userId is derived from the Hermes
+            # profile dir, so each isolated agent user gets its own distinct profile.
+            # When false, each session gets a random userId (ephemeral).
+            "managed_persistence": True,
             # Optional externally managed Camofox identity. Useful when another
             # app owns the visible browser and Hermes should operate in it.
+            # (CAMOFOX_USER_ID env var overrides this and forces a stable userId
+            # even when managed_persistence is false — useful for already-deployed
+            # agents without regenerating config.yaml.)
             "user_id": "",
             "session_key": "",
             # Rehydrate tab_id from Camofox before creating a new tab.
