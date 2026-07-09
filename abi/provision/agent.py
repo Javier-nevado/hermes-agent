@@ -588,6 +588,64 @@ def generate_age_keypair(username: str) -> Dict[str, str]:
     return {"public_key": public_key, "private_key": "stored_in_key_file"}
 
 
+# ─── CamoFox browser plugin ───────────────────────────────────────────
+
+# The @askjo/camofox-browser plugin (browser tools) loads via node_modules
+# auto-discovery at gateway startup — it is NOT in the hermes plugins
+# registry, so it doesn't ship with a fresh install. Every production agent
+# has it; a freshly provisioned agent without it falls back to the built-in
+# browser_* tools, which 403 (camofox blocks JS eval) / 404 (reaped tabs)
+# against the shared container. Clone it from an existing agent.
+CAMOFOX_PLUGIN_REL = Path(".hermes/node/lib/node_modules/@askjo/camofox-browser")
+
+
+def _find_camofox_plugin_reference(preferred: Optional[str] = None) -> Optional[Path]:
+    """Find an existing agent whose camofox plugin we can clone.
+
+    Order: the named reference agent (if any), then ailean (the canonical hub),
+    then every other /home agent dir. Returns the plugin directory (verified to
+    have its manifest) or None when no agent on this box has it yet (the very
+    first provision on a fresh install).
+    """
+    order: List[str] = []
+    if preferred:
+        order.append(preferred)
+    order.append("ailean")
+    homes = sorted(h.name for h in Path("/home").iterdir() if h.is_dir())
+    order.extend(h for h in homes if h not in order)
+    for agent in order:
+        cand = Path("/home") / agent / CAMOFOX_PLUGIN_REL
+        # Path.exists() can raise PermissionError (3.13) on an unreadable home;
+        # treat unreadable as "not present" so one locked home can't break discovery.
+        try:
+            if (cand / "openclaw.plugin.json").exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def copy_camofox_plugin(username: str, reference: Optional[str] = None) -> None:
+    """Clone the @askjo/camofox-browser plugin from a reference agent.
+
+    The plugin registers at gateway startup, so this must run BEFORE the agent is
+    started. Best-effort: silently skips when no reference exists on this box —
+    browser tools can be added later by copying any agent's plugin + restarting.
+    """
+    src = _find_camofox_plugin_reference(reference)
+    if not src:
+        print(f"  CamoFox plugin: no reference found (~/{CAMOFOX_PLUGIN_REL}); "
+              "skipping — install manually if browser tools are needed.")
+        return
+    dst = Path("/home") / username / CAMOFOX_PLUGIN_REL
+    node_dir = Path("/home") / username / ".hermes" / "node"
+    run(["sudo", "mkdir", "-p", str(dst.parent)], check=False)
+    run(["sudo", "cp", "-a", str(src), str(dst.parent) + "/"], check=False)
+    run(["sudo", "chown", "-R", f"{username}:{username}", str(node_dir)], check=False)
+    src_agent = src.parts[2] if len(src.parts) > 2 else "reference"
+    print(f"  CamoFox plugin: cloned from {src_agent} → ~/{CAMOFOX_PLUGIN_REL}")
+
+
 # ─── Shared-env + port allocation helpers ─────────────────────────────
 
 # Vars copied verbatim from an existing agent's .env (non-agent-specific infra).
@@ -986,6 +1044,8 @@ def provision(
     no_start: bool = False,
     inherit_codex_oauth: bool = False,
     opteia_gateway_key: str = "",
+    camofox_reference: Optional[str] = None,
+    no_camofox: bool = False,
 ) -> Dict:
     """Full agent provisioning (12 steps).
 
@@ -1116,6 +1176,12 @@ def provision(
         else:
             print(f"  --inherit-codex-oauth: jen auth not found at {src_auth}, skipping")
 
+    # Clone the @askjo/camofox-browser plugin from a reference agent so the new
+    # agent ships with browser tools. Runs before start (registers at startup)
+    # and regardless of --no-start, so a deferred start still has the plugin.
+    if not no_camofox:
+        copy_camofox_plugin(name, reference=camofox_reference)
+
     if not skip_db:
         step(8, total_steps, "Creating PostgreSQL role")
         create_db_role(name)
@@ -1207,6 +1273,11 @@ def main():
                         help="Copy jen's codex OAuth (auth.json) so the agent can use openai-codex via /model")
     parser.add_argument("--opteia-gateway-key", default="",
                         help="Opteia AI gateway (New-API) consumer key — adds opteia-* /model aliases")
+    parser.add_argument("--camofox-reference", default=None,
+                        help="Agent to clone the @askjo/camofox-browser plugin from "
+                             "(default: auto-discover, prefers ailean)")
+    parser.add_argument("--no-camofox", action="store_true",
+                        help="Don't copy the camofox browser plugin")
     parser.add_argument("--interactive", action="store_true", help="Force interactive mode")
     args = parser.parse_args()
 
@@ -1245,6 +1316,8 @@ def main():
         no_start=args.no_start,
         inherit_codex_oauth=args.inherit_codex_oauth,
         opteia_gateway_key=args.opteia_gateway_key,
+        camofox_reference=args.camofox_reference,
+        no_camofox=args.no_camofox,
     )
 
     sys.exit(0 if result["status"] == "running" else 1)
