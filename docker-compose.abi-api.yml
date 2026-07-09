@@ -82,15 +82,19 @@ services:
     image: ghcr.io/jo-inc/camofox-browser:latest
     container_name: abi-camofox
     ports:
-      - "9377:9377"
+      - "127.0.0.1:9377:9377"   # loopback-only (NOT LAN-exposed); host hermes uses localhost
     environment:
       - CAMOFOX_PORT=9377
+      - NODE_ENV=production   # secure default; CAMOFOX_API_KEY gates /evaluate (dev mode does NOT help via published port)
+      - CAMOFOX_API_KEY=${CAMOFOX_API_KEY:-}   # set in docker.env to enable /evaluate (JS eval); empty = disabled (default, backward compatible)
       # Idle timeouts — tuned for interactive agent workflows. Defaults (5 min) reap
       # a tab mid-task during natural review/drafting gaps, which the agent then
       # misreads as "camofox down". The browser still relaunches on demand regardless
       # (ensureBrowser()); these just keep a working tab/session alive longer.
       - TAB_INACTIVITY_MS=1800000      # 30 min — tab survives gaps (default 300000)
       - BROWSER_IDLE_TIMEOUT_MS=3600000  # 60 min — browser stays warm (default 300000)
+    volumes:
+      - camofox_persistence:/root/.camofox   # persist browser profiles/sessions (logins) across recreates
     restart: unless-stopped
     networks:
       - opteia-net
@@ -211,3 +215,6 @@ networks:
 
 volumes:
   abi-db-data:
+  camofox_persistence:
+    external: true
+    name: camofox_persistence
