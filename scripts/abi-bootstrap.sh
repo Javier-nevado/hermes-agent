@@ -67,7 +67,9 @@ fi
 if [ -d opteia-skills/standard ]; then
   for u in $(ls /home/ 2>/dev/null); do
     [ -d "/home/$u/.hermes" ] || continue
-    sudo -u "$u" mkdir -p "/home/$u/.hermes/skills/opteia/standard"
+    # Root creates the dir (agent user can't mkdir into a root-owned ~/.hermes);
+    # the chown below fixes ownership so the creds-sync step can write as the user.
+    sudo mkdir -p "/home/$u/.hermes/skills/opteia/standard"
     sudo cp -a opteia-skills/standard/. "/home/$u/.hermes/skills/opteia/standard/"
     sudo chown -R "$u:$u" "/home/$u/.hermes/skills/opteia/standard"
   done
