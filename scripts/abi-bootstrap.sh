@@ -160,6 +160,17 @@ else
   echo "  scripts/abi-enforce-memory-policy.sh not found in tarball — skip"
 fi
 
+# 4c. Install the fleet-health telemetry timer (hourly push to api.opteia.com).
+# Agent-independent (system python3, stdlib only) so it reports agent/venv breakage
+# rather than going silent. Reporter lives at a fixed /opt/abi-tools path so it
+# works on bare-metal + per-user code layouts. Best-effort; never blocks bring-up.
+echo "Installing fleet-health telemetry timer..."
+if [ -x scripts/abi-install-fleet-timer.sh ]; then
+  sudo bash scripts/abi-install-fleet-timer.sh "$HERMES_DIR" || echo "  (fleet-timer install reported warnings — continuing)"
+else
+  echo "  scripts/abi-install-fleet-timer.sh not found in tarball — skip"
+fi
+
 # 5. Health check
 echo "Waiting for abi-api health..."
 for i in $(seq 1 30); do

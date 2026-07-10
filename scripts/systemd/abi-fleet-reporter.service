@@ -1,0 +1,20 @@
+[Unit]
+Description=ABI fleet reporter — hourly health+usage telemetry push
+Documentation=https://github.com/Javier-nevado/hermes-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Fixed operator-tooling location (abi-install-fleet-timer.sh copies the reporter
+# here from the extracted tarball). Fixed so the ExecStart works on BOTH bare-metal
+# (/opt/hermes-agent) and per-user (~/.hermes/hermes-agent) code layouts.
+ExecStart=/usr/bin/python3 /opt/abi-tools/abi-fleet-reporter.py
+User=root
+
+# Root is required to read each agent's state.db under other users' homes. The
+# reporter collects COUNTS + health signals ONLY (no message/memory content, no
+# PII, no credentials) — see the PII boundary in abi-fleet-reporter.py. Exits 0
+# unconditionally; the timer firing IS the liveness signal.
+StandardOutput=journal
+StandardError=journal
