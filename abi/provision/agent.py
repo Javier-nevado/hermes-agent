@@ -668,7 +668,7 @@ def _read_shared_env(source_path: str = SHARED_ENV_SOURCE) -> Dict[str, str]:
     try:
         if not src.exists():
             return shared
-        text = src.read_text()
+        text = src.read_text(encoding="utf-8")
     except PermissionError:
         res = run(["sudo", "-n", "cat", str(src)], check=False)
         text = res.stdout if res.returncode == 0 else ""
@@ -907,7 +907,7 @@ def write_soul(username: str, display_name: str, role: str, soul_path: Optional[
     agent_home = Path(f"/home/{username}")
 
     if soul_path:
-        soul_content = Path(soul_path).read_text()
+        soul_content = Path(soul_path).read_text(encoding="utf-8")
     else:
         role_descriptions = {
             "CEO": "the AI CEO of the organization",
