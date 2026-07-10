@@ -577,7 +577,7 @@ def _post_bytes(payload_bytes, license_key):
     try:
         req = urllib.request.Request(
             ENDPOINT, data=payload_bytes,
-            headers={"Content-Type": "application/json", "X-License-Key": license_key},
+            headers={"Content-Type": "application/json", "X-License-Key": license_key, "User-Agent": "abi-fleet-reporter/%s" % REPORTER_VERSION},
             method="POST")
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
             return r.getcode() == 200
