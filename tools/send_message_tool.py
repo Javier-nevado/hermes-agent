@@ -1085,6 +1085,58 @@ async def _send_whatsapp(extra, chat_id, message):
         return _error(f"WhatsApp send failed: {e}")
 
 
+async def _read_whatsapp_history(extra, chat_id, limit=50):
+    """Read recent WhatsApp message history via the local bridge HTTP API."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        bridge_port = extra.get("bridge_port", 3000)
+        params = {"jid": chat_id, "limit": str(int(limit))}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://localhost:{bridge_port}/history",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "success": True,
+                        "platform": "whatsapp",
+                        "chat_id": chat_id,
+                        "count": data.get("count"),
+                        "messages": data.get("messages", []),
+                    }
+                body = await resp.text()
+                return _error(f"WhatsApp bridge error ({resp.status}): {body}")
+    except Exception as e:
+        return _error(f"WhatsApp history read failed: {e}")
+
+
+async def _list_whatsapp_chats(extra):
+    """List WhatsApp chats known to the bridge via the local HTTP API."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        bridge_port = extra.get("bridge_port", 3000)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"http://localhost:{bridge_port}/chats",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {"success": True, "platform": "whatsapp", "chats": data.get("chats", [])}
+                body = await resp.text()
+                return _error(f"WhatsApp bridge error ({resp.status}): {body}")
+    except Exception as e:
+        return _error(f"WhatsApp chats list failed: {e}")
+
+
 async def _send_signal(extra, chat_id, message, media_files=None):
     """Send via signal-cli JSON-RPC API.
 
@@ -1783,4 +1835,104 @@ registry.register(
     handler=send_message_tool,
     check_fn=_check_send_message,
     emoji="📨",
+)
+
+
+READ_WHATSAPP_HISTORY_SCHEMA = {
+    "name": "read_whatsapp_history",
+    "description": (
+        "Read recent WhatsApp messages from a specific chat (newest-first). "
+        "Call list_whatsapp_chats first to discover the exact chat_id (jid) of a "
+        "contact or group, then pass it here. Only messages the linked device "
+        "has seen or synced are available; very old history may be absent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {
+                "type": "string",
+                "description": (
+                    "WhatsApp chat jid (e.g. 3465...@s.whatsapp.net, ...@lid, or "
+                    "...@g.us). Obtain it from list_whatsapp_chats."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum messages to return (1-200, default 50).",
+                "default": 50,
+            },
+        },
+        "required": ["chat_id"],
+    },
+}
+
+LIST_WHATSAPP_CHATS_SCHEMA = {
+    "name": "list_whatsapp_chats",
+    "description": (
+        "List WhatsApp chats known to the bridge — contacts and groups with "
+        "message counts and a preview, sorted by most recent. Use to discover "
+        "the chat_id to pass to read_whatsapp_history or send_message."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def _whatsapp_pconfig():
+    """Load the WhatsApp platform config.
+
+    Returns ``(pconfig, None)`` on success, or ``(None, error_string)`` if the
+    gateway config can't be loaded or WhatsApp isn't enabled.
+    """
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+    except Exception as e:
+        return None, json.dumps(_error(f"Failed to load gateway config: {e}"))
+    pconfig = config.platforms.get(Platform("whatsapp"))
+    if not pconfig or not pconfig.enabled:
+        return None, tool_error(
+            "WhatsApp platform is not configured. Set up credentials in ~/.hermes/config.yaml."
+        )
+    return pconfig, None
+
+
+def read_whatsapp_history_tool(args, **kw):
+    """Handle read_whatsapp_history tool calls."""
+    chat_id = args.get("chat_id")
+    if not chat_id:
+        return tool_error("chat_id is required")
+    limit = args.get("limit", 50)
+    pconfig, err = _whatsapp_pconfig()
+    if err:
+        return err
+    from model_tools import _run_async
+    result = _run_async(_read_whatsapp_history(pconfig.extra, chat_id, limit))
+    return json.dumps(result) if isinstance(result, dict) else result
+
+
+def list_whatsapp_chats_tool(args, **kw):
+    """Handle list_whatsapp_chats tool calls."""
+    pconfig, err = _whatsapp_pconfig()
+    if err:
+        return err
+    from model_tools import _run_async
+    result = _run_async(_list_whatsapp_chats(pconfig.extra))
+    return json.dumps(result) if isinstance(result, dict) else result
+
+
+registry.register(
+    name="read_whatsapp_history",
+    toolset="messaging",
+    schema=READ_WHATSAPP_HISTORY_SCHEMA,
+    handler=read_whatsapp_history_tool,
+    check_fn=_check_send_message,
+    emoji="💬",
+)
+registry.register(
+    name="list_whatsapp_chats",
+    toolset="messaging",
+    schema=LIST_WHATSAPP_CHATS_SCHEMA,
+    handler=list_whatsapp_chats_tool,
+    check_fn=_check_send_message,
+    emoji="📋",
 )

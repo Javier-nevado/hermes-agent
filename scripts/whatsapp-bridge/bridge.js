@@ -12,6 +12,8 @@
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
+ *   GET  /history        - Read recent messages for a chat { jid, limit? }
+ *   GET  /chats          - List known chats (contacts/groups) for discovery
  *   GET  /health         - Health check
  *
  * Usage:
@@ -29,6 +31,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { normalizeWhatsAppId, getMessageContent, normalizeMessage, MessageStore } from './store.mjs';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -62,6 +65,16 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+// Pull a much larger initial message dump on connect (emulates a desktop
+// companion). Heavier on pairing time, bandwidth, and phone battery, so it
+// is opt-in — the default companion sync already covers recent history.
+const SYNC_FULL_HISTORY = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.WHATSAPP_SYNC_FULL_HISTORY || '').toLowerCase(),
+);
+// History store caps + persistence path.
+const MAX_MSGS_PER_CHAT = parseInt(process.env.WHATSAPP_HISTORY_MAX_PER_CHAT || '1000', 10);
+const MAX_TOTAL_MSGS = parseInt(process.env.WHATSAPP_HISTORY_MAX_TOTAL || '50000', 10);
+const HISTORY_FLUSH_DEBOUNCE_MS = parseInt(process.env.WHATSAPP_HISTORY_FLUSH_MS || '3000', 10);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -119,32 +132,8 @@ function trackSentMessageId(sent) {
   }
 }
 
-function normalizeWhatsAppId(value) {
-  if (!value) return '';
-  return String(value).replace(':', '@');
-}
-
-function getMessageContent(msg) {
-  const content = msg?.message || {};
-  if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
-  if (content.viewOnceMessage?.message) return content.viewOnceMessage.message;
-  if (content.viewOnceMessageV2?.message) return content.viewOnceMessageV2.message;
-  if (content.documentWithCaptionMessage?.message) return content.documentWithCaptionMessage.message;
-  if (content.templateMessage?.hydratedTemplate) return content.templateMessage.hydratedTemplate;
-  if (content.buttonsMessage) return content.buttonsMessage;
-  if (content.listMessage) return content.listMessage;
-  return content;
-}
-
-function getContextInfo(messageContent) {
-  if (!messageContent || typeof messageContent !== 'object') return {};
-  for (const value of Object.values(messageContent)) {
-    if (value && typeof value === 'object' && value.contextInfo) {
-      return value.contextInfo;
-    }
-  }
-  return {};
-}
+// normalizeWhatsAppId / getMessageContent / getContextInfo / normalizeMessage
+// / MessageStore live in ./store.mjs (imported above), shared with node:test.
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
@@ -163,12 +152,28 @@ function buildLidMap() {
   return map;
 }
 let lidToPhone = buildLidMap();
+// Restore any persisted history before connecting so the initial history-sync
+// merges into pre-existing data instead of replacing it.
+messageStore.load();
 
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+
+// History store: persistent message log powering GET /history + GET /chats.
+// Fed by `messaging-history.set` (companion history-sync on connect) and by
+// live `messages.upsert`. Persists to SESSION_DIR/message-store.json.
+const messageStore = new MessageStore({
+  storeFile: path.join(SESSION_DIR, 'message-store.json'),
+  maxPerChat: MAX_MSGS_PER_CHAT,
+  maxTotal: MAX_TOTAL_MSGS,
+  flushDebounceMs: HISTORY_FLUSH_DEBOUNCE_MS,
+});
+// jid -> display name, populated from history-sync contacts/chats so /chats
+// can show human-readable names alongside the raw jid.
+const contactNames = new Map();
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -187,7 +192,7 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    syncFullHistory: SYNC_FULL_HISTORY,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -315,93 +320,64 @@ async function startSocket() {
       }
 
       const messageContent = getMessageContent(msg);
-      const contextInfo = getContextInfo(messageContent);
-      const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
-      const quotedMessageId = contextInfo?.stanzaId || null;
-      const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
-      const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
-      const hasQuotedMessage = !!contextInfo?.quotedMessage;
+      const event = normalizeMessage(msg, { botIds, messageContent });
 
-      // Extract message body
-      let body = '';
-      let hasMedia = false;
-      let mediaType = '';
-      const mediaUrls = [];
-
-      if (messageContent.conversation) {
-        body = messageContent.conversation;
-      } else if (messageContent.extendedTextMessage?.text) {
-        body = messageContent.extendedTextMessage.text;
-      } else if (messageContent.imageMessage) {
-        body = messageContent.imageMessage.caption || '';
-        hasMedia = true;
-        mediaType = 'image';
-        try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
-          const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
-          const ext = extMap[mime] || '.jpg';
-          mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
-          const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
-          writeFileSync(filePath, buf);
-          mediaUrls.push(filePath);
-        } catch (err) {
-          console.error('[bridge] Failed to download image:', err.message);
+      // Download media for live messages (history-sync records keep mediaUrls: []).
+      if (event.hasMedia) {
+        if (event.mediaType === 'image') {
+          try {
+            const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
+            const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
+            const ext = extMap[mime] || '.jpg';
+            mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+            const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
+            writeFileSync(filePath, buf);
+            event.mediaUrls.push(filePath);
+          } catch (err) {
+            console.error('[bridge] Failed to download image:', err.message);
+          }
+        } else if (event.mediaType === 'video') {
+          try {
+            const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const mime = messageContent.videoMessage.mimetype || 'video/mp4';
+            const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
+            mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+            const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
+            writeFileSync(filePath, buf);
+            event.mediaUrls.push(filePath);
+          } catch (err) {
+            console.error('[bridge] Failed to download video:', err.message);
+          }
+        } else if (event.mediaType === 'audio' || event.mediaType === 'ptt') {
+          try {
+            const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
+            const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const mime = audioMsg.mimetype || 'audio/ogg';
+            const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
+            mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
+            const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
+            writeFileSync(filePath, buf);
+            event.mediaUrls.push(filePath);
+          } catch (err) {
+            console.error('[bridge] Failed to download audio:', err.message);
+          }
+        } else if (event.mediaType === 'document') {
+          try {
+            const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
+            const safeFileName = path.basename(messageContent.documentMessage.fileName || 'document').replace(/[^a-zA-Z0-9._-]/g, '_');
+            const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
+            writeFileSync(filePath, buf);
+            event.mediaUrls.push(filePath);
+          } catch (err) {
+            console.error('[bridge] Failed to download document:', err.message);
+          }
         }
-      } else if (messageContent.videoMessage) {
-        body = messageContent.videoMessage.caption || '';
-        hasMedia = true;
-        mediaType = 'video';
-        try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const mime = messageContent.videoMessage.mimetype || 'video/mp4';
-          const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
-          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
-          const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
-          writeFileSync(filePath, buf);
-          mediaUrls.push(filePath);
-        } catch (err) {
-          console.error('[bridge] Failed to download video:', err.message);
-        }
-      } else if (messageContent.audioMessage || messageContent.pttMessage) {
-        hasMedia = true;
-        mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
-        try {
-          const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const mime = audioMsg.mimetype || 'audio/ogg';
-          const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
-          mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
-          const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
-          writeFileSync(filePath, buf);
-          mediaUrls.push(filePath);
-        } catch (err) {
-          console.error('[bridge] Failed to download audio:', err.message);
-        }
-      } else if (messageContent.documentMessage) {
-        body = messageContent.documentMessage.caption || '';
-        hasMedia = true;
-        mediaType = 'document';
-        const fileName = messageContent.documentMessage.fileName || 'document';
-        try {
-          const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
-          const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
-          const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
-          writeFileSync(filePath, buf);
-          mediaUrls.push(filePath);
-        } catch (err) {
-          console.error('[bridge] Failed to download document:', err.message);
-        }
-      }
-
-      // For media without caption, use a placeholder so the API message is never empty
-      if (hasMedia && !body) {
-        body = `[${mediaType} received]`;
       }
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
-      if (msg.key.fromMe && ((REPLY_PREFIX && body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
+      if (msg.key.fromMe && ((REPLY_PREFIX && event.body.startsWith(REPLY_PREFIX)) || recentlySentIds.has(msg.key.id))) {
         if (WHATSAPP_DEBUG) {
           try { console.log(JSON.stringify({ event: 'ignored', reason: 'agent_echo', chatId, messageId: msg.key.id })); } catch {}
         }
@@ -409,10 +385,10 @@ async function startSocket() {
       }
 
       // Skip empty messages
-      if (!body && !hasMedia) {
+      if (!event.body && !event.hasMedia) {
         if (WHATSAPP_DEBUG) {
-          try { 
-            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) })); 
+          try {
+            console.log(JSON.stringify({ event: 'ignored', reason: 'empty', chatId, messageKeys: Object.keys(msg.message || {}) }));
           } catch (err) {
             console.error('Failed to log empty message event:', err);
           }
@@ -420,29 +396,44 @@ async function startSocket() {
         continue;
       }
 
-      const event = {
-        messageId: msg.key.id,
-        chatId,
-        senderId,
-        senderName: msg.pushName || senderNumber,
-        chatName: isGroup ? (chatId.split('@')[0]) : (msg.pushName || senderNumber),
-        isGroup,
-        body,
-        hasMedia,
-        mediaType,
-        mediaUrls,
-        mentionedIds,
-        quotedMessageId,
-        quotedParticipant,
-        quotedRemoteJid,
-        hasQuotedMessage,
-        botIds,
-        timestamp: msg.messageTimestamp,
-      };
-
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
+      }
+
+      // Persist into the history store (after filtering, so policy-rejected
+      // messages and agent echo-backs are not recorded).
+      messageStore.upsert(event);
+    }
+  });
+
+  // Companion history-sync: on connect WhatsApp pushes recent history for the
+  // linked device. Capture contact/chat display names and ingest each message
+  // into the store. No media download here — the backfill can be large, so
+  // history records keep mediaUrls: [] (type only). Messages share the same
+  // WAMessage shape as messages.upsert, so normalizeMessage handles them.
+  sock.ev.on('messaging-history.set', ({ contacts, chats, messages }) => {
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        if (!c?.id) continue;
+        const name = c.name || c.notify || c.pushname;
+        if (name) contactNames.set(c.id, name);
+      }
+    }
+    if (Array.isArray(chats)) {
+      for (const ch of chats) {
+        if (!ch?.id) continue;
+        const name = ch.name || ch.subject;
+        if (name) contactNames.set(ch.id, name);
+      }
+    }
+    if (Array.isArray(messages)) {
+      for (const msg of messages) {
+        if (!msg?.message || !msg?.key) continue;
+        try {
+          const rec = normalizeMessage(msg, { botIds: [] });
+          if (rec) messageStore.upsert(rec);
+        } catch {}
       }
     }
   });
@@ -694,6 +685,38 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+// Read recent message history for a chat (newest-first).
+// Powered by the in-memory store fed by history-sync + live upsert. The jid
+// must match the exact form WhatsApp uses (msg.key.remoteJid) — call /chats
+// first to discover it.
+app.get('/history', (req, res) => {
+  const jid = String(req.query.jid || '');
+  let limit = parseInt(req.query.limit, 10);
+  if (!Number.isFinite(limit) || limit < 1) limit = 50;
+  if (limit > 200) limit = 200;
+
+  if (!jid) {
+    return res.status(400).json({ error: 'jid query param required' });
+  }
+
+  const messages = messageStore.getHistory(jid, limit);
+  res.json({ jid, limit, count: messages.length, messages });
+});
+
+// List chats known to the store (contacts + groups) for discovery. Returns
+// the exact jid to pass back to /history or /send, sorted by most recent.
+app.get('/chats', (req, res) => {
+  const resolveName = (jid) => contactNames.get(jid) || null;
+  const resolvePhone = (jid) => {
+    const bare = jid.replace(/@.*/, '');
+    if (jid.endsWith('@lid')) {
+      return lidToPhone[bare] || null;
+    }
+    return bare || null;
+  };
+  res.json({ chats: messageStore.listChats({ resolveName, resolvePhone }) });
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
@@ -702,6 +725,15 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
   });
 });
+
+// Persist the history store on graceful shutdown so the debounced timer
+// can't lose the last few seconds of writes.
+function flushAndExit(code) {
+  try { messageStore.flush(); } catch {}
+  process.exit(typeof code === 'number' ? code : 0);
+}
+process.on('SIGINT', () => flushAndExit(0));
+process.on('SIGTERM', () => flushAndExit(0));
 
 // Start
 if (PAIR_ONLY) {
