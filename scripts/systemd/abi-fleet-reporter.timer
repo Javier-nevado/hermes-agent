@@ -1,0 +1,15 @@
+[Unit]
+Description=Push ABI fleet health+usage telemetry hourly
+Documentation=https://github.com/Javier-nevado/hermes-agent
+
+[Timer]
+# Hourly at :13 — off the :00 mark so the fleet doesn't all hit the Worker at once.
+# Persistent=true catches up a missed run after downtime/sleep, so a box that was
+# off pushes on its next boot rather than waiting for the next :13. The 15-min
+# RandomizedDelaySec spreads the fleet further (8 boxes -> staggered, not a spike).
+OnCalendar=*-*-* *:13:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
