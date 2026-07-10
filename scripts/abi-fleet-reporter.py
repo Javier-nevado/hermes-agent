@@ -186,9 +186,19 @@ def probe_venv(hermes_dir):
 
 
 def probe_gateway():
-    """Active gateway units (system-level + best-effort user-level for multi-agent boxes)."""
-    out = {"ok": True, "system_units": [], "user_active": 0, "active_count": 0}
+    """Active gateway signals across shapes. Reports three independent signals and
+    takes the max as active_count (robust — any one proving liveness avoids a false
+    'gateway down'):
+      - processes:   count of `hermes gateway`/`abi-agent` processes (works even when
+                     systemd's user-bus isn't reachable; the ExecStart is `hermes gateway`)
+      - system_units: system-level hermes-gateway/abi-agent services (customer system mode)
+      - user_units:   per-user abi-agent.service for multi-agent boxes (.19). MUST run as
+                     `sudo -u <user>` — root can't reach another user's user-systemd bus
+                     via XDG_RUNTIME_DIR alone ("Operation not permitted")."""
+    out = {"ok": True, "processes": 0, "system_units": [], "user_units": {}, "active_count": 0}
     try:
+        psout, _ = sh("ps -eo args= 2>/dev/null | grep -E 'hermes gateway|abi-agent' | grep -v grep")
+        out["processes"] = len([l for l in psout.splitlines() if l.strip()])
         globs = " ".join("'%s'" % g for g in GATEWAY_UNIT_GLOBS)
         raw, _ = sh("systemctl list-units --type=service --all --no-legend --plain %s 2>/dev/null" % globs)
         for line in raw.splitlines():
@@ -196,19 +206,18 @@ def probe_gateway():
             if len(parts) >= 4 and parts[0].endswith(".service"):
                 out["system_units"].append({"name": parts[0], "load": parts[1],
                                             "active": parts[2], "sub": parts[3]})
-        # best-effort user-level (.19 runs a per-user abi-agent). Root can reach a
-        # user's systemd via its XDG_RUNTIME_DIR when linger is on.
         for d in sorted(glob.glob("/home/*/.hermes")):
             user = os.path.basename(os.path.dirname(d))
             uid_out, _ = sh("id -u '%s' 2>/dev/null" % user)
             uid = uid_out.strip()
             if not uid:
                 continue
-            st, _ = sh("XDG_RUNTIME_DIR=/run/user/%s systemctl --user is-active abi-agent.service 2>/dev/null" % uid)
-            if st.strip() == "active":
-                out["user_active"] += 1
-        active_sys = sum(1 for u in out["system_units"] if u["active"] == "active")
-        out["active_count"] = active_sys + out["user_active"]
+            st, _ = sh("sudo -u '%s' XDG_RUNTIME_DIR=/run/user/%s systemctl --user is-active abi-agent.service 2>/dev/null"
+                       % (user, uid))
+            out["user_units"][user] = st.strip() or "unknown"
+        sys_active = sum(1 for u in out["system_units"] if u["active"] == "active")
+        usr_active = sum(1 for v in out["user_units"].values() if v == "active")
+        out["active_count"] = max(out["processes"], sys_active, usr_active)
     except Exception as e:
         out["error"] = str(e)
     return out
