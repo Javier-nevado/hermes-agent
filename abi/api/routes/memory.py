@@ -321,6 +321,84 @@ def extraction_stats():
 
 
 # ---------------------------------------------------------------------------
+# GET /session-prime
+# ---------------------------------------------------------------------------
+
+@router.get("/session-prime")
+def session_prime(agent_name: str, recent: int = 8, clusters: int = 10):
+    """Compact session-start briefing for Hermes agents: recent activity + key topics.
+
+    Lets an agent recover context instantly at session start (e.g. after a Telegram
+    topic session closes/reopens) instead of cold-loading the full history. ``recent``
+    = top-N non-superseded memories by recency (decrypted snippet in-process);
+    ``clusters`` = top entities by memory-count for the agent. DEK-gated: ``recent``
+    snippets are blank on boxes without a DEK; ``clusters`` (entity names stored
+    unencrypted) still returned. Bounded; read-only; decrypt never leaves the box.
+    """
+    recent_n = max(1, min(int(recent), 20))
+    clusters_n = max(1, min(int(clusters), 25))
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id::text AS id, content, created_at
+                FROM abi_memories
+                WHERE agent_name = %s AND superseded_by IS NULL
+                ORDER BY created_at DESC LIMIT %s
+                """,
+                [agent_name, recent_n],
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                """
+                SELECT e.name AS name, e.type AS type, count(*) AS n
+                FROM abi_memory_entities me
+                JOIN abi_entities e ON me.entity_id = e.id
+                JOIN abi_memories m ON me.memory_id = m.id
+                WHERE m.agent_name = %s AND m.superseded_by IS NULL
+                GROUP BY e.name, e.type
+                ORDER BY n DESC LIMIT %s
+                """,
+                [agent_name, clusters_n],
+            )
+            cluster_rows = cur.fetchall()
+
+        encryptor = get_encryptor()
+        from ..crypto import EncryptionService
+        recent_items = []
+        for row in rows:
+            ct = row.get("content")
+            plain = ct
+            if ct and encryptor and EncryptionService.is_encrypted(ct):
+                try:
+                    plain = encryptor.decrypt(ct)
+                except Exception:
+                    plain = ""
+            snippet = " ".join(str(plain or "").split())
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "…"
+            ts = row["created_at"].isoformat() if row.get("created_at") else None
+            recent_items.append({"ts": ts, "snippet": snippet})
+
+        cluster_items = [
+            {"name": r["name"], "type": r["type"], "n": int(r["n"])}
+            for r in cluster_rows
+        ]
+        return {
+            "agent_name": agent_name,
+            "recent": recent_items,
+            "clusters": cluster_items,
+        }
+    except Exception as e:
+        logger.error("session-prime failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        pool.putconn(conn)
+
+
+# ---------------------------------------------------------------------------
 # POST /recall
 # ---------------------------------------------------------------------------
 

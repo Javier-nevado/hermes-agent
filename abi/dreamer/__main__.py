@@ -32,6 +32,16 @@ Usage::
     docker exec -e LLM_API_KEY=... abi-memory-api python3 -m abi.dreamer \\
       --phase densify --llm-base-url http://192.168.20.2:13000/v1 --llm-model opteia-local
 
+    # LLM entity extraction — in the container (needs psycopg2 + DEK + an LLM).
+    # Recommended model: glm-4.7-flash via the ZAI/Zhipu coding subscription
+    # (api.z.ai/api/coding/paas/v4, key in $GLM_API_KEY) — fast, clean populated
+    # content, returns reasoning_content (handled). glm-4.5-air hangs on this
+    # workload; the local Ornith-35B works but is too slow at scale. Off-peak
+    # only (ZAI overload 08:00-12:00 CEST). Trial boxes (no DEK) skip.
+    docker exec -e GLM_API_KEY=... abi-memory-api python3 -m abi.dreamer \\
+      --phase extract-llm --llm-base-url https://api.z.ai/api/coding/paas/v4 \\
+      --llm-model glm-4.7-flash --llm-api-key-env GLM_API_KEY --write
+
     --dry-run is the default everywhere; --write persists.
 """
 
@@ -88,6 +98,17 @@ LLM_BACKOFF_BASE = 2.0
 ABORT_CONSECUTIVE_ERRORS = 12
 
 DEFAULT_DENSIFY_SOURCES = ("auto_extraction", "agent_tool", "api", "migration")
+
+# --- LLM entity extraction (Step 4; phase_extract_llm / extract_llm_batch) ---
+# Re-extracts entities from memories with THIN coverage (≤ EXTRACT_LLM_THIN_MAX
+# entities) via the LLM and ADDS them alongside the regex ones — never rebuilds.
+# Opt-in (only runs under --phase extract-llm). DEK required (decrypt in-process).
+EXTRACT_LLM_BATCH_SIZE = 8        # memories per LLM call
+EXTRACT_LLM_MAX_TOKENS = 4000     # reasoning models (glm-4.7-flash) emit CoT in
+                                  # reasoning_content before the JSON (densify uses 4k
+                                  # for the same reason); tunable via --llm-max-tokens
+EXTRACT_LLM_THIN_MAX = 1          # candidate iff entity count ≤ this
+EXTRACT_LLM_DEFAULT_LIMIT = 600   # cap per agent per run (idempotent → re-runnable)
 
 
 # ---------------------------------------------------------------------------
@@ -489,50 +510,390 @@ def densify_batch(client, model: str, items: List[dict],
     return out, None, tokens
 
 
-# --- Heuristic Phase 1: Deduplication ---
+def extract_llm_batch(client, model: str, items: List[dict],
+                      timeout: float = DEFAULT_LLM_TIMEOUT,
+                      max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+                      max_tokens: int = EXTRACT_LLM_MAX_TOKENS
+                      ) -> Tuple[Dict[str, list], Optional[str], int]:
+    """LLM entity extraction for a batch of memories. ``items=[{id, content}]``.
+
+    Returns ``(results_by_id {id: [Entity]}, error_or_None, tokens)``. Mirrors
+    ``densify_batch``'s hardening (SIGALRM backstop, timeout-kwarg fallback,
+    exponential backoff, reasoning_content fallback, lenient JSON parse).
+    Validation/canonicalization is delegated to ``entities.parse_llm_entity_items``.
+    """
+    from abi.memory.entities import LLM_EXTRACT_SYSTEM_PROMPT, parse_llm_entity_items
+    if not items:
+        return {}, None, 0
+    _mt = max_tokens
+    user_prompt = "Extract entities. Input JSON:\n" + json.dumps(
+        {"items": [{"id": it["id"], "content": it["content"]} for it in items]}
+    )
+    resp = None
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with _hard_alarm(timeout):
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": LLM_EXTRACT_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                    max_tokens=_mt,
+                    timeout=timeout,
+                )
+            break
+        except TypeError as e:
+            last_err = f"LLM error (attempt {attempt}/{max_retries}, timeout-kwarg rejected): {e}"
+            if "timeout" in str(e).lower() and attempt == 1:
+                try:
+                    with _hard_alarm(timeout):
+                        resp = client.chat.completions.create(
+                            model=model,
+                            messages=[
+                                {"role": "system", "content": LLM_EXTRACT_SYSTEM_PROMPT},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            response_format={"type": "json_object"},
+                            temperature=0.0,
+                            max_tokens=_mt,
+                        )
+                    break
+                except Exception as e2:
+                    last_err = f"LLM error (attempt {attempt}/{max_retries}, no-timeout fallback): {e2}"
+            if attempt < max_retries:
+                time.sleep(min(LLM_BACKOFF_BASE * (2 ** (attempt - 1)), 30.0))
+        except Exception as e:
+            last_err = f"LLM error (attempt {attempt}/{max_retries}): {e}"
+            if attempt < max_retries:
+                time.sleep(min(LLM_BACKOFF_BASE * (2 ** (attempt - 1)), 30.0))
+    if resp is None:
+        return {}, last_err or "LLM error (no response after retries)", 0
+    msg = resp.choices[0].message if resp.choices else None
+    # Reasoning models route output inconsistently across gateways: Anthropic/GLM
+    # native uses ``reasoning_content``; the opteia gateway (New-API relay) uses the
+    # Responses-API ``reasoning`` string + ``reasoning_details`` list. Read the whole
+    # message via model_dump() and try every field so a JSON-answer hiding in any of
+    # them is still parsed.
+    md = msg.model_dump(exclude_none=False) if msg else {}
+    content = (md.get("content") or "").strip()
+    if not content:
+        content = (md.get("reasoning_content") or "").strip()
+    if not content:
+        content = (md.get("reasoning") or "").strip()
+    if not content:
+        rd = md.get("reasoning_details") or []
+        if isinstance(rd, list):
+            parts = []
+            for item in rd:
+                if isinstance(item, dict):
+                    parts.append(item.get("text") or item.get("content") or "")
+                elif isinstance(item, str):
+                    parts.append(item)
+            content = "\n".join(p for p in parts if p).strip()
+    usage = getattr(resp, "usage", None)
+    tokens = 0
+    if usage:
+        tokens = (getattr(usage, "prompt_tokens", 0) or 0) + (getattr(usage, "completion_tokens", 0) or 0)
+    if not content.strip():
+        return {}, ("empty LLM content (model returned nothing — reasoning model with no surfaced "
+                    "output, or ZAI peak-hour overload 08:00-12:00 CEST)"), tokens
+    try:
+        data = parse_json_lenient(content)
+    except (json.JSONDecodeError, TypeError):
+        return {}, f"malformed JSON: {content[:80]!r}", tokens
+    return parse_llm_entity_items(data), None, tokens
+
+
+# --- Heuristic Phase 1: Deduplication (soft-delete, opt-in) ---
+
+# Calibrated 2026-07-14 (outputs/dedup-monitor/calibration-20260714.md): at 0.97 +
+# telemetry-skip the false-positive rate is ~0% across atlas/ailean/iris. 0.95 catches
+# temporal progressions (off-limits to dedup); 0.99 is the no-skip conservative fallback.
+# Opt-in: nothing happens until ABI_DEDUP_ENABLE=1 (Step 2 flips it per agent).
+DEDUP_ENABLE = os.environ.get("ABI_DEDUP_ENABLE", "0") == "1"
+DEDUP_THRESHOLD = float(os.environ.get("ABI_DEDUP_THRESHOLD", "0.97"))
+
+# Skip pairs whose either side is template-collision telemetry or a markdown doc.
+# Telemetry embeds to near-identical vectors with distinct/empty factual content (the
+# FP minefield below 0.99); markdown docs are densify's territory, not dedup's.
+_DEDUP_SKIP_RE = re.compile(
+    r"^\s*(#{1,6}\s|Session (completed|stats|summary|learning|learnings)\b|Session\s*:"
+    r"|Loading context\.?|Load identity\b|\(tool call turn\)"
+    r"|HTML report: research data|User: \[SYSTEM.*prime)",
+    re.IGNORECASE,
+)
+
+
+def _dedup_encryptor():
+    """EncryptionService for the telemetry-skip content check, or None.
+
+    Reuses the app's own LicenseManager (canonical DEK fetch via httpx — whose UA is NOT
+    Cloudflare-banned, unlike urllib's). Returns None if the DEK can't be obtained; dedup
+    then proceeds at threshold WITHOUT the skip — still safe, because soft-delete is
+    reversible and 0.97's only skip-absent FPs are low-value session telemetry.
+    """
+    try:
+        import asyncio
+        from abi.api.license import LicenseManager
+        from abi.api.crypto import EncryptionService
+        lm = LicenseManager()
+        asyncio.run(lm.fetch_jwt())
+        dek = lm.get_dek()
+        if not dek:
+            print("  [dedup] no DEK on this box — telemetry-skip disabled (proceeding at threshold)")
+            return None
+        return EncryptionService(dek)
+    except Exception as e:
+        print(f"  [dedup] DEK unavailable — telemetry-skip disabled ({e})")
+        return None
+
 
 def phase_dedup(conn, agent_name: str, dry_run: bool) -> Dict:
-    """Find and remove near-duplicate memories (>0.90 embedding similarity)."""
-    stats = {"scanned": 0, "duplicates_found": 0, "removed": 0}
+    """Soft-delete near-duplicate memories: supersede the older with the newer.
+
+    Replaces the old hard-DELETE (>0.90) phase. Opt-in via ``ABI_DEDUP_ENABLE=1``;
+    threshold via ``ABI_DEDUP_THRESHOLD`` (default 0.97). Each supersede mirrors the
+    write-path ``_supersede_old_memories`` (``superseded_by``/``valid_to``) and is logged
+    to ``dedup_log`` for audit + reversibility. Recall already filters
+    ``superseded_by IS NULL``, so superseded rows drop out of results immediately.
+    """
+    stats = {"enabled": DEDUP_ENABLE, "threshold": DEDUP_THRESHOLD,
+             "scanned": 0, "duplicates_found": 0, "skipped_noise": 0,
+             "superseded": 0, "dry_run": dry_run}
+    if not DEDUP_ENABLE:
+        print(f"  dedup: DISABLED (set ABI_DEDUP_ENABLE=1; threshold would be {DEDUP_THRESHOLD})")
+        return stats
+
+    enc = _dedup_encryptor()
+    try:
+        from abi.api.crypto import EncryptionService
+    except Exception:
+        EncryptionService = None  # type: ignore
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT m1.id AS id1, m2.id AS id2,
                    1 - (m1.embedding <=> m2.embedding) AS similarity,
+                   m1.content AS c1, m2.content AS c2,
                    m1.created_at AS created1, m2.created_at AS created2
             FROM abi_memories m1
             JOIN abi_memories m2 ON m1.id < m2.id
                 AND m1.agent_name = m2.agent_name
                 AND m1.embedding IS NOT NULL
                 AND m2.embedding IS NOT NULL
-                AND 1 - (m1.embedding <=> m2.embedding) > 0.90
+                AND 1 - (m1.embedding <=> m2.embedding) > %s
             WHERE m1.agent_name = %s
               AND m1.source_type != 'dreamer'
               AND m2.source_type != 'dreamer'
               AND m1.superseded_by IS NULL
               AND m2.superseded_by IS NULL
             ORDER BY similarity DESC
-            LIMIT 50
-        """, [agent_name])
+        """, [DEDUP_THRESHOLD, agent_name])
         pairs = cur.fetchall()
         stats["scanned"] = len(pairs)
 
-    to_delete = set()
+    # Keep the newer, supersede the older. Skip telemetry/markdown-noise pairs (FP-prone).
+    actions = []  # (loser_str, keeper_str, sim)
     for pair in pairs:
         stats["duplicates_found"] += 1
-        if pair["created1"] > pair["created2"]:
-            to_delete.add(str(pair["id2"]))
+        if enc is not None and EncryptionService is not None:
+            try:
+                a = enc.decrypt(pair["c1"]) if EncryptionService.is_encrypted(pair["c1"]) else pair["c1"]
+                b = enc.decrypt(pair["c2"]) if EncryptionService.is_encrypted(pair["c2"]) else pair["c2"]
+                if _DEDUP_SKIP_RE.search(a) or _DEDUP_SKIP_RE.search(b):
+                    stats["skipped_noise"] += 1
+                    continue
+            except Exception:
+                pass  # decrypt failed — don't skip on uncertainty; fall through to supersede
+        if pair["created1"] >= pair["created2"]:
+            keeper, loser = pair["id1"], pair["id2"]
         else:
-            to_delete.add(str(pair["id1"]))
+            keeper, loser = pair["id2"], pair["id1"]
+        actions.append((str(loser), str(keeper), float(pair["similarity"])))
 
-    if not dry_run and to_delete:
-        with conn.cursor() as cur:
+    if dry_run:
+        return stats
+
+    with conn.cursor() as cur:
+        for loser, keeper, sim in actions:
             cur.execute(
-                "DELETE FROM abi_memories WHERE id::text = ANY(%s) AND agent_name = %s",
-                [list(to_delete), agent_name],
+                "UPDATE abi_memories SET superseded_by = %s::uuid, valid_to = NOW() "
+                "WHERE id::text = %s AND agent_name = %s AND superseded_by IS NULL",
+                [keeper, loser, agent_name],
             )
-            stats["removed"] = cur.rowcount
-            conn.commit()
+            if cur.rowcount:
+                stats["superseded"] += 1
+                cur.execute(
+                    "INSERT INTO dedup_log (keeper_id, superseded_id, sim, agent_name) "
+                    "VALUES (%s::uuid, %s::uuid, %s, %s)",
+                    [keeper, loser, sim, agent_name],
+                )
+        conn.commit()
+    return stats
+
+
+# --- Heuristic Phase: LLM entity extraction (Step 4) ---
+
+def _llm_store_entities(conn, memory_id: str, entities: list, content: str) -> Tuple[int, int]:
+    """Persist LLM-extracted entities for one memory (ADD, don't rebuild).
+
+    Mirrors ``abi.api.routes.memory._store_entities`` but inlined here so the
+    dreamer needs no FastAPI-route import: upsert entities, link via the junction,
+    and infer/store typed edges. ``ON CONFLICT DO NOTHING`` on the junction means
+    existing regex entities are untouched — LLM entities only ever ADD coverage.
+    """
+    from abi.memory.entities import EntityExtractor
+    extractor = EntityExtractor()
+    entity_ids: Dict[str, str] = {}
+    with conn.cursor() as cur:
+        for entity in entities:
+            cur.execute(
+                """INSERT INTO abi_entities (name, type) VALUES (%s, %s)
+                   ON CONFLICT (name, type) DO UPDATE SET name = EXCLUDED.name
+                   RETURNING id::text""",
+                [entity.name, entity.type],
+            )
+            entity_id = cur.fetchone()[0]
+            entity_ids[entity.name.lower()] = entity_id
+            cur.execute(
+                "INSERT INTO abi_memory_entities (memory_id, entity_id) VALUES (%s, %s) "
+                "ON CONFLICT DO NOTHING",
+                [memory_id, entity_id],
+            )
+        new_edges = 0
+        for edge in extractor.infer_relations(entities, content):
+            src_id = entity_ids.get(edge.source.name.lower())
+            tgt_id = entity_ids.get(edge.target.name.lower())
+            if src_id and tgt_id:
+                cur.execute(
+                    """INSERT INTO abi_edges (source_id, target_id, relation, memory_id)
+                       VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                    [src_id, tgt_id, edge.relation, memory_id],
+                )
+                new_edges += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    return len(entity_ids), new_edges
+
+
+def phase_extract_llm(conn, agent_name: str, client, model: str, dry_run: bool,
+                      batch_size: int = EXTRACT_LLM_BATCH_SIZE,
+                      limit: Optional[int] = EXTRACT_LLM_DEFAULT_LIMIT,
+                      thin_max: int = EXTRACT_LLM_THIN_MAX,
+                      max_tokens: int = EXTRACT_LLM_MAX_TOKENS,
+                      sleep_s: float = DEFAULT_SLEEP) -> Dict:
+    """LLM entity extraction (nightly). ADDS LLM-extracted entities to memories
+    with thin coverage, alongside the regex ones — never rebuilds.
+
+    Runs in-container (direct psycopg2 + DEK decrypt in-process) like phase_dedup,
+    and uses the LLM like phase_densify (``resolve_dreamer_llm`` / ``--llm-base-url``).
+    Gating: needs a client AND a DEK (trial boxes without a DEK skip — plaintext is
+    decrypted only in-process on the box and is never sent anywhere except the box's
+    own configured LLM). Idempotent: re-running only re-visits still-thin memories.
+    """
+    stats = {"enabled": bool(client), "candidates": 0, "batches": 0, "extracted": 0,
+             "entities_added": 0, "edges_added": 0, "empty": 0, "errors": 0,
+             "tokens": 0, "dry_run": dry_run}
+    if not client:
+        print("  extract-llm: no LLM client (pass --llm-base-url); skipping")
+        return stats
+    enc = _dedup_encryptor()
+    try:
+        from abi.api.crypto import EncryptionService
+    except Exception:
+        EncryptionService = None  # type: ignore
+    if enc is None or EncryptionService is None:
+        print("  extract-llm: no DEK on this box (trial) — skipping LLM-on-content phase")
+        stats["errors"] = -1
+        return stats
+
+    # Candidates: non-superseded, non-dreamer memories for the agent with ≤ thin_max
+    # entities (LEFT JOIN → count 0 when no entities at all). Newest first so the
+    # graph reflects recent activity first; cap via `limit` (idempotent re-runs).
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT m.id::text AS id, m.content AS content,
+                   count(me.entity_id) AS n_entities
+            FROM abi_memories m
+            LEFT JOIN abi_memory_entities me ON me.memory_id = m.id
+            WHERE m.agent_name = %s
+              AND m.superseded_by IS NULL
+              AND m.source_type != 'dreamer'
+            GROUP BY m.id, m.content
+            HAVING count(me.entity_id) <= %s
+            ORDER BY m.created_at DESC
+            LIMIT %s
+        """, [agent_name, thin_max, limit or 1000000])
+        rows = cur.fetchall()
+    stats["candidates"] = len(rows)
+    if not rows:
+        return stats
+
+    consec_errors = 0
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i:i + batch_size]
+        # Decrypt in-process; skip any row that fails to decrypt (don't block the batch).
+        items: List[dict] = []
+        plains: Dict[str, str] = {}
+        for row in batch:
+            blob = row["content"]
+            try:
+                txt = enc.decrypt(blob) if EncryptionService.is_encrypted(blob) else blob
+            except Exception:
+                stats["errors"] += 1
+                continue
+            txt = redact_secrets(txt[:MAX_CONTENT_CHARS])
+            items.append({"id": row["id"], "content": txt})
+            plains[row["id"]] = txt
+        if not items:
+            continue
+
+        results, err, tokens = extract_llm_batch(
+            client, model, items,
+            timeout=DEFAULT_LLM_TIMEOUT, max_retries=DEFAULT_LLM_MAX_RETRIES,
+            max_tokens=max_tokens,
+        )
+        stats["tokens"] += tokens
+        stats["batches"] += 1
+        if err:
+            stats["errors"] += len(items)
+            consec_errors += 1
+            print(f"  [extract-llm] batch {stats['batches']} error: {err}")
+            if consec_errors >= ABORT_CONSECUTIVE_ERRORS:
+                print(f"  [extract-llm] aborting after {consec_errors} consecutive errors "
+                      f"(partial progress kept; re-run later).")
+                break
+            if sleep_s:
+                time.sleep(sleep_s)
+            continue
+        consec_errors = 0
+
+        for mid, ents in results.items():
+            content = plains.get(mid, "")
+            if not ents:
+                stats["empty"] += 1
+                continue
+            if dry_run:
+                names = ", ".join(f"{e.name}({e.type})" for e in ents[:6])
+                print(f"    [{mid[:8]}] +{len(ents)} entities: {names}")
+                stats["extracted"] += 1
+                stats["entities_added"] += len(ents)
+            else:
+                try:
+                    n_ent, n_edge = _llm_store_entities(conn, mid, ents, content)
+                    conn.commit()
+                    stats["extracted"] += 1
+                    stats["entities_added"] += n_ent
+                    stats["edges_added"] += n_edge
+                except Exception as e:
+                    conn.rollback()
+                    stats["errors"] += 1
+                    print(f"  [extract-llm] store failed for {mid[:8]}: {e}")
+
+        if sleep_s:
+            time.sleep(sleep_s)
 
     return stats
 
@@ -811,7 +1172,12 @@ def run_heuristic(agent_filter: Optional[str], dry_run: bool,
         res: Dict[str, Any] = {}
         if "dedup" in selected:
             s = phase_dedup(conn, name, dry_run)
-            print(f"  dedup: {s['duplicates_found']} duplicates found, {s['removed']} removed")
+            if s.get("enabled"):
+                print(f"  dedup: {s['duplicates_found']} pairs>@{s['threshold']} "
+                      f"(skipped {s['skipped_noise']} noise) → {s['superseded']} superseded"
+                      f"{' [DRY-RUN]' if s.get('dry_run') else ''}")
+            else:
+                print(f"  dedup: {s['threshold']} (DISABLED)")
             res["dedup"] = s
         if "contradictions" in selected:
             s = phase_contradictions(conn, api, name, clearance, dry_run)
@@ -875,11 +1241,61 @@ def run_densify(args, api: MemoryAPIClient) -> Dict:
     return summary
 
 
+def run_extract_llm(args) -> Dict:
+    """Run LLM entity extraction (Step 4). In-container: needs psycopg2 + a DEK +
+    an LLM (``--llm-base-url`` recommended). Enumerates all agents unless --agent."""
+    if not HAS_PSYCOPG2:
+        print("[extract-llm] psycopg2 unavailable — run inside the abi-memory-api container: "
+              "docker exec abi-memory-api python3 -m abi.dreamer --phase extract-llm "
+              "--llm-base-url <gateway>")
+        return {"agents_processed": 0}
+    client, model = resolve_dreamer_llm(args)
+    if not client:
+        return {"agents_processed": 0}
+
+    conn = get_connection()
+    try:
+        agents = get_active_agents(conn)
+    except Exception as e:
+        print(f"[extract-llm] could not read abi_agents: {e}")
+        conn.close()
+        return {"agents_processed": 0}
+    if args.agent:
+        agents = [a for a in agents if a["username"] == args.agent]
+    if not agents:
+        print("No active agents found.")
+        conn.close()
+        return {"agents_processed": 0}
+
+    thin_max = getattr(args, "thin_max", EXTRACT_LLM_THIN_MAX)
+    max_tokens = getattr(args, "llm_max_tokens", EXTRACT_LLM_MAX_TOKENS)
+    summary = {"agents_processed": 0, "phases": {}}
+    for agent in agents:
+        name = agent["username"]
+        print(f"\n[{name}] LLM entity extraction ({'DRY-RUN' if args.dry_run else 'WRITE'})...")
+        s = phase_extract_llm(
+            conn, name, client, model, dry_run=args.dry_run,
+            batch_size=args.batch_size, limit=args.limit,
+            thin_max=thin_max, max_tokens=max_tokens, sleep_s=args.sleep,
+        )
+        if s.get("errors", 0) == -1:
+            print(f"  skipped (no DEK on this box)")
+        else:
+            print(f"  candidates={s['candidates']} extracted={s['extracted']} "
+                  f"entities+={s['entities_added']} edges+={s['edges_added']} "
+                  f"empty={s['empty']} errors={s['errors']} tokens={s['tokens']}"
+                  f"{' [DRY-RUN]' if s.get('dry_run') else ''}")
+        summary["agents_processed"] += 1
+        summary["phases"][name] = s
+    conn.close()
+    return summary
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ABI Dreamer v2 — nightly memory intelligence pipeline")
     ap.add_argument("--agent", default=None, help="only process this agent username (required for --phase densify on the host)")
     ap.add_argument("--phase", default="all",
-                    help="heuristic | dedup | densify | all (default all — runs what the context allows)")
+                    help="heuristic | dedup | densify | extract-llm | all (default all — runs what the context allows)")
     ap.add_argument("--dry-run", action="store_true", help="analyze without writing (default for densify)")
     ap.add_argument("--write", action="store_true", help="persist changes (heuristic insights / densified rewrites)")
     # densify knobs
@@ -890,6 +1306,12 @@ def main() -> int:
     ap.add_argument("--no-skip-docs", action="store_true",
                     help="also densify markdown reference docs (content starting with '#'); "
                          "by default these are left untouched (they're reference material, not facts)")
+    ap.add_argument("--thin-max", type=int, default=EXTRACT_LLM_THIN_MAX,
+                    help="extract-llm: re-extract only memories with ≤ this many entities "
+                         "(default %(default)s — the thin-coverage set)")
+    ap.add_argument("--llm-max-tokens", type=int, default=EXTRACT_LLM_MAX_TOKENS,
+                    help="extract-llm: completion token budget per batch (reasoning models "
+                         "emit CoT before the JSON; 4000 mirrors densify). Default %(default)s")
     ap.add_argument("--sleep", type=float, default=DEFAULT_SLEEP, help="seconds between LLM calls")
     ap.add_argument("--llm-timeout", type=float, default=DEFAULT_LLM_TIMEOUT)
     ap.add_argument("--llm-retries", type=int, default=DEFAULT_LLM_MAX_RETRIES)
@@ -927,13 +1349,16 @@ def main() -> int:
     elif phase == "densify":
         r = run_densify(args, api)
         print(f"\nDensify done: {r['agents_processed']} agents processed")
+    elif phase == "extract-llm":
+        r = run_extract_llm(args)
+        print(f"\nExtract-LLM done: {r['agents_processed']} agents processed")
     elif phase == "all":
         rh = run_heuristic(args.agent, dry_run)
         print(f"\nHeuristic done: {rh['agents_processed']} agents processed")
         rd = run_densify(args, api)
         print(f"\nDensify done: {rd['agents_processed']} agents processed")
     else:
-        print(f"[fatal] unknown --phase {args.phase!r} (use heuristic|dedup|densify|all)")
+        print(f"[fatal] unknown --phase {args.phase!r} (use heuristic|dedup|densify|extract-llm|all)")
         return 2
     return 0
 

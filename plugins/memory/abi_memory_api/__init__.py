@@ -142,7 +142,7 @@ class ABIMemoryApiClient(MemoryProvider):
         )
 
     def system_prompt_block(self) -> str:
-        return (
+        base = (
             "\n<memory-context>\n"
             "[System note: ABI memory provider active (API mode). You can use abi_recall to search "
             "past memories and abi_remember to store new facts. DLP levels control "
@@ -154,6 +154,57 @@ class ABIMemoryApiClient(MemoryProvider):
             "</file-namespaces>\n"
             "</memory-context>\n"
         )
+        # Session-start memory briefing (recent activity + key topics). Fetched once
+        # per session (this block is called once, then cached). Graceful fallback:
+        # any error / old box without /session-prime → no briefing, base block only.
+        briefing = self._session_briefing()
+        if briefing:
+            return base + briefing + "\n"
+        return base
+
+    def _session_briefing(self) -> str:
+        """Compact session-start briefing from /session-prime, or '' on any failure.
+
+        Renders recent memories (date + one-line snippet) + top entity clusters so the
+        agent recovers context instantly after a session close/reopen instead of
+        cold-loading the full history. Bounded to ~400 tokens. Opt out per-box with
+        ABI_SESSION_PRIME_DISABLED=1.
+        """
+        if os.environ.get("ABI_SESSION_PRIME_DISABLED") == "1":
+            return ""
+        if not self._client:
+            return ""
+        try:
+            resp = self._client.get(
+                "/session-prime",
+                params={"agent_name": self._agent_name, "recent": 8, "clusters": 10},
+                timeout=2.5,
+            )
+            if resp.status_code != 200:
+                return ""
+            data = resp.json()
+        except Exception:
+            return ""
+        recent = data.get("recent") or []
+        clusters = data.get("clusters") or []
+        if not recent and not clusters:
+            return ""
+        lines = ["## Memory briefing (recent activity + key topics)"]
+        if recent:
+            lines.append("Recent:")
+            for it in recent[:8]:
+                ts = (it.get("ts") or "")[:10]
+                snip = (it.get("snippet") or "").strip()
+                if snip:
+                    lines.append(f"- [{ts}] {snip}")
+        if clusters:
+            names = [f"{c.get('name')} ({c.get('n')})" for c in clusters[:10] if c.get("name")]
+            if names:
+                lines.append("Key topics: " + ", ".join(names))
+        text = "\n".join(lines)
+        if len(text) > 1200:
+            text = text[:1197] + "…"
+        return text
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number
