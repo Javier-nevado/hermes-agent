@@ -604,7 +604,7 @@ def post_payload(payload, license_key):
             except Exception:
                 pass
         try:
-            with open(MARKER, "w") as fh:
+            with open(MARKER, "w", encoding="utf-8") as fh:
                 fh.write(payload.get("pushed_at", ""))
         except Exception:
             pass
