@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
     numpy \
     httpx \
     pydantic \
+    openai>=2.24.0 \
     PyJWT[crypto]==2.12.1 \
     cryptography>=44.0.0
 
