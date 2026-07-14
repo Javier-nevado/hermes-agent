@@ -6,9 +6,10 @@ from text and infers typed relationships between co-occurring entities.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -206,3 +207,173 @@ class EntityExtractor:
                 deduped.append(edge)
 
         return deduped
+
+
+# ---------------------------------------------------------------------------
+# LLM-based extraction (nightly dreamer batch; regex ``extract`` stays the
+# hot-path default). The prompt + validation live here so they are unit-
+# testable without an LLM; the dreamer wraps them in a hardened batch call.
+# ---------------------------------------------------------------------------
+
+# Exactly the types the ``abi_entities.type`` CHECK constraint allows
+# (abi/sql/002_memory_intelligence.sql). The LLM is steered to this set so nothing
+# it emits can violate the constraint; the synonym map below folds stray labels
+# (organization, metric, event, …) back into an allowed type.
+LLM_ENTITY_TYPES = (
+    "person", "company", "role", "project", "product",
+    "amount", "date", "location", "technology", "other",
+)
+
+LLM_EXTRACT_SYSTEM_PROMPT = (
+    "You extract named entities from a knowledge-worker agent's memory notes to build a "
+    "retrieval graph. For EACH memory id, return the durable, specific entities only.\n"
+    "Rules:\n"
+    "- `type` MUST be one of: " + ", ".join(LLM_ENTITY_TYPES) + ".\n"
+    "- Extract ONLY noun phrases and proper nouns (people, organizations, tools, "
+    "products, places, dates, amounts, named projects). NEVER extract verbs, actions, "
+    "clauses, or sentences (e.g. 'merges', 'self-organizes', 'no cleanup' are NOT entities).\n"
+    "- Keep canonical proper-noun casing (e.g. 'PostgreSQL', 'Javier Nevado', 'Opteia', "
+    "'ABI', 'Microsoft 365').\n"
+    "- Merge surface variants to one canonical entity ('M365' == 'Microsoft 365').\n"
+    "- amounts: currency+value+period as written ('€149/mo', 'EUR10K MRR').\n"
+    "- dates: ISO 'YYYY-MM-DD' or 'Month YYYY' or 'Qn YYYY'.\n"
+    "- Use 'other' for specific quantities/metrics that are not money or dates "
+    "(e.g. '29KB', '266 lines', '8 agents').\n"
+    "- Use 'company' for organizations, teams, and groups.\n"
+    "- Skip generic words, pronouns, stop-words, transient tokens, and the memory's own "
+    "boilerplate. A memory may legitimately have zero entities.\n"
+    "- Aim for 2-6 entities per memory where they exist.\n"
+    "Respond with STRICT JSON ONLY — no prose — in this exact shape:\n"
+    '{"items":[{"id":"<id>","entities":[{"name":"...","type":"..."}]}]}'
+)
+
+# Synonyms → an allowed LLM_ENTITY_TYPE. Lenient on purpose: the LLM is the noisy
+# input, this is the deterministic gate before anything hits the DB constraint.
+_TYPE_SYNONYMS = {
+    "tech": "technology", "tool": "technology", "tools": "technology",
+    "framework": "technology", "software": "technology", "language": "technology",
+    "platform": "technology", "library": "technology",
+    "service": "product", "feature": "product", "app": "product", "application": "product",
+    # organizations/teams/groups → company (no 'organization' type in schema)
+    "organization": "company", "organisation": "company", "org": "company",
+    "team": "company", "group": "company", "department": "company",
+    # quantities/metrics that aren't money → other
+    "metric": "other", "metrics": "other", "kpi": "other", "measure": "other",
+    "measurement": "other", "stat": "other", "statistic": "other", "quantity": "other",
+    "size": "other", "count": "other",
+    # events → other (no 'event' type in schema)
+    "event": "other", "meeting": "other", "milestone": "other",
+    "appointment": "other", "conference": "other",
+    "money": "amount", "currency": "amount", "price": "amount",
+    "revenue": "amount", "cost": "amount", "fee": "amount",
+    "place": "location", "country": "location", "city": "location",
+    "region": "location", "address": "location",
+    "people": "person", "human": "person", "user": "person", "customer": "person",
+    "client": "person",
+    "initiative": "project", "task": "project", "program": "project",
+    "title": "role", "position": "role", "job": "role",
+    "time": "date", "period": "date", "deadline": "date", "timestamp": "date",
+}
+
+
+def _build_type_aliases() -> Dict[str, str]:
+    """Precompute {alias → canonical type} including common plural forms."""
+    aliases: Dict[str, str] = {}
+    for t in LLM_ENTITY_TYPES:
+        aliases[t] = t
+        if t.endswith("y"):                       # company→companies, technology→technologies
+            aliases[t[:-1] + "ies"] = t
+        aliases[t + "s"] = t                       # products, events, metrics, roles…
+    for k, v in _TYPE_SYNONYMS.items():
+        aliases.setdefault(k, v)
+    return aliases
+
+
+_TYPE_ALIASES = _build_type_aliases()
+
+
+def _canonical_entity_type(raw: str) -> Optional[str]:
+    """Map an LLM-supplied type string to a canonical type, or None to drop it."""
+    t = (raw or "").strip().lower()
+    if not t:
+        return None
+    if t in _TYPE_ALIASES:
+        return _TYPE_ALIASES[t]
+    # Final lenient fallback: strip a plural suffix and retry (covers ad-hoc plurals
+    # of synonyms the LLM may emit, e.g. 'frameworks', 'positions').
+    for suf in ("ies", "es", "s"):
+        if t.endswith(suf) and len(t) > len(suf) + 2:
+            stem = t[:-len(suf)]
+            cand = stem + ("y" if suf == "ies" else "")
+            if cand in _TYPE_ALIASES:
+                return _TYPE_ALIASES[cand]
+    return None
+
+
+def parse_llm_entity_items(data: Any) -> Dict[str, List[Entity]]:
+    """Validate raw LLM JSON → ``{memory_id: [Entity, ...]}``.
+
+    Drops anything malformed, mistyped, blank, or a duplicate within one memory.
+    Never raises — bad items simply don't appear.
+    """
+    out: Dict[str, List[Entity]] = {}
+    if not isinstance(data, dict):
+        return out
+    items = data.get("items")
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mid = str(it.get("id") or "").strip()
+        if not mid:
+            continue
+        ents: List[Entity] = []
+        seen = set()
+        for e in (it.get("entities") or []):
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("name") or "").strip()
+            etype = _canonical_entity_type(str(e.get("type") or ""))
+            # Filter junk: too short, too long, or a bare number/symbol.
+            if not name or len(name) < 2 or len(name) > 80 or not etype:
+                continue
+            if not re.search(r"[A-Za-zÀ-ÿ]", name):
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ents.append(Entity(name=name, type=etype))
+        out[mid] = ents
+    return out
+
+
+def extract_llm(text: str, client: Any, model: str,
+                timeout: float = 60.0, max_tokens: int = 800) -> List[Entity]:
+    """LLM entity extraction for a single text (nightly batch / testing).
+
+    Returns ``[]`` on any failure — regex ``EntityExtractor.extract`` remains the
+    hot-path default; this is the offline enrichment. The dreamer's batched
+    ``extract_llm_batch`` is the production entry point (hardened retries/timeout).
+    """
+    prompt = "Extract entities. Input JSON:\n" + json.dumps(
+        {"items": [{"id": "1", "content": (text or "")[:10000]}]}
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": LLM_EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        content = (resp.choices[0].message.content or "{}") if resp.choices else "{}"
+        return parse_llm_entity_items(json.loads(content)).get("1", [])
+    except Exception:
+        return []
+
