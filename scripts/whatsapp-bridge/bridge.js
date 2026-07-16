@@ -152,9 +152,6 @@ function buildLidMap() {
   return map;
 }
 let lidToPhone = buildLidMap();
-// Restore any persisted history before connecting so the initial history-sync
-// merges into pre-existing data instead of replacing it.
-messageStore.load();
 
 const logger = pino({ level: 'warn' });
 
@@ -171,6 +168,12 @@ const messageStore = new MessageStore({
   maxTotal: MAX_TOTAL_MSGS,
   flushDebounceMs: HISTORY_FLUSH_DEBOUNCE_MS,
 });
+// Restore any persisted history before connecting so the initial history-sync
+// merges into pre-existing data instead of replacing it. This MUST run after
+// the `const messageStore` declaration above — referencing a `const` before its
+// declaration is a temporal-dead-zone ReferenceError that crashes the bridge.
+messageStore.load();
+
 // jid -> display name, populated from history-sync contacts/chats so /chats
 // can show human-readable names alongside the raw jid.
 const contactNames = new Map();

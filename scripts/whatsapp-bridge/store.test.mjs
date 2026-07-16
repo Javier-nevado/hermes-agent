@@ -9,7 +9,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 
 import { MessageStore, normalizeMessage, normalizeWhatsAppId } from './store.mjs';
 
@@ -169,4 +170,23 @@ test('MessageStore.load tolerates a malformed store file', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Regression guard for a real production crash (PR #30): bridge.js called
+// `messageStore.load()` at the top level BEFORE the `const messageStore = ...`
+// declaration. In ESM that is a temporal-dead-zone ReferenceError and the bridge
+// never boots (taking down ALL WhatsApp — send included — on the linked box).
+// Assert the call always sits textually AFTER the construction.
+test('bridge.js loads the message store only after constructing it (no TDZ on boot)', () => {
+  const bridgePath = fileURLToPath(new URL('./bridge.js', import.meta.url));
+  const src = readFileSync(bridgePath, 'utf8');
+  const decl = src.indexOf('const messageStore = new MessageStore');
+  const load = src.indexOf('messageStore.load()');
+  assert.notEqual(decl, -1, 'messageStore declaration not found in bridge.js');
+  assert.notEqual(load, -1, 'messageStore.load() call not found in bridge.js');
+  assert.ok(
+    load > decl,
+    `messageStore.load() (offset ${load}) must come AFTER the declaration ` +
+      `(offset ${decl}) — calling it first is a temporal-dead-zone ReferenceError.`,
+  );
 });
