@@ -171,6 +171,17 @@ else
   echo "  scripts/abi-install-fleet-timer.sh not found in tarball — skip"
 fi
 
+# 4d. Install the Dreamer nightly timer (memory densify/dedup at ~03:17). Ships the
+# unit files + wrapper; PRESERVES enablement — only enables where already enabled,
+# so a fresh/customer box gets the mechanism but stays OFF until per-box sign-off
+# (densify rewrites memory + spends the box's LLM credits). Best-effort; never blocks.
+echo "Installing Dreamer nightly timer..."
+if [ -x scripts/abi-install-dreamer-timer.sh ]; then
+  sudo bash scripts/abi-install-dreamer-timer.sh "$HERMES_DIR" || echo "  (dreamer-timer install reported warnings — continuing)"
+else
+  echo "  scripts/abi-install-dreamer-timer.sh not found in tarball — skip"
+fi
+
 # 5. Health check
 echo "Waiting for abi-api health..."
 for i in $(seq 1 30); do
