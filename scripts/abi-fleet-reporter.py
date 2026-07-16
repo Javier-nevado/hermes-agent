@@ -48,7 +48,7 @@ import urllib.error
 import urllib.request
 
 ENDPOINT = "https://api.opteia.com/instance/health"
-REPORTER_VERSION = 1
+REPORTER_VERSION = 2
 SCHEMA_VERSION = 1
 HTTP_TIMEOUT = 15
 SPOOL_DIR = "/var/lib/abi-fleet/spool"
@@ -60,6 +60,11 @@ VENV_PROBE_MODULES = ("fastapi", "httpx", "openai", "psycopg2", "telegram", "web
 EXPECTED_CONTAINERS = ("abi-memory-db", "abi-memory-api")
 # Gateway systemd unit name patterns (system + user-level).
 GATEWAY_UNIT_GLOBS = ("hermes-gateway*", "abi-agent*", "abi-gateway*")
+# Candidate unit names to probe at the USER level (systemctl --user is-active takes a
+# literal unit name, not a glob). A single-agent bare-metal box may run the gateway as a
+# user-level `hermes-gateway.service` (e.g. castor) while a multi-agent box uses
+# `abi-agent.service` per agent (e.g. .19) — check all + count active if ANY is up.
+GATEWAY_USER_UNITS = ("hermes-gateway.service", "abi-agent.service", "abi-gateway.service")
 SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{8,}|xox[bpoa]-[A-Za-z0-9-]{10,})")
 
 
@@ -197,7 +202,7 @@ def probe_gateway():
                      via XDG_RUNTIME_DIR alone ("Operation not permitted")."""
     out = {"ok": True, "processes": 0, "system_units": [], "user_units": {}, "active_count": 0}
     try:
-        psout, _ = sh("ps -eo args= 2>/dev/null | grep -E 'hermes gateway|abi-agent' | grep -v grep")
+        psout, _ = sh("ps -eo args= 2>/dev/null | grep -E 'hermes.*gateway|abi-agent|gateway run' | grep -v grep")
         out["processes"] = len([l for l in psout.splitlines() if l.strip()])
         globs = " ".join("'%s'" % g for g in GATEWAY_UNIT_GLOBS)
         raw, _ = sh("systemctl list-units --type=service --all --no-legend --plain %s 2>/dev/null" % globs)
@@ -212,11 +217,22 @@ def probe_gateway():
             uid = uid_out.strip()
             if not uid:
                 continue
-            st, _ = sh("sudo -u '%s' XDG_RUNTIME_DIR=/run/user/%s systemctl --user is-active abi-agent.service 2>/dev/null"
-                       % (user, uid))
-            out["user_units"][user] = st.strip() or "unknown"
+            # A user-level gateway may be named hermes-gateway.service (single-agent
+            # bare-metal, e.g. castor) or abi-agent.service (multi-agent, e.g. .19).
+            # Probe each candidate; active if ANY is up (value records which unit).
+            state = "unknown"
+            for unit in GATEWAY_USER_UNITS:
+                st, _ = sh("sudo -u '%s' XDG_RUNTIME_DIR=/run/user/%s systemctl --user is-active '%s' 2>/dev/null"
+                           % (user, uid, unit))
+                st = st.strip()
+                if st == "active":
+                    state = "active:%s" % unit
+                    break
+                if st and st != "inactive" and state == "unknown":
+                    state = st
+            out["user_units"][user] = state
         sys_active = sum(1 for u in out["system_units"] if u["active"] == "active")
-        usr_active = sum(1 for v in out["user_units"].values() if v == "active")
+        usr_active = sum(1 for v in out["user_units"].values() if str(v).startswith("active"))
         out["active_count"] = max(out["processes"], sys_active, usr_active)
     except Exception as e:
         out["error"] = str(e)
