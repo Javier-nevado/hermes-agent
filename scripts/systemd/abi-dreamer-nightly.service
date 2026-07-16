@@ -11,10 +11,10 @@ User=root
 
 # --- Per-box config (uncomment + edit before enabling) ---------------------
 # Nightly default is DENSIFY ONLY (safe: in-place rewrite + audit trail).
-# Dedup is OFF — phase_dedup's >0.90 cosine threshold is uncalibrated for
-# All-MiniLM-L6-v2 (atlas showed 10,646 pairs >0.90, mostly distinct-but-related
-# facts, not true dups). It hard-deletes with no audit trail. Enable ONLY after
-# calibrating the threshold against decrypted pairs.
+# Dedup is opt-in + SAFE (3.6.0): soft-delete (superseded_by + valid_to) + a
+# dedup_log audit trail, threshold 0.97 calibrated against decrypted pairs
+# (>0.97 + telemetry-skip ≈ 0% false positives). Reversible. Enable per-box after
+# sign-off. extract-llm (LLM egress) is separate + also opt-in.
 # Environment="ABI_DREAMER_DEDUP=1"
 #
 # Space-separated agents to densify on the host (each uses its own LLM).

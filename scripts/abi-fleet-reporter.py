@@ -48,7 +48,7 @@ import urllib.error
 import urllib.request
 
 ENDPOINT = "https://api.opteia.com/instance/health"
-REPORTER_VERSION = 2
+REPORTER_VERSION = 3
 SCHEMA_VERSION = 1
 HTTP_TIMEOUT = 15
 SPOOL_DIR = "/var/lib/abi-fleet/spool"
@@ -148,6 +148,29 @@ def probe_identity(hermes_dir):
     except Exception:
         pass
     return out
+
+
+# The self-updater lives at a fixed /opt/abi-tools path (NOT in the hermes tarball;
+# it updates itself via the /selfupdate bundle). Fall back to the in-tree copy on a
+# box that hasn't installed the standalone updater yet.
+UPDATE_SCRIPTS = ("/opt/abi-tools/abi-update.sh",)
+
+
+def probe_update_version(hermes_dir):
+    """The self-updater (abi-update.sh) version stamp — INDEPENDENT of the Hermes
+    release version: this script updates ITSELF via /selfupdate, not the tarball.
+    Major Tom reads this to spot boxes on a STALE self-updater and nudge them to
+    re-run the self-update installer. Returns the stamp (e.g. '2026-07-16'), or
+    None if the updater is absent or predates the ABI_UPDATE_VERSION marker."""
+    candidates = list(UPDATE_SCRIPTS)
+    if hermes_dir:
+        candidates.append("%s/scripts/abi-update.sh" % hermes_dir)
+    for cand in candidates:
+        v, _ = sh("grep -E '^ABI_UPDATE_VERSION=' '%s' 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\"'" % cand)
+        v = v.strip()
+        if v:
+            return v
+    return None
 
 
 def probe_venv(hermes_dir):
@@ -644,6 +667,7 @@ def build_payload(hermes_dir, license_key):
     payload = {
         "schema_version": SCHEMA_VERSION,
         "reporter_version": REPORTER_VERSION,
+        "update_version": probe_update_version(hermes_dir),  # self-updater stamp (nudge signal)
         "pushed_at": pushed_at,          # box UTC; the Worker stamps authoritative received_at
         "backfill": backfill,
         "identity": probe_identity(hermes_dir),
