@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -158,9 +159,45 @@ class ABIMemoryApiClient(MemoryProvider):
         # per session (this block is called once, then cached). Graceful fallback:
         # any error / old box without /session-prime → no briefing, base block only.
         briefing = self._session_briefing()
+        notice = self._update_applied_notice()
+        parts = [base]
+        if notice:
+            parts.append(notice)
         if briefing:
-            return base + briefing + "\n"
-        return base
+            parts.append(briefing + "\n")
+        return "".join(parts)
+
+    def _update_applied_notice(self) -> str:
+        """Fresh-self-update notice for the session-start block.
+
+        An apply restarts the gateway, which wipes the in-memory session, so the
+        agent would otherwise come back unaware an update just landed.
+        ``abi-update.sh`` writes ``/opt/abi-tools/update-applied.json`` on a successful
+        apply; we read it here and surface a one-line notice so the agent can announce
+        the completed update on its first turn back. Surfaced only while fresh (<2h).
+        This plugin runs in the gateway on the host, so the file is readable directly.
+        Returns '' on any failure, missing marker, or stale entry.
+        """
+        try:
+            with open("/opt/abi-tools/update-applied.json") as f:
+                d = json.load(f)
+            at = (d.get("at") or "").strip()
+            version = (d.get("version") or "").strip()
+            if not at or not version:
+                return ""
+            ts = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - ts > timedelta(hours=2):
+                return ""
+        except Exception:
+            return ""
+        return (
+            "\n<system-notice>\n"
+            f"[System note: An ABI self-update to {version} just completed (at {at}) — "
+            "the gateway restarted as part of it, which is why this is a fresh session. "
+            "Acknowledge this to the user in your reply (e.g. the update finished and "
+            f"you are now on {version}), then carry on. Do NOT offer to update again.]\n"
+            "</system-notice>\n"
+        )
 
     def _session_briefing(self) -> str:
         """Compact session-start briefing from /session-prime, or '' on any failure.
