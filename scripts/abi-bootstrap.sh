@@ -139,6 +139,15 @@ if [ -d opteia-skills/shared ]; then
   sudo chmod -R g+rX /opt/abi-tools/skills
   echo "  shared MCP skills -> /opt/abi-tools/skills"
 fi
+
+# 4a. Shared kanban board dir (group-writable by abi-agents, setgid so new files
+# inherit the group). A fresh box lacked this → the first provisioned agent's
+# kanban cron tick threw PermissionError every 60s. Idempotent; also repairs
+# existing boxes on update. Perms match the fleet reference (.19).
+echo "Ensuring shared kanban board dir..."
+sudo groupadd -f abi-agents 2>/dev/null || true
+sudo install -d -o root -g abi-agents -m 2775 /opt/abi-tools/kanban
+echo "  kanban board dir -> /opt/abi-tools/kanban (root:abi-agents 2775)"
 if [ -d opteia-skills/standard ]; then
   for u in $(ls /home/ 2>/dev/null); do
     [ -d "/home/$u/.hermes" ] || continue
