@@ -1046,6 +1046,7 @@ def provision(
     opteia_gateway_key: str = "",
     camofox_reference: Optional[str] = None,
     no_camofox: bool = False,
+    no_provider: bool = False,
 ) -> Dict:
     """Full agent provisioning (12 steps).
 
@@ -1084,11 +1085,16 @@ def provision(
     if not glm_key and provider_slug != "custom":
         # Try GLM_API_KEY in operator's env as last resort
         glm_key = read_existing_env("GLM_API_KEY") or ""
-    if not glm_key:
+    if not glm_key and not no_provider:
         raise ProvisioningError(
             f"API key required. Set --glm-key or have {PROVIDER_KEY_ENV.get(provider_slug, 'API_KEY')} "
-            f"in ~/.hermes/.env or in {SHARED_ENV_SOURCE}"
+            f"in ~/.hermes/.env or in {SHARED_ENV_SOURCE}, or pass --no-provider for onboarding "
+            f"mode (the customer runs /login in chat to connect a provider after first boot)."
         )
+    if not glm_key:
+        print("  [onboarding] --no-provider: provisioning WITHOUT an LLM provider.")
+        print("                The agent will boot and connect to Telegram, but cannot answer")
+        print("                messages until the customer runs /login in chat to connect one.")
 
     if not telegram_token:
         raise ProvisioningError("Communication token required")
@@ -1278,6 +1284,10 @@ def main():
                              "(default: auto-discover, prefers ailean)")
     parser.add_argument("--no-camofox", action="store_true",
                         help="Don't copy the camofox browser plugin")
+    parser.add_argument("--no-provider", action="store_true",
+                        help="Onboarding mode: provision WITHOUT an LLM provider. The agent boots "
+                             "and connects to Telegram but cannot answer until the customer runs "
+                             "/login in chat to connect a provider. For trials / BYO-key flows.")
     parser.add_argument("--interactive", action="store_true", help="Force interactive mode")
     args = parser.parse_args()
 
@@ -1318,6 +1328,7 @@ def main():
         opteia_gateway_key=args.opteia_gateway_key,
         camofox_reference=args.camofox_reference,
         no_camofox=args.no_camofox,
+        no_provider=args.no_provider,
     )
 
     sys.exit(0 if result["status"] == "running" else 1)
