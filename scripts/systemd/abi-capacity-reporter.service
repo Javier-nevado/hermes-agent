@@ -1,0 +1,20 @@
+[Unit]
+Description=ABI capacity reporter — daily capacity-equivalent self-report push
+Documentation=https://github.com/Javier-nevado/hermes-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Fixed operator-tooling location (abi-install-capacity-timer.sh copies the reporter +
+# its prompt template here from the extracted tarball). Fixed so ExecStart works on BOTH
+# bare-metal (/opt/hermes-agent) and per-user (~/.hermes/hermes-agent) code layouts.
+ExecStart=/usr/bin/python3 /opt/abi-tools/abi-capacity-reporter.py
+User=root
+
+# Root is required to read each agent's cron/jobs.json + state.db under other users'
+# homes and to `sudo -u <agent> hermes -z` for the per-agent self-classification. The
+# report carries COUNTS + categories + human-equivalent hours ONLY (no message/memory
+# content, no PII, no credentials — see abi_capacity_prompt.txt + abi-capacity-reporter.py).
+StandardOutput=journal
+StandardError=journal

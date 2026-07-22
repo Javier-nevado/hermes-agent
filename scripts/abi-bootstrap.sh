@@ -180,6 +180,17 @@ else
   echo "  scripts/abi-install-fleet-timer.sh not found in tarball — skip"
 fi
 
+# 4c-bis. Install the daily capacity-equivalent timer (nightly self-report phone-home).
+# Mirrors the fleet timer: copies the reporter + prompt template to /opt/abi-tools,
+# installs the systemd units, ENABLES the timer (does NOT run the service immediately).
+# Best-effort; never blocks bring-up.
+echo "Installing daily capacity-equivalent timer..."
+if [ -x scripts/abi-install-capacity-timer.sh ]; then
+  sudo bash scripts/abi-install-capacity-timer.sh "$HERMES_DIR" || echo "  (capacity-timer install reported warnings — continuing)"
+else
+  echo "  scripts/abi-install-capacity-timer.sh not found in tarball — skip"
+fi
+
 # 4d. Install the Dreamer nightly timer (memory densify/dedup at ~03:17). Ships the
 # unit files + wrapper; PRESERVES enablement — only enables where already enabled,
 # so a fresh/customer box gets the mechanism but stays OFF until per-box sign-off

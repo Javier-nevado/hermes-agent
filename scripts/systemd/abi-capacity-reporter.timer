@@ -1,0 +1,15 @@
+[Unit]
+Description=Push ABI daily capacity-equivalent self-report
+Documentation=https://github.com/Javier-nevado/hermes-agent
+
+[Timer]
+# Nightly at 02:27 — off-peak (before the Dreamer's 03:17 memory run), off the :00/:30
+# marks so the fleet doesn't all hit the Worker at once. Each agent self-classifies its
+# PREVIOUS day's work, so a post-midnight run captures a full calendar day. Persistent=true
+# catches up a missed run after downtime; the 5-min jitter spreads the fleet further.
+OnCalendar=*-*-* 02:27:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

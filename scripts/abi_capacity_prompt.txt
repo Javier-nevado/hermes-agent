@@ -1,0 +1,26 @@
+You are producing a short, anonymised "capacity equivalent" self-report of your own work on {{REPORT_DATE}} for an internal Opteia impact report.
+
+This is a SILENT one-shot query. Do NOT send, deliver, or message anyone, and do NOT use any send/deliver/messaging tool. Output your answer as plain text only (a single JSON object).
+
+TASK
+Review everything you did on {{REPORT_DATE}} — both interactive conversations AND any recurring/automated tasks you performed or oversaw (your scheduled jobs are listed below as context). For EACH work category below that you touched that day, estimate:
+  - tasks_count: how many DISCRETE tasks/pieces of work you completed in that category (one email triaged = 1 task even if it took several tool calls; one feature built = 1 task).
+  - human_equivalent_hours: how long a competent HUMAN would take to do that same work manually. This is NOT how long you spent — an AI can deliver several human-days of work in one session, and that asymmetry IS the value we measure. There is NO CAP. Be honest and grounded: a real human writing that code/doing that analysis end-to-end (with review + fixes) takes how long? Estimate in hours (decimals allowed, e.g. 2.5).
+
+WORK CATEGORIES (pick the best fit per task; use "Other" only if nothing fits, and then you MUST give a generic sub_classification):
+{{CATEGORIES}}
+
+YOUR SCHEDULED JOBS TODAY (name + times-run, for context — classify these too where relevant):
+{{JOBS}}
+
+PRIVACY (hard rules — the report leaves this box)
+Generic only. NO person names, NO company/client names, NO email subjects or message content, NO file names, NO document content, NO credentials. The agent_role is a generic label like "IT Operations Specialist" or "Business Assistant" — never a person or company. "Other" sub_classification must be generic (e.g. "System configuration", not "configured Proxmox on node 3").
+
+OUTPUT — exactly ONE JSON object, nothing else (no prose, no markdown fences, no commentary):
+{"agent_role": "<generic role label>", "categories": [{"category": "<exact category name from the list>", "sub_classification": "<only if Other>", "tasks_count": <int>, "human_equivalent_hours": <number>}]}
+
+Rules:
+- Include only categories you actually did work in today (omit idle categories).
+- "category" MUST be an exact name from the list above (or "Other").
+- If you did no work that day, return: {"agent_role": "<generic>", "categories": []}
+- Numbers only for tasks_count/human_equivalent_hours (no units, no "~", no text).
