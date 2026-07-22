@@ -19,7 +19,16 @@
 
 set -u
 
-HERMES_DIR="${1:-${HERMES_DIR:-}}"
+# Args: optional --preserve-enablement flag + an optional HERMES_DIR positional.
+PRESERVE_ENABLEMENT=0
+HERMES_DIR="${HERMES_DIR:-}"
+for _a in "$@"; do
+  case "$_a" in
+    --preserve-enablement) PRESERVE_ENABLEMENT=1 ;;
+    -*) ;;  # ignore unknown flags
+    *) HERMES_DIR="$_a" ;;
+  esac
+done
 if [ -z "$HERMES_DIR" ]; then
   if [ -f /opt/hermes-agent/VERSION ]; then HERMES_DIR="/opt/hermes-agent"
   else HERMES_DIR="$(pwd)"; fi
@@ -61,7 +70,20 @@ done
 systemctl daemon-reload 2>/dev/null || true
 
 # 3. Enable + start the TIMER (NOT the service — see header). Idempotent, never fails.
-systemctl enable abi-capacity-reporter.timer 2>/dev/null || true
-systemctl start abi-capacity-reporter.timer 2>/dev/null || true
-log "timer enabled (nightly at 02:27, ±5min spread). Verify: systemctl list-timers abi-capacity-reporter.timer"
+#    --preserve-enablement (abi-update.sh): the reporter spends the box's LLM credits
+#    nightly, so on an in-place UPDATE only (re)start the timer if it was ALREADY
+#    enabled — never auto-enable on a customer box (per-box sign-off, like the Dreamer).
+#    Fresh installs (abi-bootstrap.sh) call WITHOUT the flag → auto-enable.
+if [ "$PRESERVE_ENABLEMENT" = "1" ]; then
+  if systemctl is-enabled abi-capacity-reporter.timer >/dev/null 2>&1; then
+    systemctl start abi-capacity-reporter.timer 2>/dev/null || true
+    log "timer already enabled — refreshed (preserve-enablement mode)."
+  else
+    log "timer NOT enabled — preserve-enablement mode (fresh installs enable it). To turn on: sudo systemctl enable --now abi-capacity-reporter.timer"
+  fi
+else
+  systemctl enable abi-capacity-reporter.timer 2>/dev/null || true
+  systemctl start abi-capacity-reporter.timer 2>/dev/null || true
+  log "timer enabled (nightly at 02:27, ±5min spread). Verify: systemctl list-timers abi-capacity-reporter.timer"
+fi
 exit 0
