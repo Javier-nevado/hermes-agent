@@ -1,0 +1,191 @@
+# docker-compose.v4.yml — ABI v4.0.0 fully-container deployment stack.
+#
+# One compose stack per host. Topology:
+#   - shared infra: abi-memory-db (pgvector) + abi-memory-api (FastAPI), reached
+#     by agents over the internal `abi-net` network by service name (no host port
+#     needed for agent traffic).
+#   - N agent services (abi-agent-<name>): each its own named volume
+#     (abi-hermes-<name> -> /opt/data = HERMES_HOME), running the gateway. The
+#     agent's Linux-user isolation is preserved via HERMES_UID (s6-overlay remaps
+#     the image's internal `hermes` user to the agent's UID and drops to it) — NOT
+#     a compose `user:` directive, because the image's stage2 hook runs as root
+#     (PID 1 = /init) to usermod + chown the volume before services start.
+#   - per-agent camofox (abi-camofox-<name>): own profile/cookies volume (true
+#     per-agent browser identity, no cross-contamination). Capped + restartable.
+#
+# Inter-agent API: each agent binds its API server to 0.0.0.0:8080 INSIDE the
+# container (no host port published) and is reachable on abi-net by service name,
+# e.g. http://abi-agent-ailean:8080. This eliminates the v3 8400+N host-port
+# allocation + exposure entirely.
+#
+# USAGE (dev — image built locally):
+#   ABI_DB_PASSWORD=... OPTEIA_LICENSE_KEY=... ABI_API_SERVER_KEY=... \
+#   ABI_VERSION=dev docker compose -f docker-compose.v4.yml --profile dev up -d
+#
+# USAGE (prod — image pulled from registry.opteia.com, seat gate on):
+#   docker compose -f docker-compose.v4.yml up -d
+#   (registry + seat routes land in Phase 0-B/C; until then ABI_SEAT_GATE defaults
+#   to 0 = no gate, and the agent image falls back to `build: .` when ABI_VERSION=dev)
+#
+# ADDING AN AGENT: copy the `abi-agent-<name>` + `abi-camofox-<name>` pair, change
+# the three <name> occurrences + the *_UID/*_GID + the agent-specific secrets
+# (TELEGRAM_BOT_TOKEN, provider key). Provisioning (abi-provision v4) will append
+# such a pair automatically.
+
+# ─── shared agent-service config (anchor; each agent service merges + overrides) ───
+x-agent-common: &agent-common
+  # Prod: pull from the license-gated registry (the abi-update-v4 helper always
+  # `pull`s before `up`). Dev: `docker compose build` builds + tags locally from
+  # the repo Dockerfile; the build is inert in prod (image already present).
+  image: registry.opteia.com/abi-agent:${ABI_VERSION:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  command: ["gateway", "run", "--replace"]
+  networks:
+    - abi-net
+  depends_on:
+    abi-memory-api:
+      condition: service_healthy
+  mem_limit: ${AGENT_MEM_LIMIT:-768m}
+  # No `user:` here on purpose — see header. The container starts as root so s6's
+  # stage2 hook can remap the internal hermes user to HERMES_UID + chown the
+  # volume; services then drop to the agent UID via s6-setuidgid.
+
+services:
+  # ─────────────── shared infra (one set per host) ───────────────
+  abi-memory-db:
+    image: pgvector/pgvector:pg17
+    container_name: abi-memory-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${ABI_DB_USER:-abi_agent}
+      POSTGRES_PASSWORD: ${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      POSTGRES_DB: ${ABI_DB_NAME:-abi_memory}
+    volumes:
+      - abi-db-data:/var/lib/postgresql/data
+    networks: [abi-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ABI_DB_USER:-abi_agent} -d ${ABI_DB_NAME:-abi_memory}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  abi-memory-api:
+    # Phase 0-B makes this a `registry.opteia.com/abi-memory-api` pull. Until then
+    # (and for dev) it builds from Dockerfile.abi-api alongside the repo.
+    build:
+      context: .
+      dockerfile: Dockerfile.abi-api
+    container_name: abi-memory-api
+    restart: unless-stopped
+    # 8010 published to the host for operator health checks + direct API probes.
+    # Agents do NOT use this port — they reach http://abi-memory-api:8010 on abi-net.
+    ports:
+      - "${ABI_MEMORY_API_HOST_PORT:-127.0.0.1:8010}:8010"
+    environment:
+      - ABI_DATABASE_URL=postgresql://${ABI_DB_USER:-abi_agent}:${ABI_DB_PASSWORD}@abi-memory-db:5432/${ABI_DB_NAME:-abi_memory}
+      - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?OPTEIA_LICENSE_KEY required}
+      - LICENSE_JWT_SECRET=${LICENSE_JWT_SECRET:-}
+      - ABI_MEMORY_AUTO_EXTRACT_ENABLED=${ABI_MEMORY_AUTO_EXTRACT_ENABLED:-false}
+    networks: [abi-net]
+    depends_on:
+      abi-memory-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────── example agent: ailean (the delegation hub) ───────────────
+  abi-agent-ailean:
+    <<: *agent-common
+    container_name: abi-agent-ailean
+    volumes:
+      - abi-hermes-ailean:/opt/data
+    environment:
+      # --- runtime UID (s6 remaps the image's hermes user to the agent's UID) ---
+      - HERMES_UID=${AILEAN_UID:-10001}
+      - HERMES_GID=${AILEAN_GID:-10001}
+      - HERMES_HOME=/opt/data
+      # --- shared infra (internal service names, not localhost) ---
+      - ABI_MEMORY_API_URL=http://abi-memory-api:8010
+      - ABI_MEMORY_AUTO_EXTRACT_ENABLED=${ABI_MEMORY_AUTO_EXTRACT_ENABLED:-false}
+      # --- inter-agent API server (binds in-container; reached by service name) ---
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8080
+      - API_SERVER_KEY=${ABI_API_SERVER_KEY:?ABI_API_SERVER_KEY required (shared by all agents)}
+      # --- seat gate (Phase 0-C). 0 = off (default, pre-license-api); 1 = enforce ---
+      - ABI_SEAT_GATE=${ABI_SEAT_GATE:-0}
+      - ABI_AGENT_ID=ailean
+      - ABI_SEAT_API_URL=${ABI_SEAT_API_URL:-https://api.opteia.com}
+      - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?OPTEIA_LICENSE_KEY required}
+      # --- per-agent browser (its own camofox sibling) ---
+      - CAMOFOX_URL=http://abi-camofox-ailean:9377
+      # --- media ---
+      - HERMES_MEDIA_ALLOW_DIRS=/tmp:/opt/data/media
+      - HERMES_MEDIA_TRUST_RECENT_SECONDS=3600
+      # --- kanban (set only if the kanban profile is enabled; points at the container) ---
+      - KANBOARD_URL=${KANBOARD_URL:-}
+      - KANBOARD_USER=${KANBOARD_USER:-}
+      - KANBOARD_TOKEN=${KANBOARD_TOKEN:-}
+      - KANBOARD_PROJECT_ID=${KANBOARD_PROJECT_ID:-}
+      # --- agent-specific secrets (provisioning fills these) ---
+      - TELEGRAM_BOT_TOKEN=${AILEAN_TELEGRAM_BOT_TOKEN:?}
+      - TELEGRAM_ALLOWED_USERS=${AILEAN_TELEGRAM_ALLOWED_USERS:-}
+      - GLM_API_KEY=${AILEAN_GLM_API_KEY:-${GLM_API_KEY:-}}
+      - GLM_BASE_URL=${GLM_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
+      - OPTEIA_API_KEY=${OPTEIA_API_KEY:-}
+
+  abi-camofox-ailean:
+    image: ghcr.io/jo-inc/camofox-browser:latest
+    container_name: abi-camofox-ailean
+    restart: unless-stopped
+    mem_limit: ${CAMOFOX_MEM_LIMIT:-512m}
+    environment:
+      - CAMOFOX_PORT=9377
+      - NODE_ENV=production
+      - CAMOFOX_API_KEY=${CAMOFOX_API_KEY:-}
+      - TAB_INACTIVITY_MS=1800000
+      - BROWSER_IDLE_TIMEOUT_MS=3600000
+    volumes:
+      - camofox-ailean:/root/.camofox   # persistent per-agent profile/cookies
+    networks: [abi-net]
+
+  # ─────────────── more agents: copy the abi-agent-<name> + abi-camofox-<name>
+  # pair above, change <name>, *_UID/*_GID, and the *_TELEGRAM_BOT_TOKEN /
+  # provider key. Examples (uncomment + fill to deploy):
+  #
+  # abi-agent-caspian:
+  #   <<: *agent-common
+  #   container_name: abi-agent-caspian
+  #   volumes: [abi-hermes-caspian:/opt/data]
+  #   environment:
+  #     - HERMES_UID=${CASPIAN_UID:-10002}
+  #     - HERMES_GID=${CASPIAN_GID:-10002}
+  #     - ABI_MEMORY_API_URL=http://abi-memory-api:8010
+  #     - API_SERVER_ENABLED=true
+  #     - API_SERVER_HOST=0.0.0.0
+  #     - API_SERVER_PORT=8080
+  #     - API_SERVER_KEY=${ABI_API_SERVER_KEY:?}
+  #     - ABI_AGENT_ID=caspian
+  #     - OPTEIA_LICENSE_KEY=${OPTEIA_LICENSE_KEY:?}
+  #     - CAMOFOX_URL=http://abi-camofox-caspian:9377
+  #     - TELEGRAM_BOT_TOKEN=${CASPIAN_TELEGRAM_BOT_TOKEN:?}
+  #     - GLM_API_KEY=${GLM_API_KEY:-}
+  # abi-camofox-caspian:
+  #   image: ghcr.io/jo-inc/camofox-browser:latest
+  #   ... (mirror abi-camofox-ailean, volume camofox-caspian)
+
+networks:
+  abi-net:
+    driver: bridge
+
+volumes:
+  abi-db-data:
+  abi-hermes-ailean:
+  camofox-ailean:
