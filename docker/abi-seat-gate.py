@@ -38,10 +38,19 @@ ABI_VERSION = os.environ.get("ABI_VERSION", "")
 TOKEN_FILE = os.environ.get("ABI_SEAT_TOKEN_FILE", "/run/abi-seat-token")
 CFG_FILE = os.environ.get("ABI_SEAT_CFG_FILE", "/run/abi-seat-cfg")
 
+# api.opteia.com sits behind Cloudflare Bot Fight Mode, which 403s urllib's default
+# "Python-urllib/x.y" UA (edge "error code: 1010"). This is the same documented
+# requirement as abi/memory/model_cache.py (which even has a test enforcing it) and the
+# fleet/capacity reporters — every api.opteia.com client must send a non-default UA. A
+# descriptive custom UA passes cleanly; env-overridable as a safety valve if a future CF
+# rule ever targets it.
+_USER_AGENT = os.environ.get("ABI_SEAT_USER_AGENT", "abi-seat-gate/1.0 (+https://opteia.com)")
+
 
 def _post(path, payload, headers, timeout=15):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(API_BASE + path, data=data, method="POST")
+    req.add_header("User-Agent", _USER_AGENT)
     for k, v in headers.items():
         req.add_header(k, v)
     try:
@@ -95,7 +104,20 @@ def checkout():
         print("[seat] REFUSED — seat limit reached for this license", file=sys.stderr)
         return 1
     if st in (401, 403):
-        print(f"[seat] REFUSED — license invalid (HTTP {st})", file=sys.stderr)
+        # A Worker 401/403 is JSON {error:...}. A non-JSON 403 (e.g. Cloudflare Bot Fight
+        # Mode "error code: 1010" from a default/banned UA) is a TRANSPORT block at the
+        # edge, not a license problem — surface it distinctly so it isn't mis-diagnosed as
+        # "license invalid" (which sends the operator chasing the license instead of the UA).
+        try:
+            err = json.loads(body).get("error") if body.strip().startswith("{") else None
+        except (ValueError, TypeError):
+            err = None
+        if err:
+            print(f"[seat] REFUSED — license invalid ({err})", file=sys.stderr)
+        else:
+            print(f"[seat] BLOCKED at the edge (HTTP {st}, non-Worker body): {body[:120]!r} — "
+                  f"check User-Agent/network (CF Bot Fight Mode 403s the default urllib UA)",
+                  file=sys.stderr)
         return 1
     print(f"[seat] checkout unexpected HTTP {st}: {body[:200]}", file=sys.stderr)
     return 1
