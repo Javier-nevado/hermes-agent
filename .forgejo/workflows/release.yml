@@ -1,0 +1,87 @@
+# .forgejo/workflows/release.yml
+#
+# The v4 image release path: build the ABI agent image ON FRG-DMZ (forgejo-runner,
+# host executor) and push it to the on-box Forgejo OCI registry over loopback
+# (localhost:3000). Source lives in Forgejo, the build runs on the same box, and
+# the push is loopback — so cloudflared is never in the push path and the CF ~100MB
+# request-body limit is moot (the whole reason FRG-DMZ is the builder).
+#
+# Identity: the `release-bot` Forgejo user — read collaborator on the two repos
+# (hermes-agent + abi-skills) so it can clone, plus write:package on the registry
+# so it can push. Its token is the repo secret REGISTRY_PUSH_TOKEN. The customer
+# pull identity `abi-pull` (read:package only) is untouched.
+#
+# Host executor (runs-on: self-hosted, label self-hosted:host) means each step's
+# `run:` executes directly on the box with the host docker — simplest reliable path
+# for a docker build+push job, no DinD / socket-mount dance. No external actions are
+# used (no node dependency); checkouts are plain `git clone` with the release-bot token.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'image tag to publish (e.g. v4.0.0, v4.0.0-ci)'
+        required: true
+        default: 'v4.0.0-ci'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: localhost:3000
+  IMAGE: localhost:3000/opteia/abi-agent
+
+jobs:
+  build-push:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: resolve image tag
+        id: t
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -z "$tag" ] && tag="${GITHUB_REF_NAME}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice::publishing ${IMAGE}:${tag} from ref ${GITHUB_REF_NAME}"
+
+      - name: checkout hermes-agent
+        env:
+          TOKEN: ${{ secrets.REGISTRY_PUSH_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
+            "http://release-bot:${TOKEN}@${REGISTRY}/opteia/hermes-agent.git" .
+          echo "HEAD $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+
+      - name: stage shared skills (abi-skills -> ./abi-tools-skills)
+        env:
+          TOKEN: ${{ secrets.REGISTRY_PUSH_TOKEN }}
+        run: |
+          set -e
+          git clone --depth 1 "http://release-bot:${TOKEN}@${REGISTRY}/opteia/abi-skills.git" ../abi-skills
+          ABI_SKILLS_DIR="$PWD/../abi-skills" docker/sync-abi-skills.sh
+
+      - name: docker build
+        run: |
+          set -e
+          SHA="$(git rev-parse HEAD)"
+          docker build \
+            --build-arg HERMES_GIT_SHA="$SHA" \
+            --tag "${IMAGE}:${{ steps.t.outputs.tag }}" \
+            --tag "${IMAGE}:latest" \
+            .
+          docker images "${IMAGE}" --format 'built: {{.Repository}}:{{.Tag}} {{.Size}}'
+
+      - name: docker login + push
+        env:
+          TOKEN: ${{ secrets.REGISTRY_PUSH_TOKEN }}
+        run: |
+          set -e
+          printf '%s' "$TOKEN" | docker login "${REGISTRY}" -u release-bot --password-stdin
+          docker push "${IMAGE}:${{ steps.t.outputs.tag }}"
+          docker push "${IMAGE}:latest"
+          docker logout "${REGISTRY}"
