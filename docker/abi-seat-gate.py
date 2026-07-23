@@ -2,11 +2,17 @@
 """abi-seat-gate.py — on-box seat-licensing client (ABI v4 container deployment).
 
 Enforces per-tier agent-count limits (Core=1, Forge=3, +purchasable add-ons).
-The container entrypoint (docker/cont-init.d/03-seat-checkout) checks out a seat
-BEFORE the gateway starts: no seat -> exit non-zero -> s6 never brings the
-gateway up -> the agent won't run without a licensed seat (compose Restart
-retries, but it won't boot until a seat frees). A heartbeat renews the seat;
-release frees it on shutdown so crashed/killed agents don't lock seats.
+Invoked from docker/main-wrapper.sh (the container's main program / the gateway
+itself under s6-overlay Architecture B) BEFORE `exec hermes`: no seat ->
+checkout exits non-zero -> main-wrapper exits -> the container exits -> the agent
+won't run without a licensed seat (compose Restart retries, but it won't come up
+until a seat frees / the license validates). A heartbeat renews the seat; release
+frees it on shutdown so crashed/killed agents don't lock seats.
+
+NOTE: the gate must run from main-wrapper, NOT a cont-init.d script. s6-overlay
+v3's legacy-cont-init is NON-fatal — a cont-init script exiting non-zero is
+logged then ignored, and the main program runs anyway. Only the main program's
+exit stops the container. (Verified on the v4 image.)
 
 Opt-in via ABI_SEAT_GATE=1. Until the Worker routes (/license/agent-checkout |
 agent-heartbeat | agent-release) ship (Phase 0-C), leave ABI_SEAT_GATE unset ->
