@@ -93,3 +93,8 @@ docs/superpowers/*
 # logs, and per-session caches are never artifacts of the codebase.
 .hermes/
 docker.env
+
+# ABI v4: shared skills staged from the separate abi-skills repo at build
+# time (docker/sync-abi-skills.sh). NOT committed — sourced per-build so the
+# canonical abi-skills repo stays the single source of truth.
+abi-tools-skills/

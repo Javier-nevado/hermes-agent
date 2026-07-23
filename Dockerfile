@@ -237,6 +237,17 @@ COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-r
 # main-wrapper.sh (NOT a cont-init script) — see the comment there for why the
 # gate must live in the main program (s6-overlay v3's legacy-cont-init is non-fatal).
 
+# ABI v4: bake the Opteia shared skills into the image. The content is staged into
+# build-context ./abi-tools-skills/ by docker/sync-abi-skills.sh from the SEPARATE
+# abi-skills repo (not committed to this repo — see .gitignore). Baked at the exact
+# path /opt/abi-tools/skills because the skill CONTENT references its own scripts by
+# that absolute path (e.g. /opt/abi-tools/skills/pm/kanboard/kanboard_client.py).
+# Read-only + root-owned; the gateway loads it via skills.external_dirs in
+# cli-config.yaml.example. The repo-wide `COPY . .` above also drops a stray copy
+# at /opt/hermes/abi-tools-skills/ — remove it so /opt/abi-tools/skills is canonical.
+COPY abi-tools-skills /opt/abi-tools/skills
+RUN rm -rf /opt/hermes/abi-tools-skills
+
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_HOME=/opt/data

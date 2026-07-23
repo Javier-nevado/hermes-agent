@@ -551,9 +551,12 @@ skills:
   # and resolved to an absolute path.  External dirs are read-only: skill
   # creation always writes to ~/.hermes/skills/.  Local skills take precedence
   # when names collide.
-  # external_dirs:
-  #   - ~/.agents/skills
-  #   - /home/shared/team-skills
+  # ABI v4: the Opteia shared skills are baked into the image at
+  # /opt/abi-tools/skills (read-only — sourced from the separate abi-skills
+  # repo at image build time). Loaded by default so every agent sees the full
+  # platform skill library without per-box reconciliation.
+  external_dirs:
+    - /opt/abi-tools/skills
 
 # =============================================================================
 # Agent Behavior
