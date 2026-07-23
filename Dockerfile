@@ -232,6 +232,9 @@ RUN mkdir -p /etc/cont-init.d && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
+# ABI v4: seat-licensing hard gate (opt-in via ABI_SEAT_GATE). abi-seat-gate.py is
+# brought in by the repo-wide `COPY . .` at /opt/hermes/docker/abi-seat-gate.py.
+COPY --chmod=0755 docker/cont-init.d/03-seat-checkout /etc/cont-init.d/03-seat-checkout
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
