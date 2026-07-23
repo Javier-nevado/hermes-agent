@@ -32,8 +32,14 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: localhost:3000
-  IMAGE: localhost:3000/opteia/abi-agent
+  # docker registry = the FQDN. caddy (local TLS, internal CA, trusted by docker) terminates
+  # https://git.opteia.com -> forgejo:3000, and /etc/hosts pins git.opteia.com to loopback,
+  # so the push is loopback AND the registry token realm (derived from ROOT_URL=git.opteia.com)
+  # resolves locally. Cloudflared is never in the push path.
+  REGISTRY: git.opteia.com
+  IMAGE: git.opteia.com/opteia/abi-agent
+  # plain HTTP loopback for git clones (separate from the registry; no realm/TLS needed)
+  CLONE_BASE: localhost:3000
 
 jobs:
   build-push:
@@ -54,7 +60,7 @@ jobs:
         run: |
           set -e
           git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "http://release-bot:${TOKEN}@${REGISTRY}/opteia/hermes-agent.git" .
+            "http://release-bot:${TOKEN}@${CLONE_BASE}/opteia/hermes-agent.git" .
           echo "HEAD $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
 
       - name: stage shared skills (abi-skills -> ./abi-tools-skills)
@@ -62,7 +68,7 @@ jobs:
           TOKEN: ${{ secrets.REGISTRY_PUSH_TOKEN }}
         run: |
           set -e
-          git clone --depth 1 "http://release-bot:${TOKEN}@${REGISTRY}/opteia/abi-skills.git" ../abi-skills
+          git clone --depth 1 "http://release-bot:${TOKEN}@${CLONE_BASE}/opteia/abi-skills.git" ../abi-skills
           ABI_SKILLS_DIR="$PWD/../abi-skills" docker/sync-abi-skills.sh
 
       - name: docker build
