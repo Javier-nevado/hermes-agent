@@ -140,6 +140,17 @@ s6-setuidgid hermes mkdir -p \
     "$HERMES_HOME/workspace" \
     "$HERMES_HOME/home"
 
+# --- Per-agent install venv (ABI v4) ---
+# Creates $HERMES_HOME/venv bridged to the image's product venv via a .pth, so
+# agent `pip install`s survive image swaps while still inheriting the product
+# deps + source. See docker/abi-venv-init.sh. Runs as hermes (venv files must be
+# hermes-owned). Best-effort: a failure logs + continues (the gateway falls back
+# to the product venv via main-wrapper.sh).
+if [ -x "$INSTALL_DIR/docker/abi-venv-init.sh" ]; then
+    s6-setuidgid hermes "$INSTALL_DIR/docker/abi-venv-init.sh" \
+        || echo "[stage2] Warning: abi-venv-init failed; gateway will use the product venv"
+fi
+
 # --- Install-method stamp (read by detect_install_method() in hermes status) ---
 # Preserved from the tini-era entrypoint (PR #27843). Must be written as
 # the hermes user so ownership matches the file's documented owner.

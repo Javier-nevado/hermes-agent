@@ -27,8 +27,17 @@ set -e
 export HOME=/opt/data
 
 cd /opt/data
+# ABI v4: prefer the per-agent volume venv ($HERMES_HOME/venv) when present —
+# it bridges the product venv via .pth so the gateway sees BOTH the inherited
+# product deps and the agent's own installed packages (which survive image
+# swaps). Fall back to the product venv otherwise (legacy / pre-v4 boots).
+ABI_VENV="${HERMES_HOME:-/opt/data}/venv"
 # shellcheck disable=SC1091
-. /opt/hermes/.venv/bin/activate
+if [ -f "$ABI_VENV/bin/activate" ]; then
+    . "$ABI_VENV/bin/activate"
+else
+    . /opt/hermes/.venv/bin/activate
+fi
 
 if [ $# -eq 0 ]; then
     exec s6-setuidgid hermes hermes
