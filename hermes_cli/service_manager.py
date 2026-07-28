@@ -569,7 +569,11 @@ class S6ServiceManager:
           2. Resets ``HOME`` to ``/opt/data`` before the privilege drop
              so with-contenv's root HOME does not leak into the
              unprivileged gateway process.
-          3. Activates the bundled venv.
+          3. Activates the per-agent volume venv at
+             ``$HERMES_HOME/venv`` when present (ABI v4; it bridges the
+             product venv via ``.pth`` so agent-installed packages are
+             visible to the gateway and survive image swaps), else the
+             bundled product venv.
           4. Drops to the hermes user and exec's
              ``hermes -p <profile> gateway run`` (or just ``hermes
              gateway run`` for the default profile — see below).
@@ -602,7 +606,17 @@ class S6ServiceManager:
             "set -e",
             "export HOME=/opt/data",
             "cd /opt/data",
-            ". /opt/hermes/.venv/bin/activate",
+            "# ABI v4: prefer the per-agent volume venv ($HERMES_HOME/venv)",
+            "# when present — it bridges the product venv via .pth so the",
+            "# gateway sees BOTH the inherited product deps AND the agent's",
+            "# own pip-installed packages (which survive image swaps). Fall",
+            "# back to the bundled product venv otherwise (legacy / pre-v4).",
+            'ABI_VENV="${HERMES_HOME:-/opt/data}/venv"',
+            'if [ -f "$ABI_VENV/bin/activate" ]; then',
+            '    . "$ABI_VENV/bin/activate"',
+            "else",
+            "    . /opt/hermes/.venv/bin/activate",
+            "fi",
         ]
         for k, v in sorted(extra_env.items()):
             lines.append(f"export {k}={shlex.quote(v)}")
