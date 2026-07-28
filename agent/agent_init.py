@@ -193,6 +193,8 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    skip_memory_store: bool = False,
+    skip_memory_provider: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -1063,16 +1065,27 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
-    # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    # Persistent memory: two INDEPENDENT subsystems, independently skippable.
+    #   skip_memory          = legacy blanket flag -> disable BOTH (cron default)
+    #   skip_memory_store    = block 1: built-in MEMORY.md / USER.md + user-profile
+    #                          auto-extraction. THIS is the "corrupt user
+    #                          representations" pollution risk for templated prompts.
+    #   skip_memory_provider = block 2: external provider plugin -> abi_remember /
+    #                          abi_recall. Explicit, agent-initiated writes to the
+    #                          shared memory DB (NOT the user profile) -> safe for a
+    #                          cron/heartbeat job to opt into persisting output.
+    # mem_config is read by BOTH blocks, so resolve it once here, unconditionally.
+    _skip_store = skip_memory or skip_memory_store
+    _skip_provider = skip_memory or skip_memory_provider
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    mem_config = _agent_cfg.get("memory", {})
+    if not _skip_store:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1091,7 +1104,7 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not _skip_provider:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
