@@ -596,6 +596,40 @@ def test_render_run_script_resets_home_before_exec() -> None:
     assert "exec s6-setuidgid hermes hermes -p coder gateway run" in run_text
 
 
+def test_render_run_script_prefers_agent_volume_venv() -> None:
+    """The supervised gateway run-script must activate the per-agent volume
+    venv ($HERMES_HOME/venv) when present, falling back to the bundled
+    product venv. Without this the gateway boots on the product venv and
+    agent pip-installed packages are invisible to it (and to cron, which
+    uses the gateway's ``sys.executable``) — they also vanish on image
+    swap. Regression guard for the ABI v4 dual-venv wiring (see
+    ``abi-venv-init.sh`` + ``main-wrapper.sh``).
+    """
+    from hermes_cli.service_manager import S6ServiceManager
+
+    run_text = S6ServiceManager._render_run_script("default", {})
+
+    # The volume venv is selected by a RUNTIME expansion of HERMES_HOME
+    # (not a Python-substituted path), mirroring main-wrapper.sh, so a
+    # container started with -e HERMES_HOME=/data/hermes still works.
+    assert 'ABI_VENV="${HERMES_HOME:-/opt/data}/venv"' in run_text
+    assert 'if [ -f "$ABI_VENV/bin/activate" ]; then' in run_text
+    assert '. "$ABI_VENV/bin/activate"' in run_text
+    # The product venv survives as the fallback branch.
+    assert ". /opt/hermes/.venv/bin/activate" in run_text
+    # The OLD form — unconditionally sourcing the product venv as a bare,
+    # unindented line — must be gone, else the gateway silently runs on
+    # the product venv and the volume-venv preference never takes effect.
+    bare_product_activate = [
+        ln for ln in run_text.splitlines()
+        if ln == ". /opt/hermes/.venv/bin/activate"
+    ]
+    assert not bare_product_activate, (
+        "product-venv activate must be the volume-venv fallback, not "
+        f"unconditional: {bare_product_activate!r}"
+    )
+
+
 def test_s6_register_rejects_invalid_profile_name(s6_scandir) -> None:
     from hermes_cli.service_manager import S6ServiceManager
     mgr = S6ServiceManager(scandir=s6_scandir)
