@@ -23,9 +23,16 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
+# OCR toolkit (no image model needed): tesseract reads text from screenshots
+# and scanned documents; poppler-utils adds pdftotext (text PDFs) and pdftoppm
+# (rasterize PDF pages so tesseract can OCR scanned ones). Agents shell out:
+#   tesseract shot.png stdout            # screenshot / image -> text
+#   pdftotext doc.pdf -                  # text-layer PDF -> text (no OCR)
+#   pdftoppm -png -r 200 doc.pdf p && tesseract p-1.png stdout   # scanned PDF
+# Languages: eng + mlt/ita/spa for the Malta/EU customer base (~14 MB total).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 python-is-python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl python3 python-is-python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli xz-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-ita tesseract-ocr-mlt tesseract-ocr-spa poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------

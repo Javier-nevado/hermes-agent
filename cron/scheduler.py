@@ -1622,6 +1622,18 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        # Per-job memory mode (jobs.json "memory" field). Cron prompts are
+        # templated, so block 1 (user-profile auto-extraction) stays OFF by
+        # default -- it would pollute USER.md. Block 2 (abi_remember/abi_recall)
+        # is explicit, agent-initiated, and writes to the shared memory DB, not
+        # the user profile -- safe for a cron/heartbeat job to opt into.
+        #   "none" (default): both off (today's behavior)
+        #   "remember"      : block 2 on, block 1 off (abi_remember usable)
+        #   "full"          : both on (heartbeat jobs reviewing their own role)
+        _cron_mem_mode = str(job.get("memory") or "none").strip().lower()
+        _cron_skip_store = _cron_mem_mode != "full"
+        _cron_skip_provider = _cron_mem_mode == "none"
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1649,7 +1661,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory_store=_cron_skip_store,        # block 1 off unless memory="full"
+            skip_memory_provider=_cron_skip_provider,  # block 2 on unless memory="none"
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
