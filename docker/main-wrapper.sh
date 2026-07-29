@@ -39,50 +39,62 @@ else
     . /opt/hermes/.venv/bin/activate
 fi
 
-# ABI v4 license hard gate (machine-fingerprint binding).
+# ABI v4 license fingerprint staging (machine-fingerprint binding).
 #
-# WHY HERE, NOT IN cont-init.d: this image uses s6-overlay Architecture B — the
-# gateway IS this main program (the CMD /init execs), NOT an s6-rc longrun
-# (main-hermes/run is a deliberate `exec sleep infinity` no-op). s6-overlay v3's
-# legacy-cont-init does NOT abort the container when a cont-init script exits
-# non-zero — it logs "exited 1", then reports "legacy-cont-init successfully
-# started" and runs the main program anyway (verified on the v4 image). So a
-# cont-init gate is silently defeated. But THIS script's exit IS the container's
-# exit: failing here BEFORE `exec hermes` means no gateway boots (compose Restart
-# retries, but it won't come up until the license validates).
+# NON-BLOCKING: the gateway ALWAYS boots from here. The license check itself runs
+# at SESSION START inside the gateway (gateway/license_check.py → run.py
+# _check_license), where a failure surfaces a USER-FACING message ("contact Opteia
+# support") instead of silently never starting. A boot-time gate was silent death:
+# a bot bound to another machine just looked dead in Telegram — the user who needs
+# to see the error never saw anything.
 #
-# The gate runs as root (main-wrapper is /init's main program, pre-setuidgid) so it
-# can read the mode-0400 DMI product_uuid and compute the fingerprint
-# (sha256(product_uuid)) via abi-fingerprint.py → abi-license-gate.py: it binds on
-# first boot (activate) then read-only-confirms the binding every session (verify).
-# No heartbeat, no release, no seat token — the binding replaces all of that and is
-# what structurally removes the per-heartbeat KV writes that caused CF 1101 (see
+# THIS function's only job is to compute the LIVE fingerprint as ROOT (main-wrapper
+# is /init's main program, pre-setuidgid) and hand it to the non-root gateway via
+# the ABI_FINGERPRINT env var, which `exec s6-setuidgid hermes hermes` inherits
+# (s6-setuidgid preserves environ). product_uuid is mode 0400 (root-only) so only
+# this root phase can read it; the env var is NOT a file on disk → a disk clone
+# reboots → recomputes from new hardware → a different fingerprint (clone-safe).
+#
+# WHY HERE, NOT cont-init.d: s6-overlay Architecture B — the gateway IS this main
+# program (CMD). s6 v3 legacy-cont-init does NOT abort the container on a non-zero
+# exit (it logs "exited 1" then runs the main program anyway), so a cont-init stage
+# would be silently defeated; only THIS script's env reaches the gateway.
+#
+# The gateway-side check then binds on first use (activate) and read-only-verifies
+# the binding (verify) — no heartbeat/release/seat, which is what structurally
+# removes the per-heartbeat KV writes that caused CF 1101 (see
 # memory/abi-v4-fingerprint-licensing + memory/api-opteia-license-origin-1101-outage).
-# Bare-executable passthrough (sleep/bash/sh) is intentionally NOT gated, so
+# Bare-executable passthrough (sleep/bash/sh) is intentionally NOT staged, so
 # `docker exec`/`docker run … bash` still works for debugging with the gate on.
 # Entirely skipped unless ABI_LICENSE_GATE=1 (ABI_SEAT_GATE=1 accepted as a legacy
 # alias for smooth cutover; pre-license-api boxes keep it off).
-_license_gate() {
+_stage_fingerprint() {
     [ "${ABI_LICENSE_GATE:-${ABI_SEAT_GATE:-0}}" = "1" ] || return 0
     PY=/opt/hermes/.venv/bin/python
-    GATE=/opt/hermes/docker/abi-license-gate.py
-    if [ ! -f "$GATE" ]; then
-        echo "[license] $GATE missing — cannot enforce license gate; refusing to start" >&2
-        exit 1
+    FP_HELPER=/opt/hermes/docker/abi-fingerprint.py
+    if [ ! -f "$FP_HELPER" ]; then
+        echo "[license] $FP_HELPER missing — cannot stage fingerprint; gateway will fail-open" >&2
+        export ABI_FINGERPRINT=""
+        return 0
     fi
-    # Capture the gate's OWN exit code. Do NOT write `if ! cmd; then rc=$?` —
-    # the `!` negates cmd's status for the `if`, so inside `then` $? is the
-    # negated value (0 on failure) → `exit "$rc"` exits 0 → the gateway boots
-    # unlicensed. The form below is set -e-safe and captures the real code.
-    if "$PY" "$GATE" verify; then :; else
+    # Compute the live fingerprint as root. NEVER exit on failure — the gateway
+    # must always boot. An empty fingerprint makes the gateway fail-open + log
+    # (run.py _check_license), never a silent dead bot. `if cmd; then` consumes
+    # the failure under `set -e`; rc captured directly in the else branch.
+    if fp=$("$PY" "$FP_HELPER"); then
+        export ABI_FINGERPRINT="$fp"
+        fp_short=$(printf '%s' "$fp" | cut -c1-12)
+        echo "[license] staged fingerprint ${fp_short}… → session-start gate will verify" >&2
+    else
         rc=$?
-        echo "[license] gate FAILED (rc=$rc) — refusing to start the gateway" >&2
-        exit "$rc"
+        export ABI_FINGERPRINT=""
+        echo "[license] fingerprint helper exit $rc — staged empty; gateway will fail-open" >&2
     fi
+    return 0
 }
 
 if [ $# -eq 0 ]; then
-    _license_gate
+    _stage_fingerprint
     exec s6-setuidgid hermes hermes
 fi
 
@@ -92,5 +104,5 @@ if command -v "$1" >/dev/null 2>&1; then
 fi
 
 # Hermes subcommand pass-through.
-_license_gate
+_stage_fingerprint
 exec s6-setuidgid hermes hermes "$@"

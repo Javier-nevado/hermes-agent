@@ -1054,6 +1054,7 @@ from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
+from gateway.license_check import verify_license, LicenseVerdict
 
 
 logger = logging.getLogger(__name__)
@@ -1686,6 +1687,29 @@ class GatewayRunner:
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+
+        # ABI v4 session-start license gate (machine-fingerprint binding). The
+        # fingerprint is staged to ABI_FINGERPRINT at boot by main-wrapper (root,
+        # since product_uuid is mode 0400); verify_license is read-only. Gate off
+        # by default — ABI_LICENSE_GATE == "1" enables (ABI_SEAT_GATE kept as a
+        # legacy alias for smooth cutover). Hard denials are cached for the TTL so
+        # they're shown every message then re-verified (a support rebind recovers
+        # within one TTL window); transient failures are NOT cached (fail open).
+        self._license_gate_enabled = os.environ.get(
+            "ABI_LICENSE_GATE", os.environ.get("ABI_SEAT_GATE", "0")
+        ) == "1"
+        self._license_fingerprint = os.environ.get("ABI_FINGERPRINT", "")
+        self._license_key = os.environ.get("OPTEIA_LICENSE_KEY", "")
+        self._license_api_base = os.environ.get(
+            "ABI_SEAT_API_URL", "https://api.opteia.com"
+        )
+        self._license_user_agent = os.environ.get(
+            "ABI_SEAT_USER_AGENT", "abi-license-gate/1.0 (+https://opteia.com)"
+        )
+        self._license_ttl = _float_env("ABI_LICENSE_TTL_SEC", 300.0)
+        self._license_verdict: Optional[LicenseVerdict] = None
+        self._license_verdict_ts: float = 0.0
+
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -6762,6 +6786,69 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _check_license(self, source) -> bool:
+        """ABI v4 session-start license gate. Returns True to proceed with the
+        turn, False to abort (the user-facing denial has already been sent).
+
+        - gate off                 -> True (no-op)
+        - ABI_FINGERPRINT missing  -> fail open + log (boot did not stage one)
+        - verdict cached < TTL     -> replay it (ok/transient -> True; denied ->
+                                      re-send the message, False; no re-verify)
+        - otherwise                -> verify_license(); cache success + hard
+                                      denials; transient failures are NOT cached.
+        """
+        if not self._license_gate_enabled:
+            return True
+        fp = self._license_fingerprint
+        if not fp:
+            logger.warning(
+                "ABI_LICENSE_GATE is on but ABI_FINGERPRINT is unset — the boot "
+                "stage did not produce a fingerprint (license check skipped / "
+                "fail-open). Confirm main-wrapper computed it as root."
+            )
+            return True
+
+        now = time.time()
+        cached = self._license_verdict
+        if cached is not None and (now - self._license_verdict_ts) < self._license_ttl:
+            if cached.ok or cached.is_transient:
+                return True
+            await self._send_license_denial(source, cached)
+            return False
+
+        verdict = await verify_license(
+            fp,
+            self._license_key,
+            self._license_api_base,
+            user_agent=self._license_user_agent,
+        )
+        if verdict.ok:
+            self._license_verdict = verdict
+            self._license_verdict_ts = now
+            logger.info("license verified (tier=%s)", verdict.tier)
+            return True
+        if verdict.is_denied:
+            self._license_verdict = verdict
+            self._license_verdict_ts = now
+            logger.warning("license DENIED (reason=%s) — blocking turn", verdict.reason)
+            await self._send_license_denial(source, verdict)
+            return False
+        # transient (network error / CF edge block / 5xx) — fail open, do NOT cache.
+        logger.warning("license check transient (reason=%s) — failing open", verdict.reason)
+        return True
+
+    async def _send_license_denial(self, source, verdict: LicenseVerdict) -> None:
+        """Send the user-facing license-denial message to the originating chat."""
+        msg = verdict.user_message
+        if not msg:
+            return
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            try:
+                await adapter.send(source.chat_id, msg)
+            except Exception as e:
+                logger.warning("failed to send license-denial message: %s", e)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6869,6 +6956,14 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # ABI v4 license gate (session-start, user-facing). Placed AFTER user
+        # authorization so unpaired senders never trigger a Worker verify, and
+        # AFTER the pre_gateway_dispatch hook. Internal background-completion
+        # events skip it. Fail-open on transient errors; hard denials send a
+        # user-facing message + end the turn (no LLM call). TTL-cached.
+        if not is_internal and not await self._check_license(source):
+            return None
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

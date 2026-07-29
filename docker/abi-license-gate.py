@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""abi-license-gate.py — on-box fingerprint license client (ABI v4).
+"""abi-license-gate.py — DIAGNOSTIC ONLY on-box fingerprint license CLI (ABI v4).
 
-REPLACES abi-seat-gate.py (seat checkout / heartbeat / release). The fingerprint
-model: a license binds to ONE machine fingerprint (sha256(product_uuid[+MAC]),
-computed by abi-fingerprint.py). On boot the gate computes the LIVE fingerprint
-→ `activate` (binds if unbound, idempotent) → `verify` (read-only; confirms the
-binding + returns the tier). Mismatch / invalid → exit non-zero → main-wrapper
-exits BEFORE `exec hermes` → the container won't start (user sees the error).
+STATUS: NOT called from boot anymore. The production license check moved to
+SESSION START inside the gateway (gateway/license_check.py → run.py
+_check_license), so a licensing failure surfaces a USER-FACING message instead of
+silently never starting the gateway. main-wrapper.sh now only STAGES the
+fingerprint to ABI_FINGERPRINT (non-blocking); it no longer runs this gate.
+
+This script is retained as a manual OPERATOR tool — run it from the box to force
+an activate/verify against api.opteia.com for debugging (confirming a rebind,
+inspecting the live fingerprint). It is the original blocking boot gate's logic,
+kept for reference + operator use; the equivalent async, fail-open logic lives in
+gateway/license_check.py.
+
+The fingerprint model: a license binds to ONE machine fingerprint
+(sha256(product_uuid[+MAC]), computed by abi-fingerprint.py). Compute the LIVE
+fingerprint → `activate` (binds if unbound, idempotent) → `verify` (read-only;
+confirms the binding + returns the tier). Mismatch / invalid → exit non-zero.
 
 NO heartbeat, NO release, NO seat count → NO per-session KV writes (this is what
 structurally removes the CF 1101 write-quota outage — see
