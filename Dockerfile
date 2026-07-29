@@ -239,11 +239,15 @@ RUN mkdir -p /etc/cont-init.d && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
-# ABI v4 license hard gate (machine-fingerprint): abi-license-gate.py +
-# abi-fingerprint.py are brought in by the repo-wide `COPY . .` at
-# /opt/hermes/docker/abi-{license-gate,fingerprint}.py, and are invoked from
-# main-wrapper.sh (NOT a cont-init script) — see the comment there for why the
-# gate must live in the main program (s6-overlay v3's legacy-cont-init is non-fatal).
+# ABI v4 license fingerprint staging: the gateway is launched by the runtime-
+# generated `gateway-default` s6 longrun (NOT main-wrapper), so a fingerprint
+# exported in main-wrapper's env never reaches it. cont-init.d/03-abi-license-fp
+# runs as ROOT before any longrun starts, computes the fingerprint (product_uuid
+# is mode 0400) and stages it to /run/abi-fingerprint (0644 tmpfs; the gateway
+# reads it at session start) + container_environment. s6-overlay v3's legacy-cont-init
+# is non-fatal on error, which is FINE here — staging is non-blocking by design
+# (a missing fingerprint makes the gateway fail-open + log, never a dead bot).
+COPY --chmod=0755 docker/cont-init.d/03-abi-license-fp /etc/cont-init.d/03-abi-license-fp
 
 # ABI v4: bake the Opteia shared skills into the image. The content is staged into
 # build-context ./abi-tools-skills/ by docker/sync-abi-skills.sh from the SEPARATE

@@ -6799,12 +6799,17 @@ class GatewayRunner:
         """
         if not self._license_gate_enabled:
             return True
-        fp = self._license_fingerprint
+        # ABI_FINGERPRINT env (test override) wins; else the boot-staged tmpfs file
+        # written by docker/cont-init.d/03-abi-license-fp. The gateway is launched by
+        # the gateway-default s6 longrun, so an env export in main-wrapper doesn't
+        # reach it — the /run file does.
+        fp = self._license_fingerprint or self._read_staged_fingerprint()
         if not fp:
             logger.warning(
-                "ABI_LICENSE_GATE is on but ABI_FINGERPRINT is unset — the boot "
-                "stage did not produce a fingerprint (license check skipped / "
-                "fail-open). Confirm main-wrapper computed it as root."
+                "ABI_LICENSE_GATE is on but no fingerprint is available — neither "
+                "ABI_FINGERPRINT env nor /run/abi-fingerprint (staged by cont-init) "
+                "is present; license check skipped (fail-open). Confirm the cont-init "
+                "stager ran as root."
             )
             return True
 
@@ -6836,6 +6841,19 @@ class GatewayRunner:
         # transient (network error / CF edge block / 5xx) — fail open, do NOT cache.
         logger.warning("license check transient (reason=%s) — failing open", verdict.reason)
         return True
+
+    def _read_staged_fingerprint(self) -> str:
+        """Read the boot-staged fingerprint from /run/abi-fingerprint (tmpfs, 0644),
+        written by docker/cont-init.d/03-abi-license-fp as root. Returns '' if absent.
+
+        The gateway is launched by the runtime-generated `gateway-default` s6 longrun,
+        so the ABI_FINGERPRINT env var that main-wrapper exports in its own process
+        tree never reaches the gateway; this tmpfs file (recomputed from hardware each
+        boot, never on the persistent volume) is the clone-safe bridge."""
+        try:
+            return open("/run/abi-fingerprint").read().strip()
+        except OSError:
+            return ""
 
     async def _send_license_denial(self, source, verdict: LicenseVerdict) -> None:
         """Send the user-facing license-denial message to the originating chat."""

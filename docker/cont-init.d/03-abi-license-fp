@@ -1,0 +1,58 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# docker/cont-init.d/03-abi-license-fp — ABI v4 fingerprint staging (boot, root).
+#
+# WHY A CONT-INIT SCRIPT (not main-wrapper.sh): the gateway is launched by the
+# runtime-generated `gateway-default` s6-rc longrun, NOT by main-wrapper. An
+# `export ABI_FINGERPRINT` in main-wrapper only reaches main-wrapper's OWN process
+# tree — the gateway never inherits it (verified: the gateway process had
+# ABI_FINGERPRINT=<MISSING>). cont-init runs as ROOT before any longrun starts, so
+# it can read the mode-0400 DMI product_uuid and stage the fingerprint where the
+# gateway CAN read it. See gateway/license_check.py + run.py _check_license +
+# memory/abi-v4-fingerprint-licensing.
+#
+# TWO outputs (belt-and-suspenders):
+#   /run/abi-fingerprint            — 0644 tmpfs file (PRIMARY; the gateway reads
+#                                     this at session start). /run is RAM, not the
+#                                     persistent volume -> a disk clone reboots ->
+#                                     recomputes from new hardware (clone-safe).
+#   /run/s6/container_environment/  — also exported as ABI_FINGERPRINT so any
+#     ABI_FINGERPRINT                with-contenv service (incl. gateway-default)
+#                                     inherits it as an env var.
+#
+# NON-BLOCKING: never fails the boot. A missing/empty fingerprint makes the
+# gateway fail-open + log (run.py _check_license), never a silent dead bot —
+# which is why s6-overlay v3's "legacy-cont-init is non-fatal" is fine here.
+set -u
+
+PY=/opt/hermes/.venv/bin/python
+HELPER=/opt/hermes/docker/abi-fingerprint.py
+FP_FILE=/run/abi-fingerprint
+
+# Only stage when the license gate is enabled (ABI_SEAT_GATE kept as legacy alias).
+gate="${ABI_LICENSE_GATE:-${ABI_SEAT_GATE:-0}}"
+[ "$gate" = "1" ] || exit 0
+
+if [ ! -f "$HELPER" ]; then
+    echo "[license] cont-init: $HELPER missing — fingerprint unstaged (gateway will fail-open)" >&2
+    exit 0
+fi
+
+if fp=$("$PY" "$HELPER" 2>/dev/null); then
+    fp=$(printf '%s' "$fp" | tr -d ' \n\r\t')
+    if [ -n "$fp" ]; then
+        printf '%s' "$fp" > "$FP_FILE"
+        chmod 0644 "$FP_FILE"
+        # Also expose to with-contenv services (gateway-default's shebang is with-contenv).
+        mkdir -p /run/s6/container_environment 2>/dev/null || true
+        printf '%s' "$fp" > /run/s6/container_environment/ABI_FINGERPRINT 2>/dev/null || true
+        echo "[license] cont-init: staged fingerprint $(printf '%s' "$fp" | cut -c1-12)… → $FP_FILE" >&2
+        exit 0
+    fi
+fi
+
+# Helper failed / empty — stage an empty file so the gateway fail-opens deterministically.
+: > "$FP_FILE" 2>/dev/null || true
+chmod 0644 "$FP_FILE" 2>/dev/null || true
+echo "[license] cont-init: fingerprint helper produced no value — staged empty (gateway will fail-open)" >&2
+exit 0
