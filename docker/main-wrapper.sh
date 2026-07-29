@@ -39,7 +39,7 @@ else
     . /opt/hermes/.venv/bin/activate
 fi
 
-# ABI v4 seat-licensing hard gate.
+# ABI v4 license hard gate (machine-fingerprint binding).
 #
 # WHY HERE, NOT IN cont-init.d: this image uses s6-overlay Architecture B — the
 # gateway IS this main program (the CMD /init execs), NOT an s6-rc longrun
@@ -49,44 +49,48 @@ fi
 # started" and runs the main program anyway (verified on the v4 image). So a
 # cont-init gate is silently defeated. But THIS script's exit IS the container's
 # exit: failing here BEFORE `exec hermes` means no gateway boots (compose Restart
-# retries, but it won't come up until a seat frees / the license validates).
+# retries, but it won't come up until the license validates).
 #
-# Checkout runs as root (main-wrapper is /init's main program, pre-setuidgid); the
-# token it writes (/run/abi-seat-token, 0600) is read by the detached heartbeat the
-# gate starts. Bare-executable passthrough (sleep/bash/sh) is intentionally NOT
-# gated, so `docker exec`/`docker run … bash` still works for debugging with the
-# gate on. Entirely skipped when ABI_SEAT_GATE!=1 (pre-license-api parity).
-_seat_gate() {
-    [ "${ABI_SEAT_GATE:-0}" = "1" ] || return 0
+# The gate runs as root (main-wrapper is /init's main program, pre-setuidgid) so it
+# can read the mode-0400 DMI product_uuid and compute the fingerprint
+# (sha256(product_uuid)) via abi-fingerprint.py → abi-license-gate.py: it binds on
+# first boot (activate) then read-only-confirms the binding every session (verify).
+# No heartbeat, no release, no seat token — the binding replaces all of that and is
+# what structurally removes the per-heartbeat KV writes that caused CF 1101 (see
+# memory/abi-v4-fingerprint-licensing + memory/api-opteia-license-origin-1101-outage).
+# Bare-executable passthrough (sleep/bash/sh) is intentionally NOT gated, so
+# `docker exec`/`docker run … bash` still works for debugging with the gate on.
+# Entirely skipped unless ABI_LICENSE_GATE=1 (ABI_SEAT_GATE=1 accepted as a legacy
+# alias for smooth cutover; pre-license-api boxes keep it off).
+_license_gate() {
+    [ "${ABI_LICENSE_GATE:-${ABI_SEAT_GATE:-0}}" = "1" ] || return 0
     PY=/opt/hermes/.venv/bin/python
-    GATE=/opt/hermes/docker/abi-seat-gate.py
+    GATE=/opt/hermes/docker/abi-license-gate.py
     if [ ! -f "$GATE" ]; then
-        echo "[seat] $GATE missing — cannot enforce seat gate; refusing to start" >&2
+        echo "[license] $GATE missing — cannot enforce license gate; refusing to start" >&2
         exit 1
     fi
-    # Capture the checkout's OWN exit code. Do NOT write `if ! cmd; then rc=$?` —
+    # Capture the gate's OWN exit code. Do NOT write `if ! cmd; then rc=$?` —
     # the `!` negates cmd's status for the `if`, so inside `then` $? is the
     # negated value (0 on failure) → `exit "$rc"` exits 0 → the gateway boots
-    # without a seat. The form below is set -e-safe and captures the real code.
-    if "$PY" "$GATE" checkout; then :; else
+    # unlicensed. The form below is set -e-safe and captures the real code.
+    if "$PY" "$GATE" verify; then :; else
         rc=$?
-        echo "[seat] checkout FAILED (rc=$rc) — refusing to start the gateway" >&2
+        echo "[license] gate FAILED (rc=$rc) — refusing to start the gateway" >&2
         exit "$rc"
     fi
-    setsid "$PY" "$GATE" heartbeat >/dev/null 2>&1 &
-    echo "[seat] heartbeat loop started (pid $!)"
 }
 
 if [ $# -eq 0 ]; then
-    _seat_gate
+    _license_gate
     exec s6-setuidgid hermes hermes
 fi
 
 if command -v "$1" >/dev/null 2>&1; then
-    # Bare executable — pass through directly (NOT seat-gated: debugging path).
+    # Bare executable — pass through directly (NOT license-gated: debugging path).
     exec s6-setuidgid hermes "$@"
 fi
 
 # Hermes subcommand pass-through.
-_seat_gate
+_license_gate
 exec s6-setuidgid hermes hermes "$@"
