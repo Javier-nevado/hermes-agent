@@ -133,19 +133,15 @@ def _read_openai_version_fast() -> str | None:
 
 
 def _print_fast_version_info() -> None:
-    from hermes_cli import __release_date__, __version__
-    from hermes_cli.build_info import get_abi_version
+    from hermes_cli import __framework_version__, __release_date__, __version__
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    abi_version = get_abi_version()
-    if abi_version:
-        # Published ABI image: lead with the ABI deploy version (the image tag,
-        # e.g. "ABI v4.1.4"), keeping the Hermes framework version + release
-        # date as build lineage.  __version__ stays the upstream value so the
-        # models.py HTTP User-Agent is unaffected.
-        print(f"ABI v{abi_version} (Hermes framework v{__version__}, {__release_date__})")
+    if __version__ != __framework_version__:
+        # Published ABI image: __version__ is the image tag. Lead with it,
+        # keeping the Hermes framework version + release date as lineage.
+        print(f"ABI v{__version__} (Hermes framework v{__framework_version__}, {__release_date__})")
     else:
-        # Source install / dev image without the ABI_VERSION build-arg.
+        # Source install / dev image: __version__ == framework version.
         print(f"Hermes Agent v{__version__} ({__release_date__})")
     print(f"Project: {project_root}")
     print(f"Python: {sys.version.split()[0]}")

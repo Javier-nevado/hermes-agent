@@ -65,7 +65,7 @@ def _skin_branding(key: str, fallback: str) -> str:
 # ASCII Art & Branding
 # =========================================================================
 
-from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE
+from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE, __framework_version__ as FRAMEWORK_VERSION
 
 HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
 [bold #FFD700]██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝[/]
@@ -403,10 +403,7 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
 
 def format_banner_version_label() -> str:
     """Return the version label shown in the startup banner title."""
-    from hermes_cli.build_info import get_abi_version
-
-    abi_version = get_abi_version()
-    product = f"ABI v{abi_version}" if abi_version else f"Hermes Agent v{VERSION}"
+    product = f"ABI v{VERSION}" if VERSION != FRAMEWORK_VERSION else f"Hermes Agent v{VERSION}"
     base = f"{product} ({RELEASE_DATE})"
     state = get_git_banner_state()
     if not state:

@@ -16,10 +16,12 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from hermes_cli import __framework_version__ as _HERMES_VERSION
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
+# Pinned to the framework version (not the ABI image tag) so the UA stays stable
+# across releases — the version substring is irrelevant to providers.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"

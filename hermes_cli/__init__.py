@@ -14,8 +14,20 @@ Provides subcommands for:
 import os
 import sys
 
-__version__ = "0.16.0"
+from hermes_cli.build_info import get_abi_version
+
 __release_date__ = "2026.5.29"
+# The Hermes framework (upstream Nous fork) version. Used for the HTTP
+# User-Agent sent to LLM providers (models.py / model_catalog.py) and shown as
+# the "Hermes framework vX" lineage in `hermes --version`. Deliberately NOT
+# bumped with the ABI image tag, so the UA stays stable across releases.
+__framework_version__ = "0.16.0"
+# The version the agent REPORTS as its own. In a published ABI image this is the
+# image tag (baked at build into .hermes_build_version); in a source install it
+# falls back to the framework version. Everything that answers "what version am
+# I" — `hermes_cli.__version__`, `hermes --version`, `hermes dump`, the startup
+# banner — reads THIS, so an LLM introspecting the runtime gets the ABI version.
+__version__ = get_abi_version() or __framework_version__
 
 
 def _ensure_utf8():

@@ -52,7 +52,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from hermes_cli import __framework_version__ as _HERMES_VERSION
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
