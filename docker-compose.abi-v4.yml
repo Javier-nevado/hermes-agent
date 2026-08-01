@@ -1,0 +1,251 @@
+# docker-compose.abi-v4.yml — .19 (opt-abi-dev-v3) CANONICAL v4 multi-agent stack.
+#
+# The standardized reference deployment: every agent runs IDENTICALLY via the
+# x-agent-common anchor (same memory-api, terminal=local, internal API,
+# per-agent camofox, seat gate). This shape is the customer template; only the
+# per-agent overrides (UID/GID, license seat, agent uuid, camofox name) differ.
+#
+# Topology:
+#   - Shared infra (abi-memory-db, abi-memory-api, opteia-kanboard) is EXTERNAL —
+#     already running on network hermes-agent_opteia-net. NOT redefined here.
+#     (The shared abi-camofox :9377 retires once all agents are on per-agent browsers.)
+#   - Each agent = abi-agent-<name>: own volume abi-hermes-<name>:/opt/data, runs
+#     as the agent's UID via s6 HERMES_UID/GID remap, TERMINAL_ENV=local (in-agent
+#     exec, no Docker access), API server internal 0.0.0.0:8080 (no host port),
+#     memory via http://abi-memory-api:8010, seat gate ON.
+#   - Each agent paired with abi-camofox-<name>: own profile volume, capped RAM.
+#   - No host ports for agent traffic — agents reach shared services + each other
+#     by Docker service name on the shared network.
+#
+# Secrets: /opt/abi-tools/v4/.env (0600, root) holds the SHARED values
+# (ABI_API_SERVER_KEY, CAMOFOX_API_KEY, ABI_IMAGE) + per-agent <NAME>_SEAT +
+# <NAME>_AGENT_ID. Per-agent provider/telegram/kanban secrets stay in each lifted
+# /opt/data/.env (the compose env only ADDS standard wiring on top, overriding
+# the localhost URLs the lifted .env still carries).
+#
+# MIGRATING AN AGENT (one at a time — never bare `up`):
+#   1. operator issues a dev seat + generates the agent uuid (see RUNBOOK)
+#   2. append <NAME>_SEAT + <NAME>_AGENT_ID to /opt/abi-tools/v4/.env
+#   3. stop v3 gateway, lift state (abi-v4-lift.sh), flip memory_enabled->true,
+#      persist agent.uuid in the volume
+#   4. docker compose --env-file /opt/abi-tools/v4/.env -f <this> up -d \
+#        abi-agent-<name> abi-camofox-<name>
+#   5. verify (seat checkout, gateway.log, service-name reachability) before next
+# Unmigrated agents (empty <NAME>_SEAT) are defined here but NEVER started, so the
+# empty seat does not loop — only `up` agents whose seat is set.
+
+x-agent-common: &agent-common
+  image: ${ABI_IMAGE}
+  restart: unless-stopped
+  # Gateway liveness. The gateway runs as the container's MAIN program (s6 Arch B:
+  # main-hermes/run is a `sleep infinity` no-op), so restart:unless-stopped only
+  # catches a clean EXIT/crash — NOT a wedge/hang (asyncio loop seized, e.g. a
+  # deadlocked retry on persistent model-API failure / exhausted credits). This
+  # healthcheck probes the internal API :8080/health (returns 200 only while the
+  # event loop is alive) and flips the container to `unhealthy` on a wedge. The
+  # host watchdog (abi-v4-watchdog.* systemd units) then restarts it. Without
+  # this, a wedged gateway stays "Up" forever — the silent-death gap.
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        /opt/hermes/.venv/bin/python3 -c
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).status==200 else 1)"
+        || exit 1
+    interval: 30s        # 3 consecutive misses (≈90s) → unhealthy → watchdog restarts
+    timeout: 10s
+    start_period: 180s   # grace for boot + seat checkout + first Telegram connect
+    retries: 3
+  command: ["gateway", "run", "--replace"]
+  networks: [hermes-agent_opteia-net]
+  mem_limit: 768m
+  # NOTE: no depends_on — abi-memory-api is an EXTERNAL service (not in this
+  # compose), already up on the shared network. The agent connects on boot and
+  # retries if it's briefly unavailable.
+  environment: &agent-env
+    HERMES_HOME: /opt/data
+    TERMINAL_CWD: /opt/data   # agent working dir = HERMES_HOME (shared-skill relative cred paths)
+    TERMINAL_ENV: local                 # in-agent exec — the v4 simplification (no Docker access)
+    TZ: Europe/Malta                    # clean logs (v4 logs UTC by default; see liveness-logs note)
+    ABI_MEMORY_API_URL: http://abi-memory-api:8010
+    ABI_API: http://abi-memory-api:8010   # v4: container DNS (legacy scripts reading ABI_API; ABI_MEMORY_API_URL above is canonical)
+    API_SERVER_ENABLED: "true"          # inter-agent API server (was off on the mga pilot)
+    API_SERVER_HOST: 0.0.0.0
+    API_SERVER_PORT: "8080"             # internal only — no host port (kills the v3 8400+N drift)
+    API_SERVER_KEY: ${ABI_API_SERVER_KEY}
+    ABI_LICENSE_GATE: "1"               # v4 session-start fingerprint gate (machine-bound license)
+    ABI_SEAT_GATE: "0"                  # legacy alias OFF (ABI_LICENSE_GATE=1 takes precedence)
+    ABI_SEAT_API_URL: https://api.opteia.com
+    GLM_BASE_URL: https://api.z.ai/api/coding/paas/v4/
+    KANBOARD_URL: http://opteia-kanboard:80   # shared kanban on-net (override .env localhost:8095)
+
+x-camofox-common: &camofox-common
+  image: ghcr.io/jo-inc/camofox-browser:latest
+  restart: unless-stopped
+  mem_limit: 1g                        # was 384m — Firefox OOM-killed on heavy pages (Amazon/Google); idle browsers release RAM so 1g cap is safe on the 8GB box
+  networks: [hermes-agent_opteia-net]
+  environment: &camofox-env
+    CAMOFOX_PORT: "9377"
+    NODE_ENV: production
+    CAMOFOX_API_KEY: ${CAMOFOX_API_KEY} # matches what agents send (shared value)
+    TAB_INACTIVITY_MS: "1800000"
+    BROWSER_IDLE_TIMEOUT_MS: "3600000"
+
+services:
+  # ─────────────────────── mga (folded in from the standalone pilot) ───────────────────────
+  abi-agent-mga:
+    <<: *agent-common
+    container_name: abi-agent-mga
+    volumes: [abi-hermes-mga:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1008"
+      HERMES_GID: "1009"
+      ABI_AGENT_ID: ${MGA_AGENT_ID}
+      OPTEIA_LICENSE_KEY: ${MGA_SEAT}
+      CAMOFOX_URL: http://abi-camofox-mga:9377
+  abi-camofox-mga:
+    <<: *camofox-common
+    container_name: abi-camofox-mga
+    volumes: [camofox-mga:/root/.camofox]
+
+  # ─────────────────────── ailean (AI-CEO / delegation hub) ───────────────────────
+  abi-agent-ailean:
+    <<: *agent-common
+    container_name: abi-agent-ailean
+    volumes: [abi-hermes-ailean:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1001"
+      HERMES_GID: "1001"
+      ABI_AGENT_ID: ${AILEAN_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${AILEAN_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-ailean:9377
+  abi-camofox-ailean:
+    <<: *camofox-common
+    container_name: abi-camofox-ailean
+    volumes: [camofox-ailean:/root/.camofox]
+
+  # ─────────────────────── atlas (ops) ───────────────────────
+  abi-agent-atlas:
+    <<: *agent-common
+    container_name: abi-agent-atlas
+    volumes: [abi-hermes-atlas:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1002"
+      HERMES_GID: "1002"
+      ABI_AGENT_ID: ${ATLAS_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${ATLAS_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-atlas:9377
+  abi-camofox-atlas:
+    <<: *camofox-common
+    container_name: abi-camofox-atlas
+    volumes: [camofox-atlas:/root/.camofox]
+
+  # ─────────────────────── jen ───────────────────────
+  abi-agent-jen:
+    <<: *agent-common
+    container_name: abi-agent-jen
+    volumes: [abi-hermes-jen:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1003"
+      HERMES_GID: "1003"
+      ABI_AGENT_ID: ${JEN_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${JEN_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-jen:9377
+  abi-camofox-jen:
+    <<: *camofox-common
+    container_name: abi-camofox-jen
+    volumes: [camofox-jen:/root/.camofox]
+
+  # ─────────────────────── iris ───────────────────────
+  abi-agent-iris:
+    <<: *agent-common
+    container_name: abi-agent-iris
+    volumes: [abi-hermes-iris:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1004"
+      HERMES_GID: "1005"
+      ABI_AGENT_ID: ${IRIS_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${IRIS_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-iris:9377
+  abi-camofox-iris:
+    <<: *camofox-common
+    container_name: abi-camofox-iris
+    volumes: [camofox-iris:/root/.camofox]
+
+  # ─────────────────────── caspian ───────────────────────
+  abi-agent-caspian:
+    <<: *agent-common
+    container_name: abi-agent-caspian
+    volumes: [abi-hermes-caspian:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1005"
+      HERMES_GID: "1006"
+      ABI_AGENT_ID: ${CASPIAN_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${CASPIAN_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-caspian:9377
+  abi-camofox-caspian:
+    <<: *camofox-common
+    container_name: abi-camofox-caspian
+    volumes: [camofox-caspian:/root/.camofox]
+
+  # ─────────────────────── sol ───────────────────────
+  abi-agent-sol:
+    <<: *agent-common
+    container_name: abi-agent-sol
+    volumes: [abi-hermes-sol:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1006"
+      HERMES_GID: "1007"
+      ABI_AGENT_ID: ${SOL_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${SOL_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-sol:9377
+  abi-camofox-sol:
+    <<: *camofox-common
+    container_name: abi-camofox-sol
+    volumes: [camofox-sol:/root/.camofox]
+
+  # ─────────────────────── vera (marketing) ───────────────────────
+  abi-agent-vera:
+    <<: *agent-common
+    container_name: abi-agent-vera
+    volumes: [abi-hermes-vera:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    environment:
+      <<: *agent-env
+      HERMES_UID: "1007"
+      HERMES_GID: "1008"
+      ABI_AGENT_ID: ${VERA_AGENT_ID:-}
+      OPTEIA_LICENSE_KEY: ${VERA_SEAT:-}
+      CAMOFOX_URL: http://abi-camofox-vera:9377
+  abi-camofox-vera:
+    <<: *camofox-common
+    container_name: abi-camofox-vera
+    volumes: [camofox-vera:/root/.camofox]
+
+networks:
+  hermes-agent_opteia-net:
+    external: true
+
+volumes:
+  abi-hermes-mga:      {external: true}
+  abi-hermes-ailean:   {external: true}
+  abi-hermes-atlas:    {external: true}
+  abi-hermes-jen:      {external: true}
+  abi-hermes-iris:     {external: true}
+  abi-hermes-caspian:  {external: true}
+  abi-hermes-sol:      {external: true}
+  abi-hermes-vera:     {external: true}
+  camofox-mga:         {}   # per-agent browser profiles (compose-created)
+  camofox-ailean:      {}
+  camofox-atlas:       {}
+  camofox-jen:         {}
+  camofox-iris:        {}
+  camofox-caspian:     {}
+  camofox-sol:         {}
+  camofox-vera:        {}
