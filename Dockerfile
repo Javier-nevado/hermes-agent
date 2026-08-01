@@ -217,6 +217,19 @@ RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
         chown hermes:hermes /opt/hermes/.hermes_build_sha; \
     fi
 
+# ABI product version (the image tag, e.g. v4.1.4).  Written to
+# /opt/hermes/.hermes_build_version so `hermes --version` reports the ABI deploy
+# version via hermes_cli.build_info.get_abi_version(), instead of the Hermes
+# framework version (hermes_cli.__version__, kept upstream for the models.py
+# HTTP User-Agent).  Optional — local builds without the --build-arg omit the
+# file (runtime falls back to the framework version).  Forgejo CI
+# (.forgejo/workflows/release.yml) passes the git tag.
+ARG ABI_VERSION=
+RUN if [ -n "${ABI_VERSION}" ]; then \
+        printf '%s\n' "${ABI_VERSION}" > /opt/hermes/.hermes_build_version && \
+        chown hermes:hermes /opt/hermes/.hermes_build_version; \
+    fi
+
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
 # Per-profile gateway services are registered dynamically at runtime by

@@ -31,6 +31,10 @@ from typing import Optional
 # Path is resolved relative to this module so it works regardless of cwd —
 # matches the pattern used by ``banner._resolve_repo_dir``.
 _BUILD_SHA_FILE = Path(__file__).parent.parent / ".hermes_build_sha"
+# ABI product version (the image tag, e.g. "v4.1.4") baked by the Dockerfile's
+# ABI_VERSION build-arg. Lets the agent report the ABI deploy version instead of
+# the Hermes framework version (hermes_cli.__version__).  See get_abi_version().
+_ABI_VERSION_FILE = Path(__file__).parent.parent / ".hermes_build_version"
 
 
 def get_build_sha(short: int = 8) -> Optional[str]:
@@ -49,3 +53,27 @@ def get_build_sha(short: int = 8) -> Optional[str]:
     if not sha:
         return None
     return sha[:short] if short and short > 0 else sha
+
+
+def get_abi_version() -> Optional[str]:
+    """Return the baked-in ABI product version (the image tag), or None.
+
+    Reads ``<project_root>/.hermes_build_version`` if present.  The file is
+    written by the Dockerfile's ``ABI_VERSION`` build-arg (passed by Forgejo CI
+    from the git tag, e.g. ``v4.1.4``) so the CLI can report the ABI deploy
+    version ("ABI v4.1.4") rather than the Hermes framework version
+    (``hermes_cli.__version__``, which stays the upstream value so the
+    ``models.py`` HTTP User-Agent is unaffected).  A leading ``v``/``V`` is
+    stripped.
+
+    Returns ``None`` when the file is absent (source installs and dev images
+    built without the build-arg) — callers fall back to the framework version.
+    """
+    try:
+        if not _ABI_VERSION_FILE.is_file():
+            return None
+        version = _ABI_VERSION_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    version = version.lstrip("vV").strip()
+    return version or None

@@ -77,6 +77,7 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           docker build \
             --build-arg HERMES_GIT_SHA="$SHA" \
+            --build-arg ABI_VERSION="${{ steps.t.outputs.tag }}" \
             --tag "${IMAGE}:${{ steps.t.outputs.tag }}" \
             --tag "${IMAGE}:latest" \
             .

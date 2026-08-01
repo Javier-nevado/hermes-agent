@@ -232,9 +232,11 @@ def run_dump(args):
 
     try:
         from hermes_cli import __version__, __release_date__
+        from hermes_cli.build_info import get_abi_version
     except ImportError:
         __version__ = "(unknown)"
         __release_date__ = ""
+        get_abi_version = lambda: None
 
     commit = _get_git_commit(project_root)
 
@@ -268,7 +270,12 @@ def run_dump(args):
 
     lines = []
     lines.append("--- hermes dump ---")
-    ver_str = f"{__version__}"
+    abi_version = get_abi_version()
+    ver_str = (
+        f"ABI v{abi_version} (framework v{__version__})"
+        if abi_version
+        else f"{__version__}"
+    )
     if __release_date__:
         ver_str += f" ({__release_date__})"
     ver_str += f" [{commit}]"
