@@ -75,9 +75,12 @@ jobs:
         run: |
           set -e
           SHA="$(git rev-parse HEAD)"
+          # strip leading 'v' so pyproject.toml gets a clean PEP-440 version
+          ABI_VER="${{ steps.t.outputs.tag }}"
+          ABI_VER="${ABI_VER#v}"
           docker build \
             --build-arg HERMES_GIT_SHA="$SHA" \
-            --build-arg ABI_VERSION="${{ steps.t.outputs.tag }}" \
+            --build-arg ABI_VERSION="$ABI_VER" \
             --tag "${IMAGE}:${{ steps.t.outputs.tag }}" \
             --tag "${IMAGE}:latest" \
             .

@@ -189,6 +189,27 @@ RUN chmod -R a+rX /opt/hermes && \
 # `s6-setuidgid hermes` in its run script. If HERMES_UID is unset, services
 # run as the default hermes user (UID 10000).
 
+# ---------- ABI product version (the image tag, e.g. 4.1.4) ----------
+# Stamp the ABI deploy version into the image so the agent reports it instead of
+# the Hermes framework version (hermes_cli.__version__ == 0.16.0, deliberately
+# kept upstream so the models.py HTTP User-Agent is unaffected). Two surfaces:
+#   1. /opt/hermes/.hermes_build_version -> hermes_cli.build_info.get_abi_version()
+#      (drives `hermes --version`, `hermes dump`, startup banner).
+#   2. pyproject.toml `version =` -> the installed package metadata
+#      (importlib.metadata.version("hermes-agent")) AND the on-disk pyproject,
+#      which is what an LLM inspects when asked its version. The rewrite MUST
+#      precede the editable install below so the generated dist-info captures
+#      the ABI version. The repo pyproject stays at 0.16.0 (upstream-clean);
+#      only the image copy is stamped. Forgejo CI passes the tag with the
+#      leading 'v' stripped. Optional — a local build without --build-arg is
+#      unaffected.
+ARG ABI_VERSION=
+RUN if [ -n "${ABI_VERSION}" ]; then \
+        printf '%s\n' "${ABI_VERSION}" > /opt/hermes/.hermes_build_version && \
+        sed -i 's|^version = "[^"]*"|version = "'"${ABI_VERSION}"'"|' /opt/hermes/pyproject.toml && \
+        chown hermes:hermes /opt/hermes/.hermes_build_version /opt/hermes/pyproject.toml; \
+    fi
+
 # ---------- Link hermes-agent itself (editable) ----------
 # Deps are already installed in the cached layer above; `--no-deps` makes
 # this a fast (~1s) egg-link creation with no resolution or downloads.
@@ -215,19 +236,6 @@ ARG HERMES_GIT_SHA=
 RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha && \
         chown hermes:hermes /opt/hermes/.hermes_build_sha; \
-    fi
-
-# ABI product version (the image tag, e.g. v4.1.4).  Written to
-# /opt/hermes/.hermes_build_version so `hermes --version` reports the ABI deploy
-# version via hermes_cli.build_info.get_abi_version(), instead of the Hermes
-# framework version (hermes_cli.__version__, kept upstream for the models.py
-# HTTP User-Agent).  Optional — local builds without the --build-arg omit the
-# file (runtime falls back to the framework version).  Forgejo CI
-# (.forgejo/workflows/release.yml) passes the git tag.
-ARG ABI_VERSION=
-RUN if [ -n "${ABI_VERSION}" ]; then \
-        printf '%s\n' "${ABI_VERSION}" > /opt/hermes/.hermes_build_version && \
-        chown hermes:hermes /opt/hermes/.hermes_build_version; \
     fi
 
 # ---------- s6-overlay service wiring ----------
