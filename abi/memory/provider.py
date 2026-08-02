@@ -123,6 +123,7 @@ class ABIMemoryProvider(MemoryProvider):
         self._agent_name: str = ""
         self._clearance: str = "external"
         self._user_id: Optional[str] = None
+        self._shared_scope: bool = False
         self._session_id: str = ""
         self._embed_fn = None
         self._entity_extractor = EntityExtractor()
@@ -152,6 +153,9 @@ class ABIMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._agent_name = kwargs.get("agent_identity", "unknown")
         self._user_id = kwargs.get("user_id")
+        # Per-user read isolation: group/channel chats share a team memory pool;
+        # 1:1 DMs (and unset) are scoped to the speaker's own memories.
+        self._shared_scope = kwargs.get("chat_type") in ("group", "channel", "thread")
 
         # Clearance comes from ABI config (injected by our run_agent.py patch)
         # Falls back to "external" if not set
@@ -302,7 +306,9 @@ class ABIMemoryProvider(MemoryProvider):
 
             with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 # Build DLP-filtered query
-                where_clause, params = dlp_where(self._clearance, self._agent_name)
+                where_clause, params = dlp_where(
+                    self._clearance, self._agent_name, self._user_id, self._shared_scope
+                )
 
                 if embedding:
                     # Hybrid BM25 + vector search with Reciprocal Rank Fusion (RRF)

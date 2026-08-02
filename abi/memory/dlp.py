@@ -17,8 +17,21 @@ Clearance levels:
 from typing import List, Tuple
 
 
-def dlp_where(clearance: str, agent_name: str) -> Tuple[str, List[str]]:
+def dlp_where(
+    clearance: str,
+    agent_name: str,
+    user_id: str = None,
+    shared_scope: bool = False,
+) -> Tuple[str, List[str]]:
     """Build a DLP-filtered WHERE clause for SQL queries.
+
+    Per-user read isolation: when ``user_id`` is supplied and ``shared_scope`` is
+    False (the default for 1:1 DMs), the clause is additionally narrowed to that
+    user's own memories OR ownerless shared/system memories (``user_id IS NULL``,
+    plus ``source_type = 'identity'`` team anchors) — so private context never
+    leaks across users sharing the same agent. When ``shared_scope`` is True
+    (group/channel), no user filter is applied and the team shares one pool.
+    When ``user_id`` is None (system/cron callers), behaviour is unchanged.
 
     Returns:
         Tuple of (where_clause, params) where params are for %s placeholders.
@@ -28,17 +41,22 @@ def dlp_where(clearance: str, agent_name: str) -> Tuple[str, List[str]]:
         # the shared internal/public pool — same DLP view as admin. Previously
         # 'confidential' fell through to the external branch (public-only),
         # silently blinding it to internal+own-confidential memories.
-        return (
+        base, params = (
             "((dlp_level = 'confidential' AND agent_name = %s) OR dlp_level IN ('internal', 'public'))",
             [agent_name],
         )
     elif clearance == "internal":
-        return (
-            "dlp_level IN ('internal', 'public')",
-            [],
-        )
+        base, params = ("dlp_level IN ('internal', 'public')", [])
     else:  # external
-        return (
-            "dlp_level = 'public'",
-            [],
+        base, params = ("dlp_level = 'public'", [])
+
+    # Per-user read isolation for private (non-shared) scopes. Ownerless
+    # memories (NULL user_id) and identity/team anchors stay visible to all.
+    if user_id and not shared_scope:
+        base = (
+            "(" + base + ")"
+            + " AND (user_id = %s OR user_id IS NULL OR source_type = 'identity')"
         )
+        params = params + [user_id]
+
+    return base, params
