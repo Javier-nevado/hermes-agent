@@ -4264,6 +4264,7 @@ class DiscordAdapter(BasePlatformAdapter):
         current_provider: str,
         session_key: str,
         on_model_selected,
+        on_persist_default=None,  # TODO: mirror the Telegram two-button follow-up via ModelPickerView
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive select-menu model picker.

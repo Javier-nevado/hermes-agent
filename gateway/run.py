@@ -1659,6 +1659,50 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+def _persist_model_default(
+    new_model: str, target_provider: str, base_url: str = ""
+) -> bool:
+    """Persist the selected model + provider as the default in config.yaml.
+
+    Single source of truth for "set as default" — reused by both the typed
+    ``/model <name> --global`` path and the interactive picker's "⭐ Set as
+    default" follow-up button.
+
+    Coerces a scalar ``model:`` value into a dict before mutating, otherwise a
+    flat ``model: <name>`` config raises ``TypeError: 'str' object does not
+    support item assignment``. Idempotent — safe to call repeatedly. Never
+    raises; logs a warning and returns False on any failure.
+    """
+    try:
+        import yaml
+        from hermes_cli.config import get_config_path, save_config
+
+        config_path = get_config_path()
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        else:
+            cfg = {}
+        raw_model = cfg.get("model")
+        if isinstance(raw_model, dict):
+            model_cfg = raw_model
+        elif isinstance(raw_model, str) and raw_model.strip():
+            model_cfg = {"default": raw_model.strip()}
+            cfg["model"] = model_cfg
+        else:
+            model_cfg = {}
+            cfg["model"] = model_cfg
+        model_cfg["default"] = new_model
+        model_cfg["provider"] = target_provider
+        if base_url:
+            model_cfg["base_url"] = base_url
+        save_config(cfg)
+        return True
+    except Exception as e:
+        logger.warning("Failed to persist model default: %s", e)
+        return False
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -10593,8 +10637,28 @@ class GatewayRunner:
                             if mi.has_cost_data():
                                 lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
                             lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
-                        lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
+
+                    async def _on_model_persist_default(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        """Persist the just-selected model as the default for future sessions.
+
+                        Invoked by the picker's "⭐ Set as default" follow-up button.
+                        Reads model/provider/base_url from the session override that
+                        ``_on_model_selected`` just applied (the source of truth for
+                        what the agent is now running) and writes them to config.yaml
+                        via the shared ``_persist_model_default`` helper.
+                        """
+                        ov = _self._session_model_overrides.get(_session_key) or {}
+                        new_model = ov.get("model") or model_id or ""
+                        provider = ov.get("provider") or provider_slug or ""
+                        base_url = ov.get("base_url") or ""
+                        if not new_model or not provider:
+                            return t("gateway.model.persist_error", error="no model selected")
+                        if _persist_model_default(new_model, provider, base_url):
+                            return t("gateway.model.saved_default", model=new_model)
+                        return t("gateway.model.persist_error", error="config write failed")
 
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     result = await adapter.send_model_picker(
@@ -10604,6 +10668,7 @@ class GatewayRunner:
                         current_provider=current_provider,
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
+                        on_persist_default=_on_model_persist_default,
                         metadata=metadata,
                     )
                     if result.success:
@@ -10699,37 +10764,12 @@ class GatewayRunner:
         # override rather than relying on cache signature mismatch detection.
         self._evict_cached_agent(session_key)
 
-        # Persist to config if --global
+        # Persist to config if --global (shared with the picker's "set as
+        # default" follow-up — see _persist_model_default).
         if persist_global:
-            try:
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        cfg = yaml.safe_load(f) or {}
-                else:
-                    cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
-                model_cfg["default"] = result.new_model
-                model_cfg["provider"] = result.target_provider
-                if result.base_url:
-                    model_cfg["base_url"] = result.base_url
-                from hermes_cli.config import save_config
-                save_config(cfg)
-            except Exception as e:
-                logger.warning("Failed to persist model switch: %s", e)
+            _persist_model_default(
+                result.new_model, result.target_provider, result.base_url
+            )
 
         # Build confirmation message with full metadata
         provider_label = result.provider_label or result.target_provider

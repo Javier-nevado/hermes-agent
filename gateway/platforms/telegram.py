@@ -2788,6 +2788,7 @@ class TelegramAdapter(BasePlatformAdapter):
         current_provider: str,
         session_key: str,
         on_model_selected,
+        on_persist_default=None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
@@ -2855,6 +2856,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "providers": providers,
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
+                "on_persist_default": on_persist_default,
                 "current_model": current_model,
                 "current_provider": current_provider,
             }
@@ -2921,6 +2923,30 @@ class TelegramAdapter(BasePlatformAdapter):
         except ImportError:
             def get_label(slug):
                 return slug
+
+        try:
+            from agent.i18n import t
+        except Exception:
+            def t(key, **kw):  # graceful fallback: show the raw key path
+                return key
+
+        async def _edit_with_fallback(text, reply_markup=None):
+            """Edit the picker message with MD2 escaping; retry as plain text on parse error."""
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                try:
+                    await query.edit_message_text(
+                        text=text,
+                        parse_mode=None,
+                        reply_markup=reply_markup,
+                    )
+                except Exception:
+                    pass
 
         if data.startswith("mp:"):
             # --- Provider selected: show model buttons (page 0) ---
@@ -3022,26 +3048,60 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.error("Model picker switch failed: %s", exc)
                 result_text = f"Error switching model: {exc}"
 
-            # Edit message to show confirmation, remove buttons
-            try:
-                await query.edit_message_text(
-                    text=self.format_message(result_text),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=None,
+            persist_cb = state.get("on_persist_default")
+            if persist_cb:
+                # Offer the "set as default" follow-up. Keep state so the
+                # md:1/md:0 callbacks can reach the just-selected model/provider.
+                state["pending_default"] = (model_id, provider_slug)
+                followup_kb = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                t("gateway.model.set_default_button"),
+                                callback_data="md:1",
+                            ),
+                            InlineKeyboardButton(
+                                t("gateway.model.session_only_button"),
+                                callback_data="md:0",
+                            ),
+                        ]
+                    ]
                 )
-            except Exception:
-                # Markdown parse failure — retry as plain text
-                try:
-                    await query.edit_message_text(
-                        text=result_text,
-                        parse_mode=None,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-            await query.answer(text="Model switched!")
+                await _edit_with_fallback(
+                    result_text + "\n\n" + t("gateway.model.set_default_prompt"),
+                    reply_markup=followup_kb,
+                )
+                await query.answer(text="Model switched!")
+                return  # state intentionally retained for the md: callback
 
-            # Clean up state
+            # No persist follow-up offered — show confirmation + session-only hint.
+            await _edit_with_fallback(
+                result_text + "\n" + t("gateway.model.session_only_hint")
+            )
+            await query.answer(text="Model switched!")
+            self._model_picker_state.pop(chat_id, None)
+
+        elif data.startswith("md:"):
+            # --- "Set as default" follow-up (after a model was picked) ---
+            choice = data[3:]
+            persist_cb = state.get("on_persist_default")
+            mid, prov = state.get("pending_default", (None, None))
+
+            if choice == "1":
+                if persist_cb and mid:
+                    try:
+                        result_text = await persist_cb(chat_id, mid, prov or "")
+                    except Exception as exc:
+                        logger.error("Model persist failed: %s", exc)
+                        result_text = t("gateway.model.persist_error", error=str(exc))
+                else:
+                    result_text = t("gateway.model.persist_error", error="picker expired")
+            else:
+                # md:0 — session only, not saved as default
+                result_text = t("gateway.model.session_only_confirmed")
+
+            await _edit_with_fallback(result_text)
+            await query.answer()
             self._model_picker_state.pop(chat_id, None)
 
         elif data == "mb":
@@ -3108,7 +3168,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mm:", "mb", "mx", "mg:", "md:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)

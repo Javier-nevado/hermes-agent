@@ -147,6 +147,106 @@ class TestTelegramModelPicker:
         assert "12345" not in adapter._model_picker_state
 
     @pytest.mark.asyncio
+    async def test_model_selected_offers_set_default_followup(self):
+        """With on_persist_default wired, picking a model shows the
+        "Set as default / Session only" follow-up and keeps state so the
+        md: callback can still resolve the selection."""
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value="Model switched to `glm-4.7-flash`")
+        persist = AsyncMock(return_value="Saved as default: glm-4.7-flash")
+        adapter._model_picker_state["12345"] = {
+            "providers": [
+                {"slug": "opteia", "name": "Opteia", "total_models": 1, "is_current": True}
+            ],
+            "current_model": "model_1",
+            "current_provider": "opteia",
+            "session_key": "s",
+            "on_model_selected": callback,
+            "on_persist_default": persist,
+            "selected_provider": "opteia",
+            "model_list": ["glm-4.7-flash"],
+            "msg_id": 42,
+        }
+
+        query = AsyncMock()
+        query.data = "mm:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "mm:0", "12345")
+
+        callback.assert_awaited_once()
+        persist.assert_not_awaited()  # follow-up is pending — not persisted yet
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert edit_kwargs["reply_markup"] is not None  # follow-up keyboard attached
+        # State retained + selection recorded for the md: callback.
+        assert "12345" in adapter._model_picker_state
+        assert adapter._model_picker_state["12345"]["pending_default"] == ("glm-4.7-flash", "opteia")
+
+    @pytest.mark.asyncio
+    async def test_md_yes_invokes_persist_and_cleans_state(self):
+        """md:1 (Set as default) calls on_persist_default with the pending
+        selection, shows its confirmation text, then cleans up state."""
+        adapter = _make_adapter()
+        persist = AsyncMock(return_value="⭐ Saved as default: glm-4.7-flash")
+        adapter._model_picker_state["12345"] = {
+            "providers": [],
+            "current_model": "glm-4.7-flash",
+            "current_provider": "opteia",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "on_persist_default": persist,
+            "pending_default": ("glm-4.7-flash", "opteia"),
+            "msg_id": 42,
+        }
+
+        query = AsyncMock()
+        query.data = "md:1"
+        query.message = MagicMock()
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "md:1", "12345")
+
+        persist.assert_awaited_once_with("12345", "glm-4.7-flash", "opteia")
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert "Saved as default" in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None  # buttons removed after finalizing
+        assert "12345" not in adapter._model_picker_state
+
+    @pytest.mark.asyncio
+    async def test_md_no_session_only_and_cleans_state(self):
+        """md:0 (Session only) does NOT persist, removes the buttons, and
+        cleans up state."""
+        adapter = _make_adapter()
+        persist = AsyncMock(return_value="should-not-be-called")
+        adapter._model_picker_state["12345"] = {
+            "providers": [],
+            "current_model": "glm-4.7-flash",
+            "current_provider": "opteia",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "on_persist_default": persist,
+            "pending_default": ("glm-4.7-flash", "opteia"),
+            "msg_id": 42,
+        }
+
+        query = AsyncMock()
+        query.data = "md:0"
+        query.message = MagicMock()
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "md:0", "12345")
+
+        persist.assert_not_awaited()
+        edit_kwargs = query.edit_message_text.call_args[1]
+        assert edit_kwargs["reply_markup"] is None
+        assert "12345" not in adapter._model_picker_state
+
+    @pytest.mark.asyncio
     async def test_retries_without_thread_when_thread_not_found(self):
         adapter = _make_adapter()
         providers = [{"slug": "openai", "name": "OpenAI", "total_models": 2, "is_current": True}]
