@@ -32,7 +32,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # Languages: eng + mlt/ita/spa for the Malta/EU customer base (~14 MB total).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 python-is-python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli xz-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-ita tesseract-ocr-mlt tesseract-ocr-spa poppler-utils && \
+    ca-certificates curl gnupg python3 python-is-python3 ripgrep ffmpeg gcc python3-dev libffi-dev procps git openssh-client docker-cli xz-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-ita tesseract-ocr-mlt tesseract-ocr-spa poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------- s6-overlay install ----------
@@ -269,6 +269,13 @@ COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-r
 # is non-fatal on error, which is FINE here — staging is non-blocking by design
 # (a missing fingerprint makes the gateway fail-open + log, never a dead bot).
 COPY --chmod=0755 docker/cont-init.d/03-abi-license-fp /etc/cont-init.d/03-abi-license-fp
+# ABI v4 Passbolt keyring staging: imports the agent's armored GPG private key from
+# passbolt.json into $HERMES_HOME/.gnupg (owned by hermes) so the passbolt-secure-
+# credentials skill can run GPGAuth at runtime. The helper docker/abi-passbolt-
+# keyring.py reaches the image via the bulk `COPY . .` (like abi-fingerprint.py).
+# NON-BLOCKING — no-op without passbolt.json (most agents have no vault). GNUPGHOME
+# is exported to the gateway via container_environment. See plan §Architecture.
+COPY --chmod=0755 docker/cont-init.d/04-passbolt-keyring /etc/cont-init.d/04-passbolt-keyring
 
 # ABI v4: bake the Opteia shared skills into the image. The content is staged into
 # build-context ./abi-tools-skills/ by docker/sync-abi-skills.sh from the SEPARATE

@@ -1,0 +1,49 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# docker/cont-init.d/04-passbolt-keyring — ABI v4 Passbolt GPG keyring staging (boot, root).
+#
+# WHY A CONT-INIT (like 03-abi-license-fp): the gateway is the runtime
+# `gateway-default` s6 longrun, NOT main-wrapper — and the GPG keyring must exist
+# and be owned by `hermes` BEFORE the gateway (or any passbolt_client.py call)
+# runs. cont-init runs as ROOT before any longrun, so it can import the armored
+# private key from passbolt.json into $HERMES_HOME/.gnupg and hand it to hermes.
+#
+# The keyring lives on the persistent per-agent volume (survives restarts); the
+# import is idempotent. GNUPGHOME is exported via container_environment so the
+# skill's `gpg` subprocess calls find it regardless of the caller's HOME.
+#
+# NON-BLOCKING: if passbolt.json is absent (most agents have no vault) this is a
+# no-op. Never fails the boot — a missing key makes the Passbolt skill fail-soft
+# at runtime, not a dead bot. See skill `passbolt-secure-credentials` + plan §Architecture.
+set -u
+
+PY=/opt/hermes/.venv/bin/python
+HELPER=/opt/hermes/docker/abi-passbolt-keyring.py
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+GNUPGHOME="$HERMES_HOME/.gnupg"
+
+export HERMES_HOME GNUPGHOME
+export PASSBOLT_CREDS_PATH="${PASSBOLT_CREDS_PATH:-$HERMES_HOME/credentials/passbolt.json}"
+
+# Graceful no-op when no vault is wired — don't even spawn python.
+[ -f "$PASSBOLT_CREDS_PATH" ] || exit 0
+[ -f "$HELPER" ] || { echo "[passbolt] cont-init: $HELPER missing — skipping" >&2; exit 0; }
+
+# Helper prints the (public) fingerprint to stdout; warnings go to stderr (s6 log).
+if fp=$("$PY" "$HELPER"); then
+    fp=$(printf '%s' "$fp" | tail -n 1 | tr -d ' \n\r\t')
+    # gpg ran as root → keyring files are root-owned. Hand them to the runtime hermes user.
+    chown -R hermes:hermes "$GNUPGHOME" 2>/dev/null || true
+    # Expose GNUPGHOME to with-contenv services (gateway-default's shebang is with-contenv).
+    mkdir -p /run/s6/container_environment 2>/dev/null || true
+    printf '%s' "$GNUPGHOME" > /run/s6/container_environment/GNUPGHOME 2>/dev/null || true
+    if [ -n "$fp" ]; then
+        echo "[passbolt] cont-init: imported agent key $(printf '%s' "$fp" | cut -c1-12)… → $GNUPGHOME" >&2
+    else
+        echo "[passbolt] cont-init: keyring staged (no fingerprint in passbolt.json — check the file)" >&2
+    fi
+else
+    echo "[passbolt] cont-init: key import failed — Passbolt skill will fail-soft at runtime" >&2
+fi
+
+exit 0

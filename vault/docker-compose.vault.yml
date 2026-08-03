@@ -1,0 +1,77 @@
+# =============================================================================
+# ABI v4 — per-customer Passbolt vault (sibling to docker-compose.abi-v4.yml).
+# See plan §Architecture + workspace/passbolt-abi-offering-spec.md §11.
+#
+# Env keys mirror the PROVEN central passbolt.opteia.com instance (DCK-DMZ):
+# dedicated `passbolt` DB user (not root), APP_FULL_BASE_URL, Brevo SMTP,
+# GNUPGHOME=/var/lib/passbolt/.gnupg for the server keypair.
+#
+# ZERO HOST PORTS by design:
+#   - cloudflared is outbound-only (no inbound holes, no per-customer port alloc).
+#   - cloudflared reaches passbolt over the compose default network as
+#     http://passbolt:80 — NO `ports:` mapping needed (intra-network).
+#   - the ABI agent + humans reach the vault over the PUBLIC URL
+#     https://${VAULT_HOST} (Cloudflare edge), not any local port.
+#
+# Deploy: vault/provision-vault.sh <customer> writes vault/.env, creates the
+# Cloudflare tunnel + DNS, then `docker compose -f docker-compose.vault.yml up -d`.
+# =============================================================================
+services:
+  passbolt-db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${VAULT_DB_ROOT}
+      MARIADB_DATABASE: passbolt
+      # Dedicated app user (matches the proven central setup — not root).
+      MARIADB_USER: passbolt
+      MARIADB_PASSWORD: ${VAULT_DB_PASS}
+    volumes:
+      - passbolt-db:/var/lib/mysql
+    # NO ports: — reached only by passbolt over the compose network.
+
+  passbolt:
+    image: passbolt/passbolt:latest-ce
+    restart: unless-stopped
+    depends_on:
+      - passbolt-db
+    environment:
+      DATASOURCES_DEFAULT_HOST: passbolt-db
+      DATASOURCES_DEFAULT_USERNAME: passbolt
+      DATASOURCES_DEFAULT_PASSWORD: ${VAULT_DB_PASS}
+      DATASOURCES_DEFAULT_DATABASE: passbolt
+      # Baked into the OpenPGP identity — set BEFORE first boot, never change after.
+      APP_FULL_BASE_URL: https://${VAULT_HOST}
+      # Closed registration — the only users are provisioned via cake (no email).
+      PASSBOLT_REGISTRATION_PUBLIC: "false"
+      # SMTP via Brevo (disabled link-tracking on the sender to avoid breaking
+      # setup URLs — see spec §7). Email is optional; setup links come from cake stdout.
+      EMAIL_TRANSPORT_DEFAULT_HOST: smtp-relay.brevo.com
+      EMAIL_TRANSPORT_DEFAULT_PORT: "587"
+      EMAIL_TRANSPORT_DEFAULT_USERNAME: ${BREVO_SMTP_USER:-}
+      EMAIL_TRANSPORT_DEFAULT_PASSWORD: ${BREVO_SMTP_KEY:-}
+      EMAIL_TRANSPORT_DEFAULT_TLS: "true"
+      EMAIL_FROM: "no-reply@vaults.opteia.com"
+      EMAIL_FROM_NAME: "Opteia Vault"
+    volumes:
+      - passbolt-gpg:/var/lib/passbolt/.gnupg    # server OpenPGP keypair (identity)
+      - passbolt-images:/var/www/passbolt/webroot/img
+      - passbolt-tmp:/var/www/passbolt/tmp
+    # NO ports: — cloudflared reaches it intra-network as http://passbolt:80.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - passbolt
+    # Remote-managed (token) tunnel: the <customer>.vaults.opteia.com -> service
+    # ingress + CNAME are configured in Cloudflare by provision-vault.sh, so the
+    # compose stays token-only. Revoking a customer = revoke their tunnel token.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    # outbound-only — NO ports.
+
+volumes:
+  passbolt-db: {}
+  passbolt-gpg: {}
+  passbolt-images: {}
+  passbolt-tmp: {}
