@@ -7,7 +7,14 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # our Debian 13 (trixie, glibc 2.41) runtime.  Bumping to a new Node major
 # is a one-line ARG change; see #4977.
 FROM node:22-bookworm-slim@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS node_source
-FROM debian:13.4
+# Runtime base — pinned by manifest DIGEST (not the moving `13.4` tag) so the
+# rootfs layer is byte-identical across builds. apt-get below intentionally hits the
+# LIVE mirror so security updates flow automatically (the apt layer therefore drifts
+# between builds; the heavy uv-sync layer still shares across versions via immutable
+# wheels + a pinned uv.lock). To bump the base intentionally: pull a fresh
+# `debian:13.4`, `docker inspect --format='{{json .RepoDigests}}' debian:13.4`,
+# and replace the digest below.
+FROM debian:13.4@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da
 
 # Disable Python stdout buffering to ensure logs are printed immediately
 ENV PYTHONUNBUFFERED=1
