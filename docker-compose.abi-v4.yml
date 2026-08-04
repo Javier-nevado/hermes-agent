@@ -74,6 +74,8 @@ x-agent-common: &agent-common
     API_SERVER_PORT: "8080"             # internal only — no host port (kills the v3 8400+N drift)
     API_SERVER_KEY: ${ABI_API_SERVER_KEY}
     ABI_LICENSE_GATE: "1"               # v4 session-start fingerprint gate (machine-bound license)
+    ABI_GREENLIGHT_GATE: "1"            # v4 count gate (abi-service mints <=max_agents green-lights; over-cap fails closed)
+    ABI_GREENLIGHTS_DIR: /opt/abi-tools/greenlights  # ro-mounted token dir shared with abi-service
     ABI_SEAT_GATE: "0"                  # legacy alias OFF (ABI_LICENSE_GATE=1 takes precedence)
     ABI_SEAT_API_URL: https://api.opteia.com
     GLM_BASE_URL: https://api.z.ai/api/coding/paas/v4/
@@ -96,7 +98,7 @@ services:
   abi-agent-mga:
     <<: *agent-common
     container_name: abi-agent-mga
-    volumes: [abi-hermes-mga:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-mga:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1008"
@@ -104,6 +106,7 @@ services:
       ABI_AGENT_ID: ${MGA_AGENT_ID}
       OPTEIA_LICENSE_KEY: ${MGA_SEAT}
       CAMOFOX_URL: http://abi-camofox-mga:9377
+      ABI_AGENT_NAME: abi-agent-mga
   abi-camofox-mga:
     <<: *camofox-common
     container_name: abi-camofox-mga
@@ -113,7 +116,7 @@ services:
   abi-agent-ailean:
     <<: *agent-common
     container_name: abi-agent-ailean
-    volumes: [abi-hermes-ailean:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-ailean:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1001"
@@ -121,6 +124,7 @@ services:
       ABI_AGENT_ID: ${AILEAN_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${AILEAN_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-ailean:9377
+      ABI_AGENT_NAME: abi-agent-ailean
   abi-camofox-ailean:
     <<: *camofox-common
     container_name: abi-camofox-ailean
@@ -130,7 +134,7 @@ services:
   abi-agent-atlas:
     <<: *agent-common
     container_name: abi-agent-atlas
-    volumes: [abi-hermes-atlas:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-atlas:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1002"
@@ -138,6 +142,7 @@ services:
       ABI_AGENT_ID: ${ATLAS_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${ATLAS_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-atlas:9377
+      ABI_AGENT_NAME: abi-agent-atlas
   abi-camofox-atlas:
     <<: *camofox-common
     container_name: abi-camofox-atlas
@@ -147,7 +152,7 @@ services:
   abi-agent-jen:
     <<: *agent-common
     container_name: abi-agent-jen
-    volumes: [abi-hermes-jen:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-jen:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1003"
@@ -155,6 +160,7 @@ services:
       ABI_AGENT_ID: ${JEN_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${JEN_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-jen:9377
+      ABI_AGENT_NAME: abi-agent-jen
   abi-camofox-jen:
     <<: *camofox-common
     container_name: abi-camofox-jen
@@ -164,7 +170,7 @@ services:
   abi-agent-iris:
     <<: *agent-common
     container_name: abi-agent-iris
-    volumes: [abi-hermes-iris:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-iris:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1004"
@@ -172,6 +178,7 @@ services:
       ABI_AGENT_ID: ${IRIS_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${IRIS_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-iris:9377
+      ABI_AGENT_NAME: abi-agent-iris
   abi-camofox-iris:
     <<: *camofox-common
     container_name: abi-camofox-iris
@@ -181,7 +188,7 @@ services:
   abi-agent-caspian:
     <<: *agent-common
     container_name: abi-agent-caspian
-    volumes: [abi-hermes-caspian:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-caspian:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1005"
@@ -189,6 +196,7 @@ services:
       ABI_AGENT_ID: ${CASPIAN_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${CASPIAN_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-caspian:9377
+      ABI_AGENT_NAME: abi-agent-caspian
   abi-camofox-caspian:
     <<: *camofox-common
     container_name: abi-camofox-caspian
@@ -198,7 +206,7 @@ services:
   abi-agent-sol:
     <<: *agent-common
     container_name: abi-agent-sol
-    volumes: [abi-hermes-sol:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-sol:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1006"
@@ -206,6 +214,7 @@ services:
       ABI_AGENT_ID: ${SOL_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${SOL_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-sol:9377
+      ABI_AGENT_NAME: abi-agent-sol
   abi-camofox-sol:
     <<: *camofox-common
     container_name: abi-camofox-sol
@@ -215,7 +224,7 @@ services:
   abi-agent-vera:
     <<: *agent-common
     container_name: abi-agent-vera
-    volumes: [abi-hermes-vera:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro]
+    volumes: [abi-hermes-vera:/opt/data, /opt/abi-tools/skills:/opt/abi-tools/skills:ro, /opt/abi-tools/greenlights:/opt/abi-tools/greenlights:ro]
     environment:
       <<: *agent-env
       HERMES_UID: "1007"
@@ -223,6 +232,7 @@ services:
       ABI_AGENT_ID: ${VERA_AGENT_ID:-}
       OPTEIA_LICENSE_KEY: ${VERA_SEAT:-}
       CAMOFOX_URL: http://abi-camofox-vera:9377
+      ABI_AGENT_NAME: abi-agent-vera
   abi-camofox-vera:
     <<: *camofox-common
     container_name: abi-camofox-vera
