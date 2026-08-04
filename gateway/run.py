@@ -1055,6 +1055,7 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
 from gateway.license_check import verify_license, LicenseVerdict
+from gateway.green_light_check import verify_green_light, GreenLightVerdict
 
 
 logger = logging.getLogger(__name__)
@@ -1753,6 +1754,23 @@ class GatewayRunner:
         self._license_ttl = _float_env("ABI_LICENSE_TTL_SEC", 300.0)
         self._license_verdict: Optional[LicenseVerdict] = None
         self._license_verdict_ts: float = 0.0
+
+        # ABI v4 GREEN-LIGHT count gate (Phase 2). abi-service (on-box authority)
+        # mints ≤max_agents signed tokens into a shared read-only greenlights/ dir;
+        # each agent verifies ITS token at session-start and fail-closes without one
+        # (the (N+1)th, over-cap). Gated behind ABI_GREENLIGHT_GATE (default off) so it
+        # rolls out ALONGSIDE the fingerprint gate (ABI_LICENSE_GATE) during the
+        # transition, then replaces it. Token file = $ABI_AGENT_NAME.token (the compose
+        # sets ABI_AGENT_NAME = container name; HOSTNAME is just the short id). See
+        # gateway/green_light_check.py + workspace/abi-service-green-light-protocol.md.
+        self._greenlight_gate_enabled = os.environ.get("ABI_GREENLIGHT_GATE", "0") == "1"
+        self._greenlight_agent_name = os.environ.get("ABI_AGENT_NAME", "")
+        self._greenlights_dir = os.environ.get(
+            "ABI_GREENLIGHTS_DIR", "/opt/abi-tools/greenlights"
+        )
+        self._greenlight_ttl = _float_env("ABI_GREENLIGHT_TTL_SEC", 300.0)
+        self._greenlight_verdict: Optional[GreenLightVerdict] = None
+        self._greenlight_verdict_ts: float = 0.0
 
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
@@ -6895,7 +6913,7 @@ class GatewayRunner:
         tree never reaches the gateway; this tmpfs file (recomputed from hardware each
         boot, never on the persistent volume) is the clone-safe bridge."""
         try:
-            return open("/run/abi-fingerprint").read().strip()
+            return open("/run/abi-fingerprint", encoding="utf-8").read().strip()
         except OSError:
             return ""
 
@@ -6910,6 +6928,58 @@ class GatewayRunner:
                 await adapter.send(source.chat_id, msg)
             except Exception as e:
                 logger.warning("failed to send license-denial message: %s", e)
+
+    async def _check_green_light(self, source) -> bool:
+        """ABI v4 GREEN-LIGHT count gate (Phase 2). Returns True to proceed, False
+        to abort (the user-facing denial has already been sent).
+
+        - gate off                 -> True (no-op; default until cutover)
+        - verdict cached < TTL     -> replay it (ok/transient -> True; denied ->
+                                      re-send the message, False). Unlike the
+                                      fingerprint gate, transients ARE cached here:
+                                      the green-light inputs are deterministic local
+                                      files, so a transient (broken mount / missing
+                                      pubkey) is stable over the TTL, and caching it
+                                      avoids re-warning every message.
+        - otherwise                -> verify_green_light(); cache every verdict.
+        """
+        if not self._greenlight_gate_enabled:
+            return True
+        now = time.time()
+        cached = self._greenlight_verdict
+        if cached is not None and (now - self._greenlight_verdict_ts) < self._greenlight_ttl:
+            if cached.ok or cached.is_transient:
+                return True
+            await self._send_greenlight_denial(source, cached)
+            return False
+
+        verdict = verify_green_light(
+            self._greenlight_agent_name,
+            self._greenlights_dir,
+        )
+        self._greenlight_verdict = verdict
+        self._greenlight_verdict_ts = now
+        if verdict.ok:
+            return True
+        if verdict.is_denied:
+            logger.warning("green-light DENIED (reason=%s) — blocking turn", verdict.reason)
+            await self._send_greenlight_denial(source, verdict)
+            return False
+        # transient (broken mount / missing pubkey / ABI_AGENT_NAME unset) — fail open.
+        logger.warning("green-light check transient (reason=%s) — failing open", verdict.reason)
+        return True
+
+    async def _send_greenlight_denial(self, source, verdict: GreenLightVerdict) -> None:
+        """Send the user-facing green-light denial (over-cap / expired / invalid)."""
+        msg = verdict.user_message
+        if not msg:
+            return
+        adapter = self.adapters.get(source.platform)
+        if adapter:
+            try:
+                await adapter.send(source.chat_id, msg)
+            except Exception as e:
+                logger.warning("failed to send green-light denial: %s", e)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -7024,6 +7094,14 @@ class GatewayRunner:
         # events skip it. Fail-open on transient errors; hard denials send a
         # user-facing message + end the turn (no LLM call). TTL-cached.
         if not is_internal and not await self._check_license(source):
+            return None
+
+        # ABI v4 GREEN-LIGHT count gate (Phase 2; session-start). Runs ALONGSIDE
+        # the fingerprint license gate above during the transition (both gated
+        # independently via ABI_LICENSE_GATE / ABI_GREENLIGHT_GATE); eventually the
+        # fingerprint gate is dropped and this becomes the sole authority. Default
+        # off — no-op until ABI_GREENLIGHT_GATE=1. TTL-cached.
+        if not is_internal and not await self._check_green_light(source):
             return None
 
         # Intercept messages that are responses to a pending /update prompt.
