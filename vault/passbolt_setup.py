@@ -19,9 +19,17 @@ Protocol (verified against passbolt_api src/Controller/Setup/SetupCompleteContro
     (the agent needs it to decrypt the GPGAuth challenge each session).
 
 USAGE:
+  # Central vault (dev/internal) — setup + ongoing both use the public url:
   passbolt_setup.py --url https://passbolt.opteia.com \
                     --setup-link 'https://.../setup/start/<userId>/<token>' \
                     --username ailean@opteia.com --out passbolt.json
+
+  # Per-box customer vault — setup over the public https url (the setup link lives
+  # on the public hostname), but the agent reads creds over LOCAL http thereafter:
+  passbolt_setup.py --url https://brian.vaults.opteia.com \
+                    --agent-url http://brian.vaults.opteia.com \
+                    --setup-link 'https://.../setup/start/<userId>/<token>' \
+                    --username abi@brian.local --out passbolt.json
 """
 from __future__ import annotations
 
@@ -86,7 +94,18 @@ def parse_setup_link(setup_link: str) -> tuple[str, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True)
+    ap.add_argument(
+        "--url", required=True,
+        help="setup-time base url (the setup link lives here). Public https for a "
+             "per-box vault; the central vault url for dev/internal.",
+    )
+    ap.add_argument(
+        "--agent-url", default=None,
+        help="url written to passbolt.json for ONGOING GPGAuth (default: same as "
+             "--url). For a per-box vault pass http://<host> so the agent reaches "
+             "passbolt LOCALLY over the docker network alias (resilient to "
+             "Cloudflare outages) instead of round-tripping the public edge.",
+    )
     ap.add_argument("--setup-link", required=True)
     ap.add_argument("--username", required=True)
     ap.add_argument("--out", required=True)
@@ -135,8 +154,10 @@ def main() -> int:
         return 1
 
     # ─── 4. emit passbolt.json (private key = bootstrap secret) ────────────
+    # Ongoing GPGAuth uses --agent-url (local http for a per-box vault); the setup
+    # handshake above used --url (public https). Defaults to --url for back-compat.
     creds = {
-        "url": args.url,
+        "url": args.agent_url or args.url,
         "user_id": user_id,
         "username": args.username,
         "key_fingerprint": fp,

@@ -10,8 +10,12 @@
 #   - cloudflared is outbound-only (no inbound holes, no per-customer port alloc).
 #   - cloudflared reaches passbolt over the compose default network as
 #     http://passbolt:80 — NO `ports:` mapping needed (intra-network).
-#   - the ABI agent + humans reach the vault over the PUBLIC URL
-#     https://${VAULT_HOST} (Cloudflare edge), not any local port.
+#   - humans reach the vault over the PUBLIC URL https://${VAULT_HOST} (Cloudflare edge).
+#   - the ABI agent reaches it over LOCAL http by the SAME hostname — passbolt is
+#     attached to the shared opteia-net with alias ${VAULT_HOST}, so the agent
+#     container resolves <cust>.vaults.opteia.com → this container on-docker
+#     (resilient to Cloudflare outages; vault is a core dep). Same Host identity as
+#     APP_FULL_BASE_URL. GPGAuth verifies the server by key fingerprint, not URL.
 #
 # Deploy: vault/provision-vault.sh <customer> writes vault/.env, creates the
 # Cloudflare tunnel + DNS, then `docker compose -f docker-compose.vault.yml up -d`.
@@ -53,10 +57,24 @@ services:
       EMAIL_TRANSPORT_DEFAULT_TLS: "true"
       EMAIL_FROM: "no-reply@vaults.opteia.com"
       EMAIL_FROM_NAME: "Opteia Vault"
+      # The server OpenPGP key fingerprint. The image keygen creates the keypair
+      # in GNUPGHOME on first boot, but does NOT auto-wire its fingerprint into
+      # the config (default.php reads it via env() at runtime) — without this,
+      # `cake passbolt install` aborts "The server OpenPGP key is not set".
+      # provision-vault.sh must populate VAULT_SERVER_FP after the first-boot
+      # keygen (2-phase: up→read fp→set env→up) or pre-generate the key.
+      PASSBOLT_GPG_SERVER_KEY_FINGERPRINT: ${VAULT_SERVER_FP}
     volumes:
       - passbolt-gpg:/var/lib/passbolt/.gnupg    # server OpenPGP keypair (identity)
       - passbolt-images:/var/www/passbolt/webroot/img
       - passbolt-tmp:/var/www/passbolt/tmp
+    networks:
+      default: {}        # passbolt-db + cloudflared intra-comms (http://passbolt:80)
+      opteia-net:
+        # Agent path: <cust>.vaults.opteia.com → this container over LOCAL http.
+        # Same Host identity as APP_FULL_BASE_URL; resolved on-docker, not via Cloudflare.
+        aliases:
+          - ${VAULT_HOST}
     # NO ports: — cloudflared reaches it intra-network as http://passbolt:80.
 
   cloudflared:
@@ -75,3 +93,12 @@ volumes:
   passbolt-gpg: {}
   passbolt-images: {}
   passbolt-tmp: {}
+
+networks:
+  default: {}
+  # Shared with docker-compose.abi-v4.yml (external: true) so the agent container
+  # resolves <customer>.vaults.opteia.com → this passbolt container locally over http.
+  # MUST already exist (created by the v4 agent stack). Concern #1 split-horizon fix.
+  opteia-net:
+    external: true
+    name: hermes-agent_opteia-net
