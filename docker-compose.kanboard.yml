@@ -1,0 +1,90 @@
+# docker-compose.kanboard.yml — ABI standard-box Kanboard (sole kanban, shared Postgres)
+#
+# WHY: every ABI box ships Kanboard as a DEFAULT SERVICE — "one image, one set of
+# services" (uniform deploy + management). Kanboard is the SOLE kanban: the agent's
+# embedded SQLite dispatcher is OFF (set HERMES_KANBAN_DISPATCH_IN_GATEWAY=false in
+# the agent compose, docker-compose.abi-v4.yml). The agent reaches this service at
+# http://opteia-kanboard:80 (internal-net DNS) and polls it via kanban_poll.py.
+#
+# Shares the box's existing abi-memory-db Postgres in a SEPARATE `kanboard` DB
+# (created idempotently by kanboard-db-init) — isolated from the agent's opteia_memory
+# schema, so a Kanboard migration can never touch agent memory. DB_RUN_MIGRATIONS=true
+# auto-installs + upgrades the Kanboard schema on boot (no manual SQL import).
+#
+# No reverse proxy here → Kanboard's own API-token auth (REVERSE_PROXY_AUTH=false).
+# Operator web access via 127.0.0.1:8095 (loopback). Public HTTPS (cloudflared) is a
+# DEFERRED ADD-ON, not part of the default — agent-local HTTP is resilient without it.
+#
+# Copy-per-box:  scp docker-compose.kanboard.yml <box>:/opt/kanboard/docker-compose.yml
+# then create /opt/kanboard/.env (ABI_DB_USER, ABI_DB_PASSWORD from the box's infra
+# docker.env) + `mkdir -p data plugins && sudo chown -R 33:33 data plugins`.
+# See the cutover runbook Phase 3b for the full deploy + agent-user/token steps.
+#
+# Usage:
+#   docker compose --env-file .env -f docker-compose.kanboard.yml up -d
+#
+# Prereq: abi-memory-db is already up on the shared network (it always is on a
+# standard box — the memory stack comes up before the agent). kanboard-db-init waits
+# for it, then creates the kanboard DB if absent.
+services:
+  kanboard-db-init:
+    image: postgres:17-alpine
+    container_name: abi-kanboard-db-init
+    environment:
+      - PGPASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      - PGUSER=${ABI_DB_USER:-opteia}
+      - PGHOST=abi-memory-db
+      - PGDATABASE=postgres
+    # Wait for the shared PG to accept connections, then create the kanboard DB
+    # idempotently (no-op if it already exists). Owner = the box's PG user.
+    entrypoint:
+      - sh
+      - -c
+      - 'for i in $$(seq 1 30); do pg_isready -h abi-memory-db -U "$$PGUSER" >/dev/null 2>&1 && break; echo "waiting for abi-memory-db..."; sleep 2; done; psql -tAc "SELECT 1 FROM pg_database WHERE datname=''kanboard''" | grep -q 1 || psql -c "CREATE DATABASE kanboard OWNER $$PGUSER"'
+    networks:
+      - opteia-net
+    restart: "no"
+
+  kanboard:
+    image: kanboard/kanboard:latest
+    container_name: opteia-kanboard
+    depends_on:
+      kanboard-db-init:
+        condition: service_completed_successfully
+    environment:
+      # Native env-driven config (reaches fpm workers via /etc/php84/php-fpm.d/env.conf;
+      # a custom config.php reading getenv() does NOT — fpm clear_env strips it).
+      - DB_DRIVER=postgres
+      - DB_HOSTNAME=abi-memory-db
+      - DB_PORT=5432
+      - DB_NAME=kanboard
+      - DB_USERNAME=${ABI_DB_USER:-opteia}
+      - DB_PASSWORD=${ABI_DB_PASSWORD:?ABI_DB_PASSWORD required}
+      - DB_RUN_MIGRATIONS=true
+      - DEBUG=false
+      # No reverse proxy on a standard box → Kanboard's own API-token auth.
+      - REVERSE_PROXY_AUTH=false
+    volumes:
+      # No config.php mount — native env-driven config. data/ (uploads) + plugins/
+      # (theme) are bind-mounts; chown 33:33 (www-data) before first up.
+      - ./data:/var/www/app/data
+      - ./plugins:/var/www/app/plugins
+    ports:
+      - "127.0.0.1:8095:80"   # operator web only (loopback); public HTTPS = deferred cloudflared
+    networks:
+      - opteia-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/healthcheck || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  opteia-net:
+    # The shared internal network created by the box's memory stack (project
+    # hermes-agent + network opteia-net → hermes-agent_opteia-net). External so this
+    # compose can't (re)create or delete it.
+    name: hermes-agent_opteia-net
+    external: true

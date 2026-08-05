@@ -64,3 +64,32 @@ The zero-LLM Kanboard cron scripts (`kanban_poll.py` / `kanban_trigger.py` /
 that ships them are **Opteia-internal operations tooling** — they target Opteia's
 own Kanboard and NetBird/OPNsense infra, which no customer box has. They stay
 box-local on Opteia boxes (e.g. `.19 /opt/abi-tools/v4/`), not in this repo.
+
+## The standard-box Kanboard service (SHIPPED here — a default service)
+
+Every ABI box ships **Kanboard + Passbolt as default services** (one image, one set
+of services). The Kanboard *service* compose is shipped here —
+`../docker-compose.kanboard.yml` (repo root, next to `docker-compose.abi-v4.yml`).
+It is the **stripped, agent-local** variant: just `kanboard-db-init` + the
+`opteia-kanboard` service, shared Postgres (the box's `abi-memory-db`, separate
+`kanboard` DB), `REVERSE_PROXY_AUTH=false`, loopback web port `127.0.0.1:8095:80`.
+The Opteia-internal CF-Access proxy variant lives in `docker-compose.abi-api.yml`'s
+`kanban` profile (not for customer boxes).
+
+Copy-per-box, to its own dir (NOT `/opt/abi-tools/v4/`):
+
+```sh
+ssh <box> 'sudo mkdir -p /opt/kanboard'
+scp docker-compose.kanboard.yml <box>:/opt/kanboard/docker-compose.yml
+# .env: ABI_DB_USER + ABI_DB_PASSWORD (from the box's infra docker.env)
+# stock dirs: sudo mkdir -p /opt/kanboard/{data,plugins} && sudo chown -R 33:33 /opt/kanboard/{data,plugins}
+```
+
+The agent wires to it via `KANBOARD_URL=http://opteia-kanboard:80` + `KANBOARD_USER` /
+`KANBOARD_TOKEN` + `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false` in the agent compose
+(`docker-compose.abi-v4.yml`), and the zero-LLM `kanban_poll.py` cron wakes it on card
+changes (cron script shipped separately — see "Out of scope" above; lifted to
+`/opt/data/scripts/`). Full deploy + agent-user/token steps: cutover runbook Phase 3b.
+
+The per-box Passbolt vault (`provision-vault.sh`, in `vault/`) is the other default
+service — also shipped here.
