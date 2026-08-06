@@ -1,0 +1,126 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# docker/cont-init.d/05-kanban-defaults — bake the standard-box Kanban defaults (boot, root).
+#
+# WHY A CONT-INIT (like 03-abi-license-fp / 04-passbolt-keyring): every v4 box ships
+# Kanboard as the SOLE kanban ("one image, one set of services"). Rather than wire
+# the in-container pieces per-box at cutover (lift scripts, add the cron, set env),
+# the image bakes them here so a fresh box is Kanboard-aware on first boot:
+#
+#   1. seed kanban_poll.py + kanban_trigger.py -> $HERMES_HOME/scripts/ (hermes-owned,
+#      writable — the scripts write state/lock next to themselves via
+#      Path(__file__).with_name(...), so they CANNOT live in the read-only source).
+#   2. seed the kanban-poll cron job into $HERMES_HOME/cron/jobs.json (create the file
+#      with just this job on a fresh box — load_jobs() returns [] when absent and the
+#      scheduler never creates it itself; merge only-if-absent on an existing box).
+#   3. stage standard env defaults to /run/s6/container_environment (ONLY if unset —
+#      compose/.env always wins, mirror the AGENT_BROWSER_EXECUTABLE_PATH pattern in
+#      stage2-hook.sh). The gateway (with-contenv) + kanban_poll inherit them.
+#
+# The per-box SECRETS (KANBOARD_USER/TOKEN) are NOT baked — they come from .env/compose
+# (set by `abi-service box init-standard` or the cutover runbook). Without them
+# kanban_poll exits 0 silent ("no creds"), so a box with no Kanboard wired yet is
+# harmlessly idle — never a dead bot. HERMES_KANBAN_DISPATCH_IN_GATEWAY is ALSO not
+# baked (box-shape-specific — see step 3 below).
+#
+# NON-BLOCKING + IDEMPOTENT: never fails the boot; every step is a no-op if already
+# done. Existing boxes (Jeremy/Brian/Snowbytes) upgrade to this image with NO double-
+# cron and NO env override (their compose/.env values win).
+set -u
+
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+SRC=/opt/abi-tools/v4-cron-scripts
+SCRIPTS_DIR="$HERMES_HOME/scripts"
+CRON_DIR="$HERMES_HOME/cron"
+JOBS="$CRON_DIR/jobs.json"
+PY=/opt/hermes/.venv/bin/python
+
+# --- 1. seed the poll/trigger scripts (hermes-owned, writable) ---
+if [ -d "$SRC" ]; then
+    s6-setuidgid hermes mkdir -p "$SCRIPTS_DIR" 2>/dev/null || true
+    for f in kanban_poll.py kanban_trigger.py; do
+        if [ ! -f "$SCRIPTS_DIR/$f" ] && [ -f "$SRC/$f" ]; then
+            s6-setuidgid hermes cp "$SRC/$f" "$SCRIPTS_DIR/$f" 2>/dev/null || true
+            s6-setuidgid hermes chmod 755 "$SCRIPTS_DIR/$f" 2>/dev/null || true
+            echo "[kanban] cont-init: seeded $f -> $SCRIPTS_DIR/" >&2
+        fi
+    done
+fi
+
+# --- 2. seed the kanban-poll cron job (create-on-fresh / merge-only-if-absent) ---
+# Runs as hermes so jobs.json stays hermes-owned (the gateway UID must read+write it).
+if [ -x "$PY" ]; then
+    s6-setuidgid hermes mkdir -p "$CRON_DIR" 2>/dev/null || true
+    s6-setuidgid hermes "$PY" - "$JOBS" <<'PY' 2>/dev/null || true
+import json, os, sys
+p = sys.argv[1]
+# Three cases: ABSENT (fresh box -> create with just this job), MALFORMED (leave
+# untouched — cron/jobs.py load_jobs logs + auto-repairs; clobbering would destroy
+# user data), or a valid list/dict (merge only-if-absent).
+if os.path.isfile(p):
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        sys.exit(0)  # malformed — leave it for the scheduler's auto-repair
+else:
+    data = None  # absent -> fresh box
+jobs = data if isinstance(data, list) else (data.get("jobs", []) if isinstance(data, dict) else [])
+if any(isinstance(j, dict) and j.get("id") == "kanban-poll" for j in jobs):
+    sys.exit(0)  # already present (existing box upgrade) — idempotent no-op
+# Derive the Telegram origin from an existing job so the wake is delivered where the
+# box already reports; blank origin if none found (the job still runs, just no TG delivery).
+orig = None
+for j in jobs:
+    if not isinstance(j, dict):
+        continue
+    o = j.get("origin") or {}
+    if o.get("platform") == "telegram" and o.get("chat_id"):
+        orig = {"platform": "telegram", "chat_id": o["chat_id"],
+                "chat_name": o.get("chat_name", ""), "thread_id": o.get("thread_id", "1")}
+        break
+if orig is None:
+    orig = {"platform": "telegram", "chat_id": "", "chat_name": "", "thread_id": "1"}
+job = {"id": "kanban-poll", "name": "Kanban Poll",
+ "prompt": "Zero-LLM Kanboard poll. Checks all projects for tasks assigned to this agent in non-final columns; if any are waiting, spawns a detached trigger to the agent API (a kanban turn) and prints a notice. Silent (exit 0, no output) when the board is clear.",
+ "skills": [], "skill": None, "model": None, "provider": None, "base_url": None,
+ "script": "kanban_poll.py", "no_agent": True, "context_from": None,
+ "schedule": {"kind": "cron", "expr": "*/10 * * * *", "display": "*/10 * * * *"},
+ "schedule_display": "*/10 * * * *", "enabled": True, "deliver": "origin", "origin": orig,
+ "enabled_toolsets": None, "workdir": None, "profile": None}
+# Preserve the on-disk shape: append to a dict's jobs, append to a list, or create fresh.
+if isinstance(data, dict):
+    data.setdefault("jobs", []).append(job)
+    out = data
+elif isinstance(data, list):
+    out = {"jobs": data + [job]}  # canonicalise list -> dict (save_jobs writes dict form)
+else:
+    out = {"jobs": [job]}  # absent -> fresh
+tmp = p + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(out, fh, indent=2)
+os.replace(tmp, p)
+print("[kanban] cont-init: seeded kanban-poll cron job", file=sys.stderr)
+PY
+fi
+
+# --- 3. stage standard env defaults (ONLY if unset — compose/.env always wins) ---
+# Deliberately DOES NOT stage HERMES_KANBAN_DISPATCH_IN_GATEWAY: that flag is
+# box-shape-specific (false for single-agent customer boxes where Kanboard is the
+# sole kanban; UNSET→code-default-true for .19 multi-agent dev where the embedded
+# SQLite dispatcher is genuinely active + spawns workers). Baking it false here
+# would silently stall .19's handoffs on the next image upgrade. The deployer
+# (`abi-service box init-standard` / the runbook) sets it per box-shape instead.
+mkdir -p /run/s6/container_environment 2>/dev/null || true
+stage_if_unset() {
+    # $1 = env var name (already visible via with-contenv if compose/.env set it)
+    key="$1"; val="$2"
+    eval "cur=\"\${${key}:-}\""
+    if [ -z "$cur" ]; then
+        printf '%s' "$val" > "/run/s6/container_environment/$key" 2>/dev/null || true
+    fi
+}
+stage_if_unset KANBOARD_URL "http://opteia-kanboard:80"
+stage_if_unset PASSBOLT_CREDS_PATH "$HERMES_HOME/credentials/passbolt.json"
+
+exit 0

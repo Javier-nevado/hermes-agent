@@ -283,6 +283,15 @@ COPY --chmod=0755 docker/cont-init.d/03-abi-license-fp /etc/cont-init.d/03-abi-l
 # NON-BLOCKING — no-op without passbolt.json (most agents have no vault). GNUPGHOME
 # is exported to the gateway via container_environment. See plan §Architecture.
 COPY --chmod=0755 docker/cont-init.d/04-passbolt-keyring /etc/cont-init.d/04-passbolt-keyring
+# ABI v4 standard-box Kanban defaults: seeds the kanban_poll/trigger scripts into
+# $HERMES_HOME/scripts/, the kanban-poll cron into cron/jobs.json, and the universal
+# env defaults (KANBOARD_URL, PASSBOLT_CREDS_PATH) — all idempotent + only-if-unset,
+# so a fresh box boots Kanboard-aware and existing boxes upgrade cleanly (no double-
+# cron, no env override). HERMES_KANBAN_DISPATCH_IN_GATEWAY is deliberately NOT baked
+# (box-shape-specific: false for single-agent customers, unset for .19 multi-agent) —
+# the deployer sets it. Per-box secrets (KANBOARD_USER/TOKEN) come from .env/compose.
+# See docker/cont-init.d/05-kanban-defaults.
+COPY --chmod=0755 docker/cont-init.d/05-kanban-defaults /etc/cont-init.d/05-kanban-defaults
 
 # ABI v4: bake the Opteia shared skills into the image. The content is staged into
 # build-context ./abi-tools-skills/ by docker/sync-abi-skills.sh from the SEPARATE
@@ -294,6 +303,14 @@ COPY --chmod=0755 docker/cont-init.d/04-passbolt-keyring /etc/cont-init.d/04-pas
 # at /opt/hermes/abi-tools-skills/ — remove it so /opt/abi-tools/skills is canonical.
 COPY abi-tools-skills /opt/abi-tools/skills
 RUN rm -rf /opt/hermes/abi-tools-skills
+
+# ABI v4 standard-box Kanban cron scripts (the zero-LLM poll/trigger). Baked read-only
+# at /opt/abi-tools/v4-cron-scripts; cont-init.d/05-kanban-defaults seeds them into the
+# writable $HERMES_HOME/scripts/ on first boot (the scripts write state/lock next to
+# themselves, so they can't run from this read-only path). Byte-identical to the copies
+# proven on Jeremy/Brian/Snowbytes. The repo-wide COPY . . also drops a stray copy at
+# /opt/hermes/docker/v4-cron-scripts/ — leave it (harmless, documents the source).
+COPY docker/v4-cron-scripts /opt/abi-tools/v4-cron-scripts
 
 # ---------- Runtime ----------
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
