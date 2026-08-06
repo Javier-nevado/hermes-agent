@@ -889,6 +889,21 @@ delegation:
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
 
 # =============================================================================
+# Kanban (cross-agent task coordination)
+# =============================================================================
+# Controls the embedded SQLite kanban dispatcher — the legacy multi-agent worker
+# spawn loop (.19 dev uses it; single-agent boxes don't). The LIVE control on ABI v4
+# is the env var HERMES_KANBAN_DISPATCH_IN_GATEWAY, set by the deployer per box-shape:
+# false for single-agent customer boxes (Kanboard is the sole kanban there), UNSET for
+# .19 multi-agent (code default true keeps the dispatcher active). The zero-LLM
+# kanban_poll.py cron (*/10, baked into the image via cont-init.d/05-kanban-defaults)
+# watches Kanboard and wakes the agent on assigned work regardless of this setting.
+# kanban:
+#   dispatch_in_gateway: true                # Code default. ABI v4 single-agent boxes set false via HERMES_KANBAN_DISPATCH_IN_GATEWAY.
+#   # dispatch_interval_seconds: 60          # Dispatcher poll interval (unused when dispatch_in_gateway=false).
+#   # failure_limit: 2                       # Dispatcher consecutive-failure cap (unused when off).
+
+# =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
 # =============================================================================
 # AI-native persistent memory via Honcho (https://honcho.dev/).
