@@ -211,10 +211,24 @@ RUN chmod -R a+rX /opt/hermes && \
 #      leading 'v' stripped. Optional — a local build without --build-arg is
 #      unaffected.
 ARG ABI_VERSION=
+# PEP 440 sanitization: a suffixed tag like 4.3.0-test is NOT a valid Python
+# version (uv rejects it at the editable install on the next line, failing the
+# whole build). Fold any hyphenated suffix into a PEP 440 *local* version —
+# 4.3.0-test -> 4.3.0+test, 4.3.0-rc-1 -> 4.3.0+rc.1 — which IS valid and is
+# preserved verbatim by pip + importlib.metadata, so both surfaces stay
+# identical. Clean semver (4.3.0) and every prior release tag (4.2.1, ...)
+# contain no hyphen and pass through unchanged.
 RUN if [ -n "${ABI_VERSION}" ]; then \
-        printf '%s\n' "${ABI_VERSION}" > /opt/hermes/.hermes_build_version && \
-        sed -i 's|^version = "[^"]*"|version = "'"${ABI_VERSION}"'"|' /opt/hermes/pyproject.toml && \
-        chown hermes:hermes /opt/hermes/.hermes_build_version /opt/hermes/pyproject.toml; \
+        _tag="${ABI_VERSION#v}" ; \
+        _base="${_tag%%-*}" ; \
+        if [ "$_tag" != "$_base" ]; then \
+            _pep="${_base}+$(printf '%s' "${_tag#*-}" | sed -E 's/[^a-zA-Z0-9.]+/./g')" ; \
+        else \
+            _pep="${_tag}" ; \
+        fi ; \
+        printf '%s\n' "${_pep}" > /opt/hermes/.hermes_build_version && \
+        sed -i 's|^version = "[^"]*"|version = "'"${_pep}"'"|' /opt/hermes/pyproject.toml && \
+        chown hermes:hermes /opt/hermes/.hermes_build_version /opt/hermes/pyproject.toml ; \
     fi
 
 # ---------- Link hermes-agent itself (editable) ----------
