@@ -1,0 +1,64 @@
+# docker-compose.paas.yml — ABI standard-box mini-PaaS (runs customer web apps).
+#
+# WHY: every ABI box ships abi-paas as a DEFAULT SERVICE (alongside Passbolt +
+# Kanboard). The SANDBOXED agent deploys + runs customer web apps here through a
+# token-authed mgmt API (http://abi-paas:7100, opteia-net only). nginx serves the
+# apps to the LAN. The agent's own volume (abi-hermes-*) is NEVER mounted here — a
+# compromised app reaches only the LAN/SAP (as the dashboards legitimately do
+# today), never the agent's memory/DEK/creds. No docker.sock.
+#
+# LAN-ONLY (enforced here, not in nginx): nginx listens on :80 in-container, and the
+# publish "${LAN_IP}:8090:80" binds it to the box's LAN interface ONLY. ZeroTier
+# (Opteia management) cannot reach it — the agent must offer the LAN URL, never ZT.
+#
+# The mgmt API (:7100) has NO host port — only opteia-net peers (the agent) reach it.
+#
+# Copy-per-box:  scp this + the paas/ build context to <box>:/opt/abi-paas/, then
+#   docker build -t abi-paas:pilot ./paas   (pilot; fleet uses the registry image)
+# create /opt/abi-paas/.env (ABI_PAAS_TOKEN, LAN_IP, ABI_PAAS_IMAGE) — see
+# provision-paas.sh — then:
+#   docker compose --env-file .env -f docker-compose.paas.yml up -d
+#
+# Usage:
+#   docker compose --env-file /opt/abi-paas/.env -f docker-compose.paas.yml up -d
+# Prereq: the box's opteia-net (hermes-agent_opteia-net) already exists (agent stack).
+
+services:
+  abi-paas:
+    image: ${ABI_PAAS_IMAGE:-abi-paas:pilot}
+    container_name: abi-paas
+    environment:
+      - ABI_PAAS_TOKEN=${ABI_PAAS_TOKEN:?ABI_PAAS_TOKEN required (shared bearer — agent + paas)}
+      - ABI_PAAS_VERSION=${ABI_PAAS_VERSION:-pilot}
+      - TZ=Europe/Malta
+    volumes:
+      # isolated app store: code + PERSISTENT per-app data/ (SQLite) + logs + venvs.
+      # NOT the agent's volume. Lift this volume to relocate apps to a separate VPS.
+      - ${ABI_PAAS_VOLUME:-paas-apps}:/paas-apps
+    ports:
+      # LAN-ONLY: bind nginx to the box's LAN interface. ZT (mgmt) can't reach it.
+      # 7100 (mgmt API) is intentionally NOT published — opteia-net peers only.
+      - "${LAN_IP:?LAN_IP required (the box's customer-LAN IP, e.g. 192.168.0.7)}:8090:80"
+    networks:
+      - opteia-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  opteia-net:
+    # The shared internal network created by the box's agent stack (project
+    # hermes-agent + network opteia-net → hermes-agent_opteia-net). External so this
+    # compose can't (re)create or delete it.
+    name: hermes-agent_opteia-net
+    external: true
+
+volumes:
+  paas-apps:
+    # compose-created named volume (hermes-agent_paas-apps). Override with a bind
+    # mount via ABI_PAAS_VOLUME if a box wants host-side app dirs.
+    {}

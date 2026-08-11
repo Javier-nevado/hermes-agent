@@ -1,0 +1,9 @@
+# keep the build context lean — the image only COPYs mgmt/, supervisord.conf,
+# nginx/nginx.conf, entrypoint.sh (see Dockerfile). Everything else is repo/test/artifact.
+tests/
+examples/
+README.md
+provision-paas.sh
+**/__pycache__/
+*.pyc
+.git/
